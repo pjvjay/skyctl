@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skyctl"
+version = "0.1.0"
+description = "Multi-account Bluesky automation library and CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "atproto>=0.0.55",
+    "apscheduler>=3.10",
+    "click>=8.1",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+skyctl = "skyctl.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["skyctl*"]
