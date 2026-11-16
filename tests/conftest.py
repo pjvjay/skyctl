@@ -17,7 +17,8 @@ class FakeAtProto:
     instances = []
     fail_session_login = False
 
-    def __init__(self):
+    def __init__(self, base_url=None):
+        self.base_url = base_url
         self.login_calls = []
         self.sent = []
         self.likes = []

@@ -108,13 +108,24 @@ class BskyClient:
         self.config = config
         self.alias = config.alias
         self.session_dir = Path(session_dir) if session_dir else None
-        self._client = AtProtoClient()
+        self._client = self._new_client()
         self._profile = None
         self._logged_in = False
 
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
+
+    def _new_client(self):
+        if self.config.pds_url:
+            return AtProtoClient(self.config.pds_url)
+        return AtProtoClient()
+
+    @property
+    def did(self) -> str:
+        """The DID of the logged-in account."""
+        self._ensure_logged_in()
+        return self._client.me.did
 
     @property
     def _session_file(self) -> Optional[Path]:
@@ -139,7 +150,7 @@ class BskyClient:
                 return self
             except Exception:
                 # Expired or corrupt session: start clean and use the password.
-                self._client = AtProtoClient()
+                self._client = self._new_client()
 
         self._profile = self._client.login(
             self.config.handle, self.config.password
@@ -360,9 +371,53 @@ class BskyClient:
         )
         return [self._flatten_post_record(p) for p in resp.posts]
 
+    def list_posts(self, actor: Optional[str] = None, limit: int = 30) -> list[dict]:
+        """
+        List an account's recent posts (newest first) straight from its
+        repo on the PDS. `actor` is a handle or DID; defaults to this account.
+
+        Unlike the timeline and search, this needs no AppView, so it also
+        works on a self-hosted PDS that is not connected to the network.
+        """
+        self._ensure_logged_in()
+        repo = actor or self.did
+        resp = self._client.com.atproto.repo.list_records(
+            {"repo": repo, "collection": "app.bsky.feed.post", "limit": limit}
+        )
+        return [self._flatten_repo_record(r, repo) for r in resp.records]
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_repo_record(record, author: str) -> dict:
+        def field(obj, *names):
+            for name in names:
+                value = (
+                    obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+                )
+                if value is not None:
+                    return value
+            return None
+
+        def ref(obj):
+            if obj is None:
+                return None
+            return {"uri": field(obj, "uri"), "cid": field(obj, "cid")}
+
+        value = record.value
+        reply = field(value, "reply")
+        return {
+            "uri": record.uri,
+            "cid": record.cid,
+            "author": author,
+            "text": field(value, "text") or "",
+            "created_at": field(value, "created_at", "createdAt") or "",
+            "reply_parent": ref(field(reply, "parent")) if reply else None,
+            "reply_root": ref(field(reply, "root")) if reply else None,
+            "url": _uri_to_url(record.uri),
+        }
 
     def _ok(self, resp) -> PostResult:
         return PostResult(
