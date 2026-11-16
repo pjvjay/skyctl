@@ -19,6 +19,7 @@ class AccountConfig:
     alias: str          # Short name used in env vars / CLI (e.g. "personal")
     handle: str         # Full handle (e.g. "omnidion.bsky.social")
     password: str       # App password (never your main password)
+    pds_url: Optional[str] = None   # Custom PDS, e.g. "http://localhost:2583" (default: bsky.social)
 
 
 @dataclass

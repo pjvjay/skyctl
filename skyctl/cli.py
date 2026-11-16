@@ -21,6 +21,11 @@ Commands:
     skyctl notifications <alias>     Show notifications
     skyctl profile [alias] [handle]  Show a profile
     skyctl logout [alias]            Forget cached login sessions
+    skyctl agents list               List agent groups (private PDS only)
+    skyctl agents explore <group>    Show the group's shared feed
+    skyctl agents comment <group>    Agents reply to each other's posts
+    skyctl agents research <group>   Agents research a topic and post findings
+    skyctl agents round <group>      Run full rounds of interaction
 
 Most commands accept --json for machine-readable output.
 """
@@ -35,6 +40,13 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from .agents import (
+    AgentConfigError,
+    AgentGroup,
+    PublicNetworkError,
+    load_agents_config,
+)
+from .llm import LLMError, default_model
 from .manager import BskyManager
 from .richtext import (
     MAX_GRAPHEMES,
@@ -666,6 +678,215 @@ def profile(alias, handle, as_json):
         f"Following: {data.get('follows_count', 0)}  "
         f"Posts: {data.get('posts_count', 0)}[/dim]"
     )
+
+
+# ------------------------------------------------------------------
+# Agent groups
+# ------------------------------------------------------------------
+
+config_option = click.option(
+    "--config", "config_file", default=None,
+    help="Agents config file (default: agents.toml or $SKYCTL_AGENTS_FILE).",
+)
+agent_option = click.option(
+    "--agent", default=None, help="Only this agent acts (default: every member)."
+)
+dry_run_option = click.option(
+    "--dry-run", is_flag=True, help="Generate the text but post nothing."
+)
+
+
+def get_group(name, config_file, as_json) -> AgentGroup:
+    try:
+        return AgentGroup.from_config(name, config_file, manager=get_manager())
+    except (AgentConfigError, PublicNetworkError) as e:
+        fail(str(e), as_json)
+
+
+def report_actions(actions, as_json):
+    """Print what each agent did and exit non-zero if anything failed."""
+    if as_json:
+        emit_json([a.to_dict() for a in actions])
+    else:
+        marks = {
+            "posted": "[green]✓[/green]",
+            "dry-run": "[yellow]~[/yellow]",
+            "skipped": "[dim]-[/dim]",
+            "failed": "[red]✗[/red]",
+        }
+        if not actions:
+            console.print("Nothing to do.")
+        for a in actions:
+            what = a.action
+            if a.target_author:
+                what += f" → {a.target_author}"
+            console.print(
+                f"{marks[a.status]} [cyan]{a.agent}[/cyan] {what} "
+                f"[dim]({a.status}, {escape(a.model)})[/dim]"
+            )
+            if a.text:
+                console.print(f"  {escape(a.text)}".replace("\n", "\n  "))
+            if a.error:
+                console.print(f"  [red]{escape(a.error)}[/red]")
+    if any(a.status == "failed" for a in actions):
+        sys.exit(1)
+
+
+def run_agents(as_json, message, work):
+    try:
+        with status(message, as_json):
+            return work()
+    except (AgentConfigError, LLMError) as e:
+        fail(str(e), as_json)
+
+
+@cli.group()
+def agents():
+    """Persona-driven agent groups on a private test PDS.
+
+    Groups are defined in agents.toml (see agents.example.toml). They only
+    run against a self-hosted PDS, never the public Bluesky network.
+    """
+
+
+@agents.command("list")
+@config_option
+@json_option
+def agents_list(config_file, as_json):
+    """List the configured groups and their members."""
+    try:
+        groups = load_agents_config(config_file)
+    except AgentConfigError as e:
+        fail(str(e), as_json)
+    if as_json:
+        emit_json([
+            {
+                "group": g.name,
+                "topic": g.topic,
+                "members": [
+                    {
+                        "agent": p.alias,
+                        "account": p.account,
+                        "name": p.name,
+                        "model": p.model or g.model or default_model(),
+                    }
+                    for p in g.members
+                ],
+            }
+            for g in groups.values()
+        ])
+        return
+    for g in groups.values():
+        table = Table(title=f"{g.name} — {g.topic}" if g.topic else g.name)
+        table.add_column("Agent", style="cyan")
+        table.add_column("Account")
+        table.add_column("Name")
+        table.add_column("Model", style="dim")
+        for p in g.members:
+            table.add_row(
+                p.alias, p.account, p.name, p.model or g.model or default_model()
+            )
+        console.print(table)
+
+
+@agents.command("explore")
+@click.argument("group")
+@click.option("--limit", "-n", default=30, show_default=True, help="Posts per member.")
+@config_option
+@json_option
+def agents_explore(group, limit, config_file, as_json):
+    """Show the posts the group's members have written, oldest first."""
+    g = get_group(group, config_file, as_json)
+    feed = run_agents(as_json, "Reading feeds...", lambda: g.explore(limit=limit))
+    if as_json:
+        emit_json(feed)
+        return
+    if not feed:
+        console.print("No posts yet. Try: skyctl agents research " + group)
+    for p in feed:
+        indent = "  " * p["depth"]
+        console.print(
+            f"{indent}[cyan]{p['agent']}[/cyan] [dim]{str(p['created_at'])[:16]}[/dim]"
+        )
+        console.print(f"{indent}{escape(p['text'])}")
+
+
+@agents.command("comment")
+@click.argument("group")
+@agent_option
+@click.option("--max", "max_comments", default=2, show_default=True,
+              help="Most replies each agent writes.")
+@dry_run_option
+@config_option
+@json_option
+def agents_comment(group, agent, max_comments, dry_run, config_file, as_json):
+    """Have agents reply to each other's posts, in character.
+
+    \b
+    Example:
+        skyctl agents comment debate --agent skeptic --dry-run
+    """
+    g = get_group(group, config_file, as_json)
+    actions = run_agents(
+        as_json, "Agents are reading and replying...",
+        lambda: g.comment(agent=agent, max_comments=max_comments, dry_run=dry_run),
+    )
+    report_actions(actions, as_json)
+
+
+@agents.command("research")
+@click.argument("group")
+@agent_option
+@click.option("--topic", default=None,
+              help="What to research (default: the group's topic, or the agent's choice).")
+@click.option("--url", "urls", multiple=True,
+              help="A page to give the agents as source material. Repeatable.")
+@click.option("--max-posts", default=3, show_default=True,
+              help="Longest thread an agent may post.")
+@dry_run_option
+@config_option
+@json_option
+def agents_research(group, agent, topic, urls, max_posts, dry_run, config_file, as_json):
+    """Have agents research a topic and post their findings.
+
+    \b
+    Example:
+        skyctl agents research debate --topic "Four-day work week" \\
+            --url https://example.org/study
+    """
+    g = get_group(group, config_file, as_json)
+    actions = run_agents(
+        as_json, "Agents are researching...",
+        lambda: g.research(
+            agent=agent, topic=topic, urls=list(urls),
+            max_posts=max_posts, dry_run=dry_run,
+        ),
+    )
+    report_actions(actions, as_json)
+
+
+@agents.command("round")
+@click.argument("group")
+@click.option("--rounds", "-r", default=1, show_default=True, help="Rounds to run.")
+@click.option("--research", "research", is_flag=True,
+              help="Every agent researches and posts before the first round.")
+@click.option("--topic", default=None, help="Topic for any research this run.")
+@click.option("--max", "max_comments", default=2, show_default=True,
+              help="Most replies each agent writes per round.")
+@dry_run_option
+@config_option
+@json_option
+def agents_round(group, rounds, research, topic, max_comments, dry_run, config_file, as_json):
+    """Run rounds: agents with no posts research first, then all comment."""
+    g = get_group(group, config_file, as_json)
+    actions = run_agents(
+        as_json, "Running rounds...",
+        lambda: g.run_round(
+            rounds=rounds, research=research, topic=topic,
+            max_comments=max_comments, dry_run=dry_run,
+        ),
+    )
+    report_actions(actions, as_json)
 
 
 if __name__ == "__main__":

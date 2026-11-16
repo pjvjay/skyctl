@@ -12,6 +12,11 @@ Expected format in your .env file:
     BSKY_WORK_PASSWORD=xxxx-xxxx-xxxx-xxxx
 
 Aliases are case-insensitive; env vars are always uppercased.
+
+To use a self-hosted PDS instead of bsky.social, set BSKY_PDS_URL for
+every account, or BSKY_<ALIAS>_PDS_URL for one account:
+
+    BSKY_PDS_URL=http://localhost:2583
 """
 
 import os
@@ -35,6 +40,7 @@ def load_accounts(env_file: str = ".env") -> dict[str, AccountConfig]:
 
     aliases = [a.strip().lower() for a in raw.split(",") if a.strip()]
     accounts: dict[str, AccountConfig] = {}
+    default_pds = os.getenv("BSKY_PDS_URL", "").strip() or None
 
     for alias in aliases:
         prefix = f"BSKY_{alias.upper()}_"
@@ -47,7 +53,10 @@ def load_accounts(env_file: str = ".env") -> dict[str, AccountConfig]:
                 f"Expected env vars: {prefix}HANDLE and {prefix}PASSWORD"
             )
 
-        accounts[alias] = AccountConfig(alias=alias, handle=handle, password=password)
+        pds_url = os.getenv(f"{prefix}PDS_URL", "").strip() or default_pds
+        accounts[alias] = AccountConfig(
+            alias=alias, handle=handle, password=password, pds_url=pds_url
+        )
 
     return accounts
 
