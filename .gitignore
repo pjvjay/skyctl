@@ -15,3 +15,6 @@ build/
 *.jsonl
 logs/
 
+.skyctl_sessions/
+.skyctl_queue.json
+*~

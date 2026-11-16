@@ -42,12 +42,39 @@ skyctl post-all "Announcement from all accounts!"
 skyctl post-all "Announcement" --exclude work
 ```
 
+Links, `@mentions` and `#hashtags` in the text are made clickable automatically.
+Posts over 300 graphemes are rejected before anything is sent.
+
+```bash
+# Alt text, one --alt per image, in order
+skyctl post personal "Photo post" -i photo.jpg --alt "A red kite over the bay"
+
+# Quote post (AT URI or bsky.app URL) and link preview card
+skyctl post personal "Worth a read" --quote https://bsky.app/profile/someone.bsky.social/post/abc123
+skyctl post personal "Our new release" --link-card https://example.com/release
+
+# Preview without logging in or sending
+skyctl post personal "hi @bsky.app https://example.com #test" --dry-run
+```
+
+### Threads
+
+```bash
+skyctl thread personal "Long text is split into posts of 300 graphemes or fewer..."
+skyctl thread personal "Long text ..." --dry-run    # show the split only
+```
+
 ### Replying & reposting
 
 ```bash
 skyctl reply personal at://did:plc:.../post/... "Great point!"
 skyctl repost work at://did:plc:.../post/...
+skyctl like personal at://did:plc:.../post/...
+skyctl delete personal at://did:plc:.../post/...   # asks first; --yes to skip
+skyctl search personal "open source" -n 25
 ```
+
+Replies to a post deep in a thread are attached to the original thread root.
 
 ### Scheduling
 
@@ -58,13 +85,22 @@ skyctl schedule personal "Good morning!" 2026-03-01T09:00:00
 # Schedule a reply
 skyctl schedule personal "Follow up" 2026-03-01T10:00:00 --reply-to at://...
 
+# Schedule a recurring post (UTC crontab; use day names for weekdays)
+skyctl schedule work "Daily update" --cron "0 9 * * mon-fri"
+
 # List and manage jobs
 skyctl jobs
 skyctl cancel <job-id>
 
 # Start the scheduler process (runs until Ctrl+C)
 skyctl run-scheduler
+skyctl run-scheduler --max-retries 5 --retry-delay 30
 ```
+
+All jobs, including recurring ones, are saved to `.skyctl_queue.json` and are
+sent only while `skyctl run-scheduler` is running. A running scheduler picks up
+jobs added or cancelled from another terminal within 30 seconds. A failed send
+is retried up to 3 times, waiting 60s, 120s, then 240s.
 
 ### Feeds & notifications
 
@@ -73,6 +109,19 @@ skyctl timeline personal               # Home timeline
 skyctl timeline personal -n 25         # More posts
 skyctl notifications personal          # Recent notifications
 ```
+
+### JSON output and sessions
+
+Most commands accept `--json` for scripting:
+
+```bash
+skyctl post personal "Hello" --json
+skyctl jobs --json
+```
+
+The CLI caches each account's login session in `.skyctl_sessions/` (owner-only
+files, git-ignored) and reuses it, so it does not log in with the app password
+on every run. `skyctl logout [alias]` clears the cache.
 
 ---
 
@@ -101,6 +150,12 @@ client.reply("Great!", parent_uri="at://...")
 client.like("at://...")
 client.delete_post("at://...")
 
+# Alt text, quote posts, link cards, threads
+client.post("Photo", image_paths=["kite.jpg"], image_alts=["A red kite"])
+client.post("Worth a read", quote_uri="at://...")
+client.post("Our release", link_card="https://example.com/release")
+results = client.thread("Long text that is split automatically ...")
+
 # Timeline and search
 posts = client.get_timeline(limit=20)
 results = client.search_posts("canada tariff")
@@ -122,6 +177,10 @@ scheduler.schedule_cron(
     hour=9, minute=0,
     day_of_week="mon-fri",
 )
+
+# Or a crontab expression; retries are configurable
+scheduler = BskyScheduler(manager, max_retries=3, retry_delay=60)
+scheduler.schedule_cron(alias="work", text="Weekly", cron="0 9 * * mon")
 
 # Run in background thread (non-blocking)
 scheduler.start(blocking=False)
@@ -166,9 +225,22 @@ skyctl/
 │   ├── client.py        # Single-account wrapper
 │   ├── manager.py       # Multi-account orchestrator
 │   ├── scheduler.py     # APScheduler integration
+│   ├── richtext.py      # Length check, facets, thread splitting
 │   ├── models.py        # Dataclasses
 │   └── cli.py           # Click CLI
+├── tests/               # Offline pytest suite
 ├── .env.example
 ├── pyproject.toml
 └── README.md
 ```
+
+---
+
+## Tests
+
+```bash
+pip install -e ".[test]"
+pytest
+```
+
+The suite uses a fake Bluesky client, so it needs no network and no credentials.
