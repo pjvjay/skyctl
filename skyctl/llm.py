@@ -47,6 +47,9 @@ class LLMRefusal(LLMError):
 class LLMProvider(Protocol):
     """Anything with this method can drive an agent."""
 
+    # Set supports_web_search = True on a backend that searches the web
+    # itself when complete() is called with web_search=True.
+
     def complete(self, system: str, prompt: str, web_search: bool = False) -> str:
         ...
 
@@ -72,6 +75,8 @@ def parse_model_spec(spec: Optional[str]) -> tuple[str, str]:
 
 class AnthropicProvider:
     """Claude through the official Anthropic SDK."""
+
+    supports_web_search = True
 
     def __init__(
         self,
@@ -149,6 +154,8 @@ class AnthropicProvider:
 
 class OpenAICompatProvider:
     """Any server that speaks the OpenAI chat-completions protocol."""
+
+    supports_web_search = False
 
     def __init__(
         self,
@@ -245,7 +252,8 @@ _PROVIDERS: dict[str, Callable[..., LLMProvider]] = {
 def register_provider(name: str, factory: Callable[..., LLMProvider]) -> None:
     """
     Add a backend. `factory(model, **options)` must return an object with
-    a complete(system, prompt, web_search=False) -> str method.
+    a complete(system, prompt, web_search=False) -> str method, and may set
+    supports_web_search = True if it can search the web itself.
     """
     _PROVIDERS[name.lower()] = factory
 

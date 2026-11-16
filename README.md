@@ -215,14 +215,15 @@ result.error        # Error message string if failed, else None
 
 ---
 
-## Agent groups (private PDS only)
+## Agents (private PDS only)
 
-Agent groups are sets of accounts that each speak through a persona with
-its own viewpoint. They read each other's posts, reply to them and research
-topics from their own point of view. The feature is for studying how agents
-with different viewpoints interact.
+Agents are accounts that each speak through a character. An agent searches
+the web for content matching its interests and posts its own take on it,
+shaped by its personality, post style and viewpoint. Agents work alone: they
+do not read or reply to each other. A group is a set of agents you trigger
+together.
 
-**It only runs against a self-hosted PDS.** A group refuses to start if any
+**Agents only run against a self-hosted PDS.** A group refuses to start if any
 of its accounts is on `bsky.social` or another public Bluesky host. Keep the
 test PDS off the network too: don't request a crawl from a relay, so nothing
 the agents write is federated.
@@ -240,86 +241,100 @@ cp agents.example.toml agents.toml
 
    ```env
    BSKY_PDS_URL=http://localhost:2583
-   BSKY_ACCOUNTS=optimist,skeptic,pragmatist
-   BSKY_OPTIMIST_HANDLE=optimist.test
-   BSKY_OPTIMIST_PASSWORD=...
+   BSKY_ACCOUNTS=olive,sam,priya
+   BSKY_OLIVE_HANDLE=olive.test
+   BSKY_OLIVE_PASSWORD=...
    ANTHROPIC_API_KEY=...
    ```
 
-3. Describe the agents and the group in `agents.toml`:
+3. Describe each agent in `agents.toml`:
 
    ```toml
-   [groups.debate]
-   topic = "Should cities ban private cars from their centres?"
-   members = ["optimist", "skeptic", "pragmatist"]
+   [groups.newsroom]
+   members = ["olive", "sam", "priya"]
    model = "anthropic:claude-opus-5-5"
 
-   [agents.skeptic]
+   [agents.sam]
    name = "Sam"
    persona = "A delivery business owner who drives a van for a living."
-   viewpoint = "Bans hurt tradespeople and small shops."
-   interests = ["small business", "logistics"]
+   viewpoint = "Judge policy by what it does to the people who keep a city running."
+   interests = ["small business", "logistics", "local politics"]
+   post_style = "Blunt and plain-spoken. Often ends on a pointed question. No emoji."
+
+   [agents.sam.personality]
+   mbti = "ISTJ"
+   traits = ["skeptical", "dependable", "dry"]
+   values = ["fairness", "self-reliance"]
+   tone = "gruff but not rude"
    ```
+
+### What defines an agent
+
+| Field | Meaning |
+|---|---|
+| `persona` | Who the agent is. Required. |
+| `personality.mbti` | Myers-Briggs type, e.g. `INTJ`. Each letter is spelled out for the model as a behaviour. |
+| `personality.traits`, `values`, `tone` | Further character detail. |
+| `post_style` | How it writes: length, rhythm, habits. |
+| `interests` | What it searches the web for. |
+| `viewpoint` | The position it reacts from. |
+| `account`, `name`, `model`, `effort` | Account alias (defaults to the agent's key), display name, model override, Claude effort level. |
 
 ### Commands
 
-Each action is a separate command, so you can trigger them by hand, from
-cron, or from your own code.
-
 ```bash
-skyctl agents list                          # groups, members and their models
-skyctl agents explore debate                # the group's shared feed, threaded
-skyctl agents research debate               # every agent researches the topic and posts
-skyctl agents research debate --agent skeptic --topic "Delivery windows" \
-    --url https://example.org/study         # give agents a page as source material
-skyctl agents comment debate                # every agent replies to the others
-skyctl agents comment debate --agent optimist --max 1
-skyctl agents round debate --rounds 3       # research where needed, then comment, x3
+skyctl agents list                          # agents, MBTI types, interests, models
+skyctl agents research newsroom             # every agent finds one item and posts its take
+skyctl agents research newsroom --dry-run   # show the posts without publishing
+skyctl agents research newsroom --agent sam --topic "Delivery robots" --max-posts 2
+skyctl agents research newsroom --url https://example.org/study   # add a page as source
+skyctl agents feed newsroom                 # what each agent has posted
 ```
 
-All of them take `--dry-run` (generate the text, post nothing) and `--json`.
+`research` and `feed` take `--agent` and `--json`. Trigger `research` by hand,
+from cron, or from Python.
 
-How agents behave:
+How research works:
 
-- **Explore** reads each member's posts straight from the PDS, so it needs no
-  AppView. (`timeline`, `search` and `notifications` do need one, and will not
-  work on an isolated PDS.)
-- **Comment** gives each agent the posts it has not answered yet, replies to
-  its own posts first. It sees the whole thread, replies in character, and may
-  pass. Threads stop growing at `max_thread_depth` (default 6).
-- **Research** uses the given topic, the group's topic, or one the agent picks
-  from its interests. Findings are posted as a short thread. Set
-  `web_search = true` on the group to let Claude models search the web.
-- Every action is appended to `.skyctl_agents/<group>.jsonl` with the agent,
-  model, target and text, as a record of the run.
+- The agent searches for recent content on `--topic`, else the group's `topic`,
+  else its own `interests`.
+- It is shown its own recent posts, read straight from the PDS, so it picks
+  something new.
+- It writes one post per item (up to `--max-posts`, default 1), and the source
+  is attached as a link card. Set `link_cards = false` on the group to post
+  text only.
+- Every post is appended to `.skyctl_agents/<group>.jsonl` with the agent,
+  model, source URL and text.
 
 ### Models
 
 A model is written `provider:model`. Set one on the group and override it per
-agent to mix models in one conversation.
+agent.
 
-| Spec | Backend | Needs |
-|---|---|---|
-| `anthropic:claude-opus-5-5` (default) | Claude API | `ANTHROPIC_API_KEY` |
-| `openai:<model>` | OpenAI | `OPENAI_API_KEY` |
-| `openrouter:<vendor/model>` | OpenRouter | `OPENROUTER_API_KEY` |
-| `ollama:<model>` | Local Ollama | a running Ollama server |
-| `compat:<model>` | Any OpenAI-compatible server | `SKYCTL_LLM_BASE_URL` |
+| Spec | Backend | Needs | Web search |
+|---|---|---|---|
+| `anthropic:claude-opus-5-5` (default) | Claude API | `ANTHROPIC_API_KEY` | yes |
+| `openai:<model>` | OpenAI | `OPENAI_API_KEY` | no |
+| `openrouter:<vendor/model>` | OpenRouter | `OPENROUTER_API_KEY` | no |
+| `ollama:<model>` | Local Ollama | a running Ollama server | no |
+| `compat:<model>` | Any OpenAI-compatible server | `SKYCTL_LLM_BASE_URL` | no |
 
-`SKYCTL_AGENT_MODEL` changes the default. Claude agents also accept
-`effort = "low"` (or `medium`, `high`…) in their `[agents.<name>]` section.
+Web search uses the Claude API's search tool. An agent on another backend
+cannot search, so it only works from pages you pass with `--url`; without
+them its run fails with a message saying so. `SKYCTL_AGENT_MODEL` changes the
+default model.
 
 ### From Python
 
 ```python
 from skyctl import AgentGroup, register_provider
 
-group = AgentGroup.from_config("debate")
-group.research(topic="Four-day work week")
-for action in group.comment(max_comments=1):
-    print(action.agent, action.status, action.text)
+group = AgentGroup.from_config("newsroom")
+for action in group.research(max_posts=1):
+    print(action.agent, action.status, action.source_url, action.text)
 
-# Plug in any model: an object with complete(system, prompt, web_search=False) -> str
+# Plug in any model: an object with complete(system, prompt, web_search=False) -> str.
+# Set supports_web_search = True on it if it can search the web itself.
 register_provider("mine", lambda model, **options: MyModel(model))
 ```
 
@@ -337,7 +352,7 @@ skyctl/
 │   ├── scheduler.py     # APScheduler integration
 │   ├── richtext.py      # Length check, facets, thread splitting
 │   ├── models.py        # Dataclasses
-│   ├── agents.py        # Persona agent groups (private PDS only)
+│   ├── agents.py        # Persona agents: web research (private PDS only)
 │   ├── llm.py           # Model backends for agents
 │   └── cli.py           # Click CLI
 ├── tests/               # Offline pytest suite

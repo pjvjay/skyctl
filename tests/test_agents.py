@@ -1,4 +1,4 @@
-"""Agent groups, tested against an in-memory PDS and scripted models."""
+"""Agents, tested against an in-memory PDS and scripted models."""
 
 import json
 from types import SimpleNamespace
@@ -7,15 +7,15 @@ import pytest
 from click.testing import CliRunner
 
 import skyctl.client as client_mod
-from skyctl import BskyManager
+from skyctl import AccountConfig, BskyManager
 from skyctl.agents import (
     AgentConfigError,
     AgentGroup,
     PublicNetworkError,
-    extract_tagged,
     fit_to_post,
     is_public_network,
     load_agents_config,
+    parse_items,
 )
 from skyctl.cli import cli
 from skyctl.config import load_accounts
@@ -35,22 +35,30 @@ from conftest import FakeAtProto
 PDS = "http://localhost:2583"
 
 CONFIG = """
-[groups.debate]
-topic = "Cars in cities"
-members = ["optimist", "skeptic"]
+[groups.newsroom]
+members = ["olive", "sam"]
 model = "script:default"
-max_thread_depth = 3
 
-[agents.optimist]
+[agents.olive]
 name = "Olive"
 persona = "An urban planner."
-viewpoint = "Ban cars."
+viewpoint = "People before cars."
+interests = ["urban design", "air quality"]
+post_style = "Upbeat, short sentences."
 
-[agents.skeptic]
+[agents.olive.personality]
+mbti = "enfp"
+traits = ["enthusiastic"]
+values = ["community"]
+tone = "warm"
+
+[agents.sam]
 name = "Sam"
 persona = "A van driver."
 model = "script:other"
 """
+
+ITEM = "<item><url>https://news.test/a</url><post>{}</post></item>"
 
 
 class FakePDS(FakeAtProto):
@@ -69,7 +77,7 @@ class FakePDS(FakeAtProto):
         FakePDS.counter += 1
         n = FakePDS.counter
         record = SimpleNamespace(
-            uri=f"{'at://' + self.me.did}/app.bsky.feed.post/{n:04d}",
+            uri=f"at://{self.me.did}/app.bsky.feed.post/{n:04d}",
             cid=f"cid{n}",
             value=SimpleNamespace(
                 text=text, created_at=f"2026-01-01T00:00:{n:02d}Z", reply=reply_to
@@ -90,13 +98,14 @@ class FakePDS(FakeAtProto):
 class Script:
     """A model that answers from a queue and remembers what it was asked."""
 
-    def __init__(self, *answers):
+    def __init__(self, *answers, supports_web_search=True):
         self.answers = list(answers)
         self.calls = []
+        self.supports_web_search = supports_web_search
 
     def complete(self, system, prompt, web_search=False):
         self.calls.append({"system": system, "prompt": prompt, "web_search": web_search})
-        answer = self.answers.pop(0) if self.answers else "<reply>SKIP</reply>"
+        answer = self.answers.pop(0) if self.answers else ITEM.format("Default take.")
         if isinstance(answer, Exception):
             raise answer
         return answer
@@ -107,14 +116,17 @@ def pds(monkeypatch):
     FakePDS.repos = {}
     FakePDS.counter = 0
     monkeypatch.setattr(client_mod, "AtProtoClient", FakePDS)
+    # Link cards would otherwise fetch the source page.
+    monkeypatch.setattr(
+        client_mod, "fetch_link_metadata",
+        lambda url: {"title": url, "description": "", "thumb": None},
+    )
 
 
 def make_manager(pds_url=PDS):
-    from skyctl import AccountConfig
-
     return BskyManager({
         alias: AccountConfig(alias, f"{alias}.test", "pw", pds_url=pds_url)
-        for alias in ("optimist", "skeptic")
+        for alias in ("olive", "sam")
     })
 
 
@@ -122,15 +134,15 @@ def make_manager(pds_url=PDS):
 def group(pds, tmp_path):
     config_file = tmp_path / "agents.toml"
     config_file.write_text(CONFIG)
-    scripts = {"optimist": Script(), "skeptic": Script()}
+    scripts = {"olive": Script(), "sam": Script()}
     made = []
 
     def factory(spec, **options):
         made.append(spec)
-        return scripts["skeptic" if spec == "script:other" else "optimist"]
+        return scripts["sam" if spec == "script:other" else "olive"]
 
     g = AgentGroup.from_config(
-        "debate", config_file, manager=make_manager(),
+        "newsroom", config_file, manager=make_manager(),
         llm_factory=factory, transcript_dir=tmp_path / "log",
     )
     g.scripts, g.made = scripts, made
@@ -158,7 +170,7 @@ def test_group_refuses_the_public_network(pds, tmp_path):
     config_file.write_text(CONFIG)
     for url in (None, "https://bsky.social"):
         with pytest.raises(PublicNetworkError):
-            AgentGroup.from_config("debate", config_file, manager=make_manager(url))
+            AgentGroup.from_config("newsroom", config_file, manager=make_manager(url))
 
 
 def test_pds_url_is_loaded_and_used(pds, tmp_path, monkeypatch):
@@ -178,21 +190,26 @@ def test_pds_url_is_loaded_and_used(pds, tmp_path, monkeypatch):
 
 # -- config ------------------------------------------------------------
 
-def test_load_config(tmp_path):
+def test_load_config_with_personality(tmp_path):
     f = tmp_path / "agents.toml"
     f.write_text(CONFIG)
-    g = load_agents_config(f)["debate"]
-    assert [p.alias for p in g.members] == ["optimist", "skeptic"]
-    assert g.members[0].account == "optimist"
-    assert g.members[1].model == "script:other"
-    assert g.max_thread_depth == 3
+    g = load_agents_config(f)["newsroom"]
+    olive, sam = g.members
+    assert olive.account == "olive" and sam.model == "script:other"
+    assert olive.personality.mbti == "ENFP"
+    assert olive.personality.traits == ["enthusiastic"]
+    assert olive.post_style == "Upbeat, short sentences."
+    assert sam.personality.mbti == "" and sam.personality.describe() == ""
+    assert g.web_search is True and g.link_cards is True
 
 
 @pytest.mark.parametrize("bad", [
-    '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"',
+    '[groups.g]\nmembers = []\n[agents.a]\npersona = "x"',
     '[groups.g]\nmembers = ["a", "ghost"]\n[agents.a]\npersona = "x"',
-    '[groups.g]\nmembers = ["a", "b"]\n[agents.a]\npersona = "x"\n[agents.b]\nname = "B"',
+    '[groups.g]\nmembers = ["a"]\n[agents.a]\nname = "A"',
     '[agents.a]\npersona = "x"',
+    '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"\n[agents.a.personality]\nmbti = "ABCD"',
+    '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"\npersonality = "INTJ"',
 ])
 def test_bad_config(tmp_path, bad):
     f = tmp_path / "agents.toml"
@@ -205,14 +222,20 @@ def test_account_must_exist(pds, tmp_path):
     f = tmp_path / "agents.toml"
     f.write_text(CONFIG.replace('name = "Sam"', 'name = "Sam"\naccount = "nobody"'))
     with pytest.raises(AgentConfigError, match="nobody"):
-        AgentGroup.from_config("debate", f, manager=make_manager())
+        AgentGroup.from_config("newsroom", f, manager=make_manager())
 
 
 # -- text helpers ------------------------------------------------------
 
-def test_extract_tagged():
-    assert extract_tagged("Sure!\n<reply> hi there </reply> bye", "reply") == "hi there"
-    assert extract_tagged("  no tags  ", "reply") == "no tags"
+def test_parse_items():
+    raw = (
+        "I searched.\n<item><url> https://a.test/x </url><post>One</post></item>\n"
+        "<item><url>not a url</url><post>Two</post></item><item><post></post></item>"
+    )
+    assert parse_items(raw) == [("https://a.test/x", "One"), (None, "Two")]
+    assert parse_items("<post>Bare</post>") == [(None, "Bare")]
+    assert parse_items("  plain text  ") == [(None, "plain text")]
+    assert parse_items("") == []
 
 
 def test_fit_to_post():
@@ -224,132 +247,107 @@ def test_fit_to_post():
 
 # -- research ----------------------------------------------------------
 
-def test_research_posts_a_thread_and_logs_it(group):
-    group.scripts["optimist"].answers = [
-        "Thinking...\n<post>Streets are for people.</post>\n<post>Evidence: Pontevedra.</post>"
-    ]
-    [action] = group.research(agent="optimist")
-    assert action.status == "posted" and len(action.uris) == 2
-    assert action.topic == "Cars in cities"
+def test_research_searches_and_posts_with_link_card(group):
+    group.scripts["olive"].answers = [ITEM.format("Paris cut traffic 40%. More of this!")]
+    [action] = group.research(agent="olive")
+    assert action.status == "posted" and action.source_url == "https://news.test/a"
 
-    feed = group.explore()
-    assert [p["text"] for p in feed] == ["Streets are for people.", "Evidence: Pontevedra."]
-    assert [p["depth"] for p in feed] == [0, 1]
-    assert feed[1]["reply_root"]["uri"] == feed[0]["uri"]
+    [post] = group.feed("olive")
+    assert post["text"] == "Paris cut traffic 40%. More of this!"
+    sent = FakePDS.instances[0].sent[0]
+    assert sent["embed"].external.uri == "https://news.test/a"
+    assert sent["reply_to"] is None
 
-    call = group.scripts["optimist"].calls[0]
-    assert "You are Olive" in call["system"] and "Ban cars." in call["system"]
-    assert "Cars in cities" in call["prompt"]
+    call = group.scripts["olive"].calls[0]
+    assert call["web_search"] is True
+    assert "urban design, air quality" in call["prompt"]
     logged = [json.loads(line) for line in group.transcript_path.read_text().splitlines()]
-    assert logged[0]["action"] == "research" and logged[0]["status"] == "posted"
+    assert logged[0]["status"] == "posted" and logged[0]["agent"] == "olive"
 
 
-def test_research_uses_each_agents_model(group):
-    group.research(dry_run=True)
+def test_system_prompt_carries_the_whole_character(group):
+    group.research(agent="olive", dry_run=True)
+    system = group.scripts["olive"].calls[0]["system"]
+    for expected in (
+        "You are Olive", "An urban planner.", "Myers-Briggs type ENFP",
+        "- E: energised", "- P: open-ended", "Traits: enthusiastic",
+        "Values: community", "Tone: warm", "People before cars.",
+        "urban design, air quality", "Upbeat, short sentences.",
+    ):
+        assert expected in system
+
+
+def test_agents_work_alone(group):
+    group.scripts["olive"].answers = [ITEM.format("Olive's take.")]
+    group.scripts["sam"].answers = [ITEM.format("Sam's take.")]
+    actions = group.research()
+    assert [(a.agent, a.status) for a in actions] == [("olive", "posted"), ("sam", "posted")]
     assert group.made == ["script:default", "script:other"]
+    # Sam never sees Olive's post, and nobody replies to anybody.
+    sam_call = group.scripts["sam"].calls[0]
+    assert "Olive" not in sam_call["prompt"] + sam_call["system"]
+    assert all(s["reply_to"] is None for inst in FakePDS.instances for s in inst.sent)
+    assert [p["text"] for p in group.feed("sam")] == ["Sam's take."]
 
 
-def test_research_dry_run_posts_nothing(group):
-    group.scripts["optimist"].answers = ["<post>Hello</post>"]
-    [action] = group.research(agent="optimist", dry_run=True)
-    assert action.status == "dry-run" and action.text == "Hello"
-    assert group.explore() == []
+def test_agent_is_told_what_it_already_posted(group):
+    group.scripts["olive"].answers = [ITEM.format("First take.")]
+    group.research(agent="olive")
+    group.research(agent="olive", dry_run=True)
+    assert "- First take." in group.scripts["olive"].calls[1]["prompt"]
+    assert "First take." not in group.scripts["olive"].calls[0]["prompt"]
 
 
-def test_research_includes_sources_and_caps_posts(group, monkeypatch):
-    monkeypatch.setattr("skyctl.agents.fetch_source_text", lambda url: "The study found X.")
-    group.scripts["optimist"].answers = ["<post>1</post><post>2</post><post>3</post>"]
-    [action] = group.research(
-        agent="optimist", topic="Custom", urls=["https://e.test/s"], max_posts=2
-    )
-    prompt = group.scripts["optimist"].calls[0]["prompt"]
-    assert "The study found X." in prompt and "Custom" in prompt
-    assert len(action.uris) == 2
-
-
-def test_research_model_failure_is_reported(group):
-    group.scripts["optimist"].answers = [LLMError("boom")]
-    [action] = group.research(agent="optimist")
-    assert action.status == "failed" and action.error == "boom"
-
-
-# -- comment -----------------------------------------------------------
-
-def test_agents_reply_to_each_other_with_correct_threading(group):
-    group.scripts["optimist"].answers = ["<post>Ban cars downtown.</post>"]
-    group.research(agent="optimist")
-    root = group.explore()[0]
-
-    group.scripts["skeptic"].answers = ["<reply>And my deliveries?</reply>"]
-    actions = group.comment()
-    # Optimist has nothing to answer when its turn comes; skeptic replies.
-    assert [(a.agent, a.status) for a in actions] == [("skeptic", "posted")]
-    assert actions[0].target_author == "optimist"
-    prompt = group.scripts["skeptic"].calls[0]["prompt"]
-    assert "Olive: Ban cars downtown." in prompt
-
-    group.scripts["optimist"].answers = ["<reply>Cargo bikes and delivery windows.</reply>"]
-    actions = group.comment()
-    # Skeptic sees the new reply in the same run and (by script) passes on it.
-    assert [(a.agent, a.status) for a in actions] == [
-        ("optimist", "posted"), ("skeptic", "skipped"),
+def test_max_posts_and_topic(group):
+    group.scripts["olive"].answers = [
+        "".join(ITEM.format(n) for n in ("one", "two", "three"))
     ]
-    prompt = group.scripts["optimist"].calls[-1]["prompt"]
-    assert "Olive: Ban cars downtown." in group.scripts["skeptic"].calls[-1]["prompt"]
-    assert "You: Ban cars downtown." in prompt and "Sam: And my deliveries?" in prompt
-
-    feed = group.explore()
-    assert [p["depth"] for p in feed] == [0, 1, 2]
-    # Nested reply keeps the original root and points at its direct parent.
-    assert feed[2]["reply_root"]["uri"] == root["uri"]
-    assert feed[2]["reply_parent"]["uri"] == feed[1]["uri"]
+    actions = group.research(agent="olive", topic="Tram lines", max_posts=2)
+    assert [a.text for a in actions] == ["one", "two"]
+    assert all(a.topic == "Tram lines" for a in actions)
+    prompt = group.scripts["olive"].calls[0]["prompt"]
+    assert "Tram lines" in prompt and "up to 2" in prompt
+    assert len(group.feed("olive")) == 2
 
 
-def test_no_double_replies_and_skip(group):
-    group.scripts["optimist"].answers = ["<post>Ban cars.</post>"]
-    group.research(agent="optimist")
-    group.scripts["skeptic"].answers = ["<reply>SKIP</reply>", "<reply>No.</reply>"]
-    assert group.comment(agent="skeptic")[0].status == "skipped"
-    assert group.comment(agent="skeptic")[0].status == "posted"
-    assert group.comment(agent="skeptic") == []  # already answered
-
-
-def test_thread_depth_limit_stops_the_back_and_forth(group):
-    group.scripts["optimist"].answers = ["<post>Ban cars.</post>"] + ["<reply>yes</reply>"] * 9
-    group.scripts["skeptic"].answers = ["<reply>no</reply>"] * 9
-    group.research(agent="optimist")
-    for _ in range(6):
-        group.comment()
-    assert max(p["depth"] for p in group.explore()) == 3  # max_thread_depth
-
-
-def test_comment_dry_run_and_long_reply(group):
-    group.scripts["optimist"].answers = ["<post>Ban cars.</post>"]
-    group.research(agent="optimist")
-    group.scripts["skeptic"].answers = ["<reply>" + "blah " * 100 + "</reply>"]
-    [action] = group.comment(agent="skeptic", dry_run=True)
+def test_dry_run_posts_nothing_and_trims(group):
+    group.scripts["olive"].answers = [ITEM.format("blah " * 100)]
+    [action] = group.research(agent="olive", dry_run=True)
     assert action.status == "dry-run" and grapheme_len(action.text) <= 300
-    assert len(group.explore()) == 1
+    assert group.feed("olive") == []
 
 
-def test_unknown_agent(group):
+def test_link_cards_can_be_turned_off(group):
+    group.config.link_cards = False
+    group.research(agent="olive")
+    assert FakePDS.instances[0].sent[0]["embed"] is None
+
+
+def test_model_without_search_needs_sources(group, monkeypatch):
+    group.scripts["olive"].supports_web_search = False
+    [action] = group.research(agent="olive")
+    assert action.status == "failed" and "cannot search the web" in action.error
+    assert group.scripts["olive"].calls == []
+
+    monkeypatch.setattr("skyctl.agents.fetch_source_text", lambda url: "The study found X.")
+    [action] = group.research(agent="olive", urls=["https://e.test/s"])
+    assert action.status == "posted"
+    call = group.scripts["olive"].calls[0]
+    assert call["web_search"] is False and "The study found X." in call["prompt"]
+
+
+def test_web_search_off_in_config(group):
+    group.config.web_search = False
+    [action] = group.research(agent="olive")
+    assert action.status == "failed" and "web_search is off" in action.error
+
+
+def test_failures_are_reported(group):
+    group.scripts["olive"].answers = [LLMError("boom"), "   "]
+    assert group.research(agent="olive")[0].error == "boom"
+    assert group.research(agent="olive")[0].error == "The model returned no posts."
     with pytest.raises(AgentConfigError):
-        group.comment(agent="ghost")
-
-
-def test_run_round_researches_then_comments(group):
-    group.scripts["optimist"].answers = ["<post>Ban cars.</post>", "<reply>Why not?</reply>"]
-    group.scripts["skeptic"].answers = ["<post>Vans matter.</post>", "<reply>Costs.</reply>"]
-    actions = group.run_round(max_comments=1)
-    assert [(a.agent, a.action) for a in actions] == [
-        ("optimist", "research"), ("skeptic", "research"),
-        ("optimist", "comment"), ("skeptic", "comment"),
-    ]
-    assert all(a.status == "posted" for a in actions)
-    # Skeptic answers the reply addressed to its own post first.
-    assert actions[3].target_uri == actions[2].uris[0]
-    # A second round does no new research: everyone has a top-level post.
-    assert all(a.action == "comment" for a in group.run_round())
+        group.research(agent="ghost")
 
 
 # -- model backends ----------------------------------------------------
@@ -365,8 +363,8 @@ def test_parse_model_spec(monkeypatch):
 
 
 def test_register_provider():
-    register_provider("script", lambda model, **o: Script(f"<reply>{model}</reply>"))
-    assert get_provider("script:abc").complete("s", "p") == "<reply>abc</reply>"
+    register_provider("script", lambda model, **o: Script(model))
+    assert get_provider("script:abc").complete("s", "p") == "abc"
 
 
 def test_missing_key_is_a_clear_error(monkeypatch):
@@ -456,33 +454,37 @@ def test_openai_compat_provider(monkeypatch):
 def cli_env(pds, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "agents.toml").write_text(CONFIG)
-    monkeypatch.setenv("BSKY_ACCOUNTS", "optimist,skeptic")
-    for alias in ("OPTIMIST", "SKEPTIC"):
+    monkeypatch.setenv("BSKY_ACCOUNTS", "olive,sam")
+    for alias in ("OLIVE", "SAM"):
         monkeypatch.setenv(f"BSKY_{alias}_HANDLE", f"{alias.lower()}.test")
         monkeypatch.setenv(f"BSKY_{alias}_PASSWORD", "pw")
     monkeypatch.setenv("BSKY_PDS_URL", PDS)
-    register_provider("script", lambda model, **o: Script("<post>From the CLI.</post>"))
+    register_provider("script", lambda model, **o: Script(ITEM.format("From the CLI.")))
     return CliRunner()
 
 
-def test_cli_list_and_research_and_explore(cli_env):
+def test_cli_list_research_and_feed(cli_env):
     result = cli_env.invoke(cli, ["agents", "list", "--json"])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)[0]["members"][1]["model"] == "script:other"
+    members = json.loads(result.output)[0]["members"]
+    assert members[0]["mbti"] == "ENFP" and members[1]["model"] == "script:other"
+    assert "ENFP" in cli_env.invoke(cli, ["agents", "list"]).output
 
-    result = cli_env.invoke(cli, ["agents", "research", "debate", "--agent", "optimist", "--json"])
+    result = cli_env.invoke(cli, ["agents", "research", "newsroom", "--dry-run"])
+    assert result.exit_code == 0 and "From the CLI." in result.output
+
+    result = cli_env.invoke(cli, ["agents", "research", "newsroom", "--agent", "olive", "--json"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)[0]["status"] == "posted"
 
-    result = cli_env.invoke(cli, ["agents", "explore", "debate"])
-    assert "From the CLI." in result.output
-
-    result = cli_env.invoke(cli, ["agents", "comment", "debate", "--dry-run"])
-    assert result.exit_code == 0, result.output
+    result = cli_env.invoke(cli, ["agents", "feed", "newsroom"])
+    assert "From the CLI." in result.output and "No posts yet." in result.output
+    result = cli_env.invoke(cli, ["agents", "feed", "newsroom", "--agent", "olive", "--json"])
+    assert json.loads(result.output)["olive"][0]["text"] == "From the CLI."
 
 
 def test_cli_refuses_public_network(cli_env, monkeypatch):
     monkeypatch.delenv("BSKY_PDS_URL")
-    result = cli_env.invoke(cli, ["agents", "comment", "debate", "--json"])
+    result = cli_env.invoke(cli, ["agents", "research", "newsroom", "--json"])
     assert result.exit_code == 1
     assert "private PDS" in json.loads(result.output)["error"]

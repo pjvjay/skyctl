@@ -1,6 +1,13 @@
 """skyctl — multi-account Bluesky automation library and CLI."""
 
-from .agents import AgentAction, AgentGroup, GroupConfig, Persona, load_agents_config
+from .agents import (
+    AgentAction,
+    AgentGroup,
+    GroupConfig,
+    Persona,
+    Personality,
+    load_agents_config,
+)
 from .client import BskyClient
 from .llm import LLMError, get_provider, register_provider
 from .manager import BskyManager
@@ -25,6 +32,7 @@ __all__ = [
     "LLMError",
     "MAX_GRAPHEMES",
     "Persona",
+    "Personality",
     "PostResult",
     "PostTooLongError",
     "ScheduledPost",
