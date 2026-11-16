@@ -7,15 +7,25 @@ All methods return typed result objects rather than raw API dicts.
 
 from __future__ import annotations
 
-import mimetypes
+import html as html_lib
+import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from atproto import Client as AtProtoClient
 from atproto import models as at_models
 
 from .models import AccountConfig, PostResult
+from .richtext import detect_facets, split_thread, validate_length
+
+MAX_IMAGES = 4
+MAX_THUMB_BYTES = 1_000_000
+
+_BSKY_URL_RE = re.compile(
+    r"^https?://bsky\.app/profile/([^/]+)/post/([^/?#]+)"
+)
 
 
 def _now_utc() -> str:
@@ -34,6 +44,49 @@ def _uri_to_url(uri: str) -> str:
         return uri
 
 
+def _meta_content(page: str, prop: str) -> str:
+    """Pull an <meta property|name=prop content=...> value out of HTML."""
+    for pattern in (
+        rf'<meta[^>]+(?:property|name)=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']',
+        rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']{re.escape(prop)}["\']',
+    ):
+        m = re.search(pattern, page, re.IGNORECASE)
+        if m:
+            return html_lib.unescape(m.group(1)).strip()
+    return ""
+
+
+def fetch_link_metadata(url: str) -> dict:
+    """
+    Fetch title, description and preview image bytes for a link card.
+    Never raises: on any failure the card falls back to the bare URL.
+    """
+    meta = {"title": url, "description": "", "thumb": None}
+    try:
+        import httpx
+
+        headers = {"User-Agent": "skyctl-linkcard"}
+        resp = httpx.get(url, follow_redirects=True, timeout=10, headers=headers)
+        page = resp.text[:300_000]
+        title = _meta_content(page, "og:title")
+        if not title:
+            m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+            title = html_lib.unescape(m.group(1)).strip() if m else ""
+        meta["title"] = title or url
+        meta["description"] = _meta_content(page, "og:description") or _meta_content(
+            page, "description"
+        )
+        image_url = _meta_content(page, "og:image")
+        if image_url:
+            image_url = str(httpx.URL(str(resp.url)).join(image_url))
+            img = httpx.get(image_url, follow_redirects=True, timeout=10, headers=headers)
+            if img.status_code == 200 and len(img.content) <= MAX_THUMB_BYTES:
+                meta["thumb"] = img.content
+    except Exception:
+        pass
+    return meta
+
+
 class BskyClient:
     """
     Single-account Bluesky client.
@@ -42,11 +95,19 @@ class BskyClient:
         client = BskyClient(config)
         result = client.post("Hello, Bluesky!")
         result = client.reply("Nice post!", parent_uri="at://...")
+
+    Pass `session_dir` to cache the login session on disk so later runs
+    reuse it instead of logging in with the app password again.
     """
 
-    def __init__(self, config: AccountConfig):
+    def __init__(
+        self,
+        config: AccountConfig,
+        session_dir: Optional[Union[str, Path]] = None,
+    ):
         self.config = config
         self.alias = config.alias
+        self.session_dir = Path(session_dir) if session_dir else None
         self._client = AtProtoClient()
         self._profile = None
         self._logged_in = False
@@ -55,13 +116,61 @@ class BskyClient:
     # Auth
     # ------------------------------------------------------------------
 
+    @property
+    def _session_file(self) -> Optional[Path]:
+        if self.session_dir is None:
+            return None
+        return self.session_dir / f"{self.alias}.session"
+
     def login(self) -> "BskyClient":
-        """Authenticate with Bluesky. Returns self for chaining."""
+        """
+        Authenticate with Bluesky. Returns self for chaining.
+
+        Reuses a cached session when one exists and is still valid;
+        otherwise logs in with the app password and caches the new session.
+        """
+        session_file = self._session_file
+        if session_file is not None and session_file.exists():
+            try:
+                self._profile = self._client.login(
+                    session_string=session_file.read_text().strip()
+                )
+                self._after_login()
+                return self
+            except Exception:
+                # Expired or corrupt session: start clean and use the password.
+                self._client = AtProtoClient()
+
         self._profile = self._client.login(
             self.config.handle, self.config.password
         )
-        self._logged_in = True
+        self._after_login()
         return self
+
+    def _after_login(self):
+        self._logged_in = True
+        self._save_session()
+        on_change = getattr(self._client, "on_session_change", None)
+        if on_change is not None and self._session_file is not None:
+            on_change(lambda *_: self._save_session())
+
+    def _save_session(self):
+        session_file = self._session_file
+        if session_file is None:
+            return
+        try:
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(self._client.export_session_string())
+            os.chmod(session_file, 0o600)
+        except Exception:
+            pass  # Session caching is best-effort.
+
+    def logout(self) -> None:
+        """Forget the cached session for this account."""
+        session_file = self._session_file
+        if session_file is not None and session_file.exists():
+            session_file.unlink()
+        self._logged_in = False
 
     def _ensure_logged_in(self):
         if not self._logged_in:
@@ -76,36 +185,34 @@ class BskyClient:
         text: str,
         image_paths: Optional[list[str]] = None,
         langs: Optional[list[str]] = None,
+        image_alts: Optional[list[str]] = None,
+        quote_uri: Optional[str] = None,
+        link_card: Optional[str] = None,
     ) -> PostResult:
         """
         Create a new top-level post.
+
+        Links, @mentions and #hashtags in the text are made clickable.
 
         Args:
             text: Post text (max 300 graphemes).
             image_paths: Optional list of local image file paths (max 4).
             langs: Language tags e.g. ["en", "fr"]. Defaults to ["en"].
+            image_alts: Alt text per image, in the same order as image_paths.
+            quote_uri: AT URI or bsky.app URL of a post to quote.
+            link_card: URL to attach as a link preview card.
 
         Returns:
             PostResult with uri, cid, and url.
         """
-        self._ensure_logged_in()
-        try:
-            embed = self._build_image_embed(image_paths) if image_paths else None
-            resp = self._client.send_post(
-                text=text,
-                embed=embed,
-                langs=langs or ["en"],
-            )
-            return PostResult(
-                account=self.alias,
-                uri=resp.uri,
-                cid=resp.cid,
-                url=_uri_to_url(resp.uri),
-            )
-        except Exception as e:
-            return PostResult(
-                account=self.alias, uri="", cid="", url="", error=str(e)
-            )
+        return self._send(
+            text,
+            image_paths=image_paths,
+            image_alts=image_alts,
+            langs=langs,
+            quote_uri=quote_uri,
+            link_card=link_card,
+        )
 
     def reply(
         self,
@@ -114,86 +221,108 @@ class BskyClient:
         parent_cid: Optional[str] = None,
         image_paths: Optional[list[str]] = None,
         langs: Optional[list[str]] = None,
+        image_alts: Optional[list[str]] = None,
+        root_uri: Optional[str] = None,
+        root_cid: Optional[str] = None,
+        quote_uri: Optional[str] = None,
+        link_card: Optional[str] = None,
     ) -> PostResult:
         """
         Reply to an existing post.
 
         Args:
             text: Reply text.
-            parent_uri: AT URI of the post to reply to.
+            parent_uri: AT URI (or bsky.app URL) of the post to reply to.
             parent_cid: CID of the parent post (fetched automatically if omitted).
             image_paths: Optional images to attach.
             langs: Language tags.
+            image_alts: Alt text per image.
+            root_uri / root_cid: Thread root, if already known. Otherwise it
+                is looked up from the parent so nested replies thread correctly.
         """
-        self._ensure_logged_in()
-        try:
-            if parent_cid is None:
-                parent_cid = self._fetch_cid(parent_uri)
+        return self._send(
+            text,
+            image_paths=image_paths,
+            image_alts=image_alts,
+            langs=langs,
+            quote_uri=quote_uri,
+            link_card=link_card,
+            reply_to=(parent_uri, parent_cid, root_uri, root_cid),
+        )
 
-            ref = at_models.ComAtprotoRepoStrongRef.Main(
-                uri=parent_uri, cid=parent_cid
-            )
-            reply_ref = at_models.AppBskyFeedPost.ReplyRef(parent=ref, root=ref)
-            embed = self._build_image_embed(image_paths) if image_paths else None
+    def thread(
+        self,
+        text: Union[str, list[str]],
+        image_paths: Optional[list[str]] = None,
+        image_alts: Optional[list[str]] = None,
+        langs: Optional[list[str]] = None,
+    ) -> list[PostResult]:
+        """
+        Post a thread. A string is split into parts of at most 300
+        graphemes; a list is posted as given. Images go on the first post.
 
-            resp = self._client.send_post(
-                text=text,
-                reply_to=reply_ref,
-                embed=embed,
-                langs=langs or ["en"],
+        Stops at the first failure. Returns one PostResult per attempted post.
+        """
+        parts = split_thread(text) if isinstance(text, str) else list(text)
+        if not parts:
+            return [self._error("Thread text is empty.")]
+        for part in parts:
+            try:
+                validate_length(part)
+            except ValueError as e:
+                return [self._error(str(e))]
+
+        results = [
+            self.post(
+                parts[0], image_paths=image_paths, image_alts=image_alts, langs=langs
             )
-            return PostResult(
-                account=self.alias,
-                uri=resp.uri,
-                cid=resp.cid,
-                url=_uri_to_url(resp.uri),
+        ]
+        root = results[0]
+        for part in parts[1:]:
+            prev = results[-1]
+            if not prev.success:
+                break
+            results.append(
+                self.reply(
+                    part,
+                    parent_uri=prev.uri,
+                    parent_cid=prev.cid,
+                    root_uri=root.uri,
+                    root_cid=root.cid,
+                    langs=langs,
+                )
             )
-        except Exception as e:
-            return PostResult(
-                account=self.alias, uri="", cid="", url="", error=str(e)
-            )
+        return results
 
     def repost(self, uri: str, cid: Optional[str] = None) -> PostResult:
         """Repost (boost) an existing post."""
         self._ensure_logged_in()
         try:
+            uri = self._normalize_uri(uri)
             if cid is None:
                 cid = self._fetch_cid(uri)
             resp = self._client.repost(uri=uri, cid=cid)
-            return PostResult(
-                account=self.alias,
-                uri=resp.uri,
-                cid=resp.cid,
-                url=_uri_to_url(resp.uri),
-            )
+            return self._ok(resp)
         except Exception as e:
-            return PostResult(
-                account=self.alias, uri="", cid="", url="", error=str(e)
-            )
+            return self._error(str(e))
 
     def like(self, uri: str, cid: Optional[str] = None) -> PostResult:
         """Like a post."""
         self._ensure_logged_in()
         try:
+            uri = self._normalize_uri(uri)
             if cid is None:
                 cid = self._fetch_cid(uri)
             resp = self._client.like(uri=uri, cid=cid)
-            return PostResult(
-                account=self.alias,
-                uri=resp.uri,
-                cid=resp.cid,
-                url=_uri_to_url(resp.uri),
-            )
+            return self._ok(resp)
         except Exception as e:
-            return PostResult(
-                account=self.alias, uri="", cid="", url="", error=str(e)
-            )
+            return self._error(str(e))
 
     def delete_post(self, uri: str) -> bool:
         """Delete one of your own posts. Returns True on success."""
         self._ensure_logged_in()
         try:
-            self._client.delete_post(uri)
+            self._client.delete_post(self._normalize_uri(uri))
             return True
         except Exception:
             return False
@@ -235,29 +364,185 @@ class BskyClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _fetch_cid(self, uri: str) -> str:
-        """Resolve an AT URI to its CID."""
+    def _ok(self, resp) -> PostResult:
+        return PostResult(
+            account=self.alias,
+            uri=resp.uri,
+            cid=resp.cid,
+            url=_uri_to_url(resp.uri),
+        )
+
+    def _error(self, message: str) -> PostResult:
+        return PostResult(
+            account=self.alias, uri="", cid="", url="", error=message
+        )
+
+    def _send(
+        self,
+        text: str,
+        image_paths=None,
+        image_alts=None,
+        langs=None,
+        quote_uri=None,
+        link_card=None,
+        reply_to=None,
+    ) -> PostResult:
+        # Validate everything we can before touching the network.
+        try:
+            validate_length(text)
+            self._check_media_args(image_paths, image_alts, link_card)
+        except ValueError as e:
+            return self._error(str(e))
+
+        try:
+            self._ensure_logged_in()
+            reply_ref = self._build_reply_ref(*reply_to) if reply_to else None
+            embed = self._build_embed(image_paths, image_alts, quote_uri, link_card)
+            resp = self._client.send_post(
+                text=text,
+                reply_to=reply_ref,
+                embed=embed,
+                langs=langs or ["en"],
+                facets=self._build_facets(text) or None,
+            )
+            return self._ok(resp)
+        except Exception as e:
+            return self._error(str(e))
+
+    @staticmethod
+    def _check_media_args(image_paths, image_alts, link_card):
+        image_paths = image_paths or []
+        image_alts = image_alts or []
+        if len(image_paths) > MAX_IMAGES:
+            raise ValueError(f"At most {MAX_IMAGES} images per post.")
+        if len(image_alts) > len(image_paths):
+            raise ValueError("More alt texts than images.")
+        if image_paths and link_card:
+            raise ValueError("A post cannot have both images and a link card.")
+        for path in image_paths:
+            if not Path(path).is_file():
+                raise ValueError(f"Image not found: {path}")
+
+    def _normalize_uri(self, uri: str) -> str:
+        """Accept an AT URI or a bsky.app post URL; return an AT URI."""
+        m = _BSKY_URL_RE.match(uri)
+        if not m:
+            return uri
+        actor, rkey = m.groups()
+        if not actor.startswith("did:"):
+            actor = self._client.resolve_handle(actor).did
+        return f"at://{actor}/app.bsky.feed.post/{rkey}"
+
+    def _fetch_post(self, uri: str):
         resp = self._client.get_posts([uri])
         if not resp.posts:
             raise ValueError(f"Post not found: {uri}")
-        return resp.posts[0].cid
+        return resp.posts[0]
 
-    def _build_image_embed(self, image_paths: list[str]):
-        """Upload images and return an embed object."""
-        images = []
-        for path_str in image_paths[:4]:  # Bluesky max is 4 images
-            path = Path(path_str)
-            mime, _ = mimetypes.guess_type(path_str)
-            mime = mime or "image/jpeg"
-            with open(path, "rb") as f:
-                data = f.read()
-            blob = self._client.upload_blob(data, mime)
-            images.append(
-                at_models.AppBskyEmbedImages.Image(
-                    image=blob.blob, alt=path.stem
+    def _fetch_cid(self, uri: str) -> str:
+        """Resolve an AT URI to its CID."""
+        return self._fetch_post(uri).cid
+
+    def _build_reply_ref(self, parent_uri, parent_cid, root_uri, root_cid):
+        """
+        Build the reply reference. The root must be the first post of the
+        thread, not the parent, so it is read from the parent's own reply
+        reference when the parent is itself a reply.
+        """
+        StrongRef = at_models.ComAtprotoRepoStrongRef.Main
+        parent_uri = self._normalize_uri(parent_uri)
+
+        if parent_cid and root_uri and root_cid:
+            parent = StrongRef(uri=parent_uri, cid=parent_cid)
+            root = StrongRef(uri=root_uri, cid=root_cid)
+        else:
+            parent_post = self._fetch_post(parent_uri)
+            parent = StrongRef(uri=parent_uri, cid=parent_cid or parent_post.cid)
+            parent_reply = getattr(parent_post.record, "reply", None)
+            if parent_reply is not None:
+                root = StrongRef(
+                    uri=parent_reply.root.uri, cid=parent_reply.root.cid
+                )
+            else:
+                root = parent
+        return at_models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
+
+    def _build_facets(self, text: str) -> list:
+        """Turn detected links, mentions and hashtags into facet models."""
+        F = at_models.AppBskyRichtextFacet
+        facets = []
+        for f in detect_facets(text):
+            if f.kind == "link":
+                feature = F.Link(uri=f.value)
+            elif f.kind == "tag":
+                feature = F.Tag(tag=f.value)
+            else:
+                try:
+                    did = self._client.resolve_handle(f.value).did
+                except Exception:
+                    continue  # Unknown handle: leave it as plain text.
+                feature = F.Mention(did=did)
+            facets.append(
+                F.Main(
+                    index=F.ByteSlice(byte_start=f.byte_start, byte_end=f.byte_end),
+                    features=[feature],
                 )
             )
+        return facets
+
+    def _build_embed(self, image_paths, image_alts, quote_uri, link_card):
+        media = None
+        if image_paths:
+            media = self._build_image_embed(image_paths, image_alts)
+        elif link_card:
+            media = self._build_link_card(link_card)
+
+        if not quote_uri:
+            return media
+
+        quote_uri = self._normalize_uri(quote_uri)
+        record = at_models.AppBskyEmbedRecord.Main(
+            record=at_models.ComAtprotoRepoStrongRef.Main(
+                uri=quote_uri, cid=self._fetch_cid(quote_uri)
+            )
+        )
+        if media is None:
+            return record
+        return at_models.AppBskyEmbedRecordWithMedia.Main(record=record, media=media)
+
+    def _build_image_embed(
+        self, image_paths: list[str], image_alts: Optional[list[str]] = None
+    ):
+        """Upload images and return an embed object."""
+        image_alts = image_alts or []
+        images = []
+        for i, path_str in enumerate(image_paths[:MAX_IMAGES]):
+            path = Path(path_str)
+            with open(path, "rb") as f:
+                data = f.read()
+            blob = self._client.upload_blob(data)
+            alt = image_alts[i] if i < len(image_alts) else path.stem
+            images.append(
+                at_models.AppBskyEmbedImages.Image(image=blob.blob, alt=alt)
+            )
         return at_models.AppBskyEmbedImages.Main(images=images)
+
+    def _build_link_card(self, url: str):
+        meta = fetch_link_metadata(url)
+        thumb = None
+        if meta.get("thumb"):
+            try:
+                thumb = self._client.upload_blob(meta["thumb"]).blob
+            except Exception:
+                thumb = None
+        return at_models.AppBskyEmbedExternal.Main(
+            external=at_models.AppBskyEmbedExternal.External(
+                uri=url,
+                title=meta.get("title") or url,
+                description=meta.get("description") or "",
+                thumb=thumb,
+            )
+        )
 
     def _flatten_post(self, feed_item) -> dict:
         post = feed_item.post

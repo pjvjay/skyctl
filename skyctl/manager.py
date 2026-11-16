@@ -7,11 +7,15 @@ Handles login pooling and fan-out operations.
 
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 from .client import BskyClient
 from .config import load_accounts
 from .models import AccountConfig, PostResult
+
+
+DEFAULT_SESSION_DIR = Path(".skyctl_sessions")
 
 
 class BskyManager:
@@ -25,9 +29,13 @@ class BskyManager:
         client = manager["work"]  # get a single BskyClient
     """
 
-    def __init__(self, accounts: dict[str, AccountConfig]):
+    def __init__(
+        self,
+        accounts: dict[str, AccountConfig],
+        session_dir: Optional[Union[str, Path]] = None,
+    ):
         self._clients: dict[str, BskyClient] = {
-            alias: BskyClient(config)
+            alias: BskyClient(config, session_dir=session_dir)
             for alias, config in accounts.items()
         }
 
@@ -36,17 +44,27 @@ class BskyManager:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_env(cls, env_file: str = ".env") -> "BskyManager":
+    def from_env(
+        cls,
+        env_file: str = ".env",
+        session_dir: Optional[Union[str, Path]] = DEFAULT_SESSION_DIR,
+    ) -> "BskyManager":
         """
         Load all accounts from environment variables and return a manager.
 
         Reads BSKY_ACCOUNTS and corresponding BSKY_<ALIAS>_HANDLE / PASSWORD vars.
+        Login sessions are cached in `session_dir` and reused on later runs;
+        pass session_dir=None to log in with the app password every time.
         """
         accounts = load_accounts(env_file)
-        return cls(accounts)
+        return cls(accounts, session_dir=session_dir)
 
     @classmethod
-    def from_dict(cls, accounts: dict[str, tuple[str, str]]) -> "BskyManager":
+    def from_dict(
+        cls,
+        accounts: dict[str, tuple[str, str]],
+        session_dir: Optional[Union[str, Path]] = None,
+    ) -> "BskyManager":
         """
         Build a manager from a plain dict.
 
@@ -63,7 +81,7 @@ class BskyManager:
             alias: AccountConfig(alias=alias, handle=handle, password=pw)
             for alias, (handle, pw) in accounts.items()
         }
-        return cls(configs)
+        return cls(configs, session_dir=session_dir)
 
     # ------------------------------------------------------------------
     # Account access
@@ -96,6 +114,20 @@ class BskyManager:
                 client.login()
         return self
 
+    def client(self, alias: str) -> BskyClient:
+        """Get a client by alias without logging in (it logs in on first use)."""
+        alias = alias.lower()
+        if alias not in self._clients:
+            raise KeyError(
+                f"Account '{alias}' not found. "
+                f"Available: {', '.join(self._clients)}"
+            )
+        return self._clients[alias]
+
+    def _selected(self, exclude: Optional[list[str]]) -> list[BskyClient]:
+        skip = [a.lower() for a in (exclude or [])]
+        return [c for alias, c in self._clients.items() if alias not in skip]
+
     # ------------------------------------------------------------------
     # Fan-out operations
     # ------------------------------------------------------------------
@@ -105,30 +137,32 @@ class BskyManager:
         text: str,
         image_paths: Optional[list[str]] = None,
         exclude: Optional[list[str]] = None,
+        **kwargs,
     ) -> list[PostResult]:
         """
         Post the same text from all accounts (or all except those in `exclude`).
+        Extra keyword arguments are passed to BskyClient.post.
 
         Returns a list of PostResult objects, one per account.
         """
-        exclude = [a.lower() for a in (exclude or [])]
-        results = []
-        for alias, client in self._clients.items():
-            if alias in exclude:
-                continue
-            if not client._logged_in:
-                client.login()
-            results.append(client.post(text, image_paths=image_paths))
-        return results
+        return [
+            c.post(text, image_paths=image_paths, **kwargs)
+            for c in self._selected(exclude)
+        ]
 
     def post(
         self,
         alias: str,
         text: str,
         image_paths: Optional[list[str]] = None,
+        **kwargs,
     ) -> PostResult:
         """Post from a specific account by alias."""
-        return self[alias].post(text, image_paths=image_paths)
+        return self.client(alias).post(text, image_paths=image_paths, **kwargs)
+
+    def thread(self, alias: str, text, **kwargs) -> list[PostResult]:
+        """Post a thread from a specific account."""
+        return self.client(alias).thread(text, **kwargs)
 
     def reply(
         self,
@@ -136,9 +170,12 @@ class BskyManager:
         text: str,
         parent_uri: str,
         parent_cid: Optional[str] = None,
+        **kwargs,
     ) -> PostResult:
         """Reply to a post from a specific account."""
-        return self[alias].reply(text, parent_uri=parent_uri, parent_cid=parent_cid)
+        return self.client(alias).reply(
+            text, parent_uri=parent_uri, parent_cid=parent_cid, **kwargs
+        )
 
     def reply_all(
         self,
@@ -147,19 +184,13 @@ class BskyManager:
         exclude: Optional[list[str]] = None,
     ) -> list[PostResult]:
         """Reply to the same post from all accounts."""
-        exclude = [a.lower() for a in (exclude or [])]
-        results = []
-        for alias, client in self._clients.items():
-            if alias in exclude:
-                continue
-            if not client._logged_in:
-                client.login()
-            results.append(client.reply(text, parent_uri=parent_uri))
-        return results
+        return [
+            c.reply(text, parent_uri=parent_uri) for c in self._selected(exclude)
+        ]
 
     def repost(self, alias: str, uri: str, cid: Optional[str] = None) -> PostResult:
         """Repost from a specific account."""
-        return self[alias].repost(uri, cid=cid)
+        return self.client(alias).repost(uri, cid=cid)
 
     def repost_all(
         self,
@@ -167,15 +198,15 @@ class BskyManager:
         exclude: Optional[list[str]] = None,
     ) -> list[PostResult]:
         """Repost from all accounts."""
-        exclude = [a.lower() for a in (exclude or [])]
-        results = []
-        for alias, client in self._clients.items():
-            if alias in exclude:
-                continue
-            if not client._logged_in:
-                client.login()
-            results.append(client.repost(uri))
-        return results
+        return [c.repost(uri) for c in self._selected(exclude)]
+
+    def like(self, alias: str, uri: str, cid: Optional[str] = None) -> PostResult:
+        """Like a post from a specific account."""
+        return self.client(alias).like(uri, cid=cid)
+
+    def delete_post(self, alias: str, uri: str) -> bool:
+        """Delete one of an account's own posts."""
+        return self.client(alias).delete_post(uri)
 
     def __repr__(self):
         return f"<BskyManager accounts=[{', '.join(self._clients)}]>"

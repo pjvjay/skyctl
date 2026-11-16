@@ -13,7 +13,11 @@ dependencies = [
     "click>=8.1",
     "python-dotenv>=1.0",
     "rich>=13.0",
+    "httpx>=0.24",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
 
 [project.scripts]
 skyctl = "skyctl.cli:cli"
@@ -21,3 +25,6 @@ skyctl = "skyctl.cli:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["skyctl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
