@@ -143,7 +143,8 @@
             "condition": {
               "age": 90,
               "matches_prefix": [
-                "skyctl/runs/"
+                "skyctl/runs/",
+                "skyctl/ledger/"
               ]
             },
             "action": {
@@ -158,7 +159,10 @@
               "type": "Delete"
             }
           }
-        ]
+        ],
+        "lifecycle": {
+          "prevent_destroy": true
+        }
       }
     },
     "google_storage_bucket_iam_member": {
@@ -214,6 +218,13 @@
         "member": "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
       }
     },
+    "google_project_iam_member": {
+      "vertex": {
+        "project": "my-skyctl-project",
+        "role": "roles/aiplatform.user",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      }
+    },
     "google_service_account_iam_member": {
       "agent_token": {
         "service_account_id": "${google_service_account.invoker.name}",
@@ -227,17 +238,10 @@
       }
     },
     "google_pubsub_subscription": {
-      "push": {
+      "work": {
         "name": "skyctl-work-push",
         "topic": "${google_pubsub_topic.work.id}",
         "ack_deadline_seconds": 600,
-        "push_config": {
-          "push_endpoint": "https://skyctl-svc-${data.google_project.this.number}.europe-west1.run.app/invoke",
-          "oidc_token": {
-            "service_account_email": "${google_service_account.invoker.email}",
-            "audience": "https://skyctl-svc-${data.google_project.this.number}.europe-west1.run.app/invoke"
-          }
-        },
         "dead_letter_policy": {
           "dead_letter_topic": "${google_pubsub_topic.dlq.id}",
           "max_delivery_attempts": 5
@@ -246,6 +250,13 @@
           "minimum_backoff": "10s",
           "maximum_backoff": "600s"
         },
+        "push_config": {
+          "push_endpoint": "https://skyctl-svc-${data.google_project.this.number}.europe-west1.run.app/invoke",
+          "oidc_token": {
+            "service_account_email": "${google_service_account.invoker.email}",
+            "audience": "https://skyctl-svc-${data.google_project.this.number}.europe-west1.run.app/invoke"
+          }
+        },
         "depends_on": [
           "google_cloud_run_v2_service.svc"
         ]
@@ -253,7 +264,7 @@
     },
     "google_pubsub_subscription_iam_member": {
       "agent_ack": {
-        "subscription": "${google_pubsub_subscription.push.name}",
+        "subscription": "${google_pubsub_subscription.work.name}",
         "role": "roles/pubsub.subscriber",
         "member": "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
       }
@@ -281,13 +292,6 @@
         "name": "${google_cloud_tasks_queue.delayed.name}",
         "location": "europe-west1",
         "role": "roles/cloudtasks.enqueuer",
-        "member": "serviceAccount:${google_service_account.runtime.email}"
-      }
-    },
-    "google_project_iam_member": {
-      "vertex": {
-        "project": "my-skyctl-project",
-        "role": "roles/aiplatform.user",
         "member": "serviceAccount:${google_service_account.runtime.email}"
       }
     },
@@ -561,7 +565,7 @@
                 "image": "${var.image}",
                 "args": [
                   "invoke",
-                  "{\"kind\":\"task.run\",\"task\":\"daily-engagement\"}"
+                  "{\"kind\":\"task.run\",\"slot\":{\"cron\":\"0 9 * * mon-fri\",\"timezone\":\"UTC\"},\"task\":\"daily-engagement\"}"
                 ],
                 "env": [
                   {
@@ -751,8 +755,8 @@
         "SKYCTL_OIDC_ALLOWED": "${google_service_account.invoker.email}"
       }
     },
-    "state_bucket": {
-      "value": "${google_storage_bucket.state.name}"
+    "state_url": {
+      "value": "gs://${google_storage_bucket.state.name}/skyctl"
     }
   }
 }

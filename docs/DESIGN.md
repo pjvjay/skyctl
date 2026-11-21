@@ -1,6 +1,7 @@
 # skyctl cloud + agent design
 
-> **Revision note.** The cross-cloud parts of this document (state, scheduling,
+> **Revision note.** The agent/MCP parts are extended by [MCP_AGENT.md](MCP_AGENT.md)
+> (plan-then-execute, profiles, approval modes, grounding, evaluation). The cross-cloud parts of this document (state, scheduling,
 > concurrency, run execution, infrastructure) are superseded by
 > [CLOUD_FRAMEWORK.md](CLOUD_FRAMEWORK.md), which also lists the specific
 > corrections (§14 there). The agent, tools, MCP and policy design below still

@@ -140,7 +140,7 @@ class AzurePlatform(Platform):
     name = "azure"
     display_name = "Microsoft Azure"
     default_compute = "container-apps"
-    service_schemes = ("az", "servicebus", "azure-kv")
+    service_schemes = ("az", "azqueue", "azure-kv")
     compute_profiles = {
         "container-apps": _P(
             "container-apps", "service",
@@ -154,20 +154,20 @@ class AzurePlatform(Platform):
             "container-apps-job", "job",
             frozenset({Cap.SCHEDULED_JOBS, Cap.EVENT_JOBS, Cap.SECRETS_NATIVE_INJECTION}),
             Limits(job_timeout_s=None, secret_bytes=25_600,
-                   note="replicaTimeout is configurable; schedule triggers evaluate cron in UTC; "
-                        "event triggers use KEDA scalers (e.g. azure-servicebus)."),
+                   note="replicaTimeout is configurable; schedule triggers evaluate cron in UTC. skyctl drains "
+                        "Storage Queues with a scheduled job (KEDA's azure-queue scaler here would need shared keys)."),
             "Container Apps Job: manual, schedule or event (KEDA) trigger.",
         ),
     }
     caps = frozenset({Cap.WORKLOAD_IDENTITY, Cap.SCHEDULE_ONE_SHOT, Cap.STATE_ATOMIC_CAS})
     toolset = Toolset(
-        python_packages=("azure-identity", "azure-storage-blob", "azure-keyvault-secrets", "azure-servicebus",
+        python_packages=("azure-identity", "azure-storage-blob", "azure-storage-queue", "azure-keyvault-secrets",
                          "azure-monitor-opentelemetry"),
         credential_chain="DefaultAzureCredential: env → workload identity (AKS) → managed identity "
                          "(AZURE_CLIENT_ID picks a user-assigned one) → Azure CLI",
         iac=("Terraform/OpenTofu hashicorp/azurerm (+ azure/azapi)", "Bicep", "azd"),
         cli="az",
-        emulators=("Azurite (Blob/Queue/Table)", "Service Bus emulator (container)"),
+        emulators=("Azurite (Blob and Queue)",),
         ci_auth="azure/login (GitHub OIDC → federated credential on an app registration)",
         observability=("Log Analytics (ContainerAppConsoleLogs)", "Application Insights via OTel distro"),
         registry="ACR",

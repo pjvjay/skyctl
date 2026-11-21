@@ -17,7 +17,10 @@ permissions:
   id-token: write
 
 env:
-  DEPLOY_SPEC: deploy/skyctl.deploy.toml   # your spec; deploy/examples/ holds a worked example
+  # Your spec. deploy/examples/ has the same intent two ways:
+  #   managed.deploy.toml     ECS/Lambda · Container Apps · Cloud Run
+  #   kubernetes.deploy.toml  EKS · AKS · GKE (existing clusters)
+  DEPLOY_SPEC: deploy/skyctl.deploy.toml
 
 jobs:
   test:
@@ -37,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
-      azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000"] }
+      azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000", "10001:10001"] }
       gcs: { image: "fsouza/fake-gcs-server", ports: ["4443:4443"], options: "--entrypoint /bin/fake-gcs-server -- -scheme http" }
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +54,7 @@ jobs:
           AWS_REGION: us-east-1
           SKYCTL_IT_S3_ENDPOINT: http://localhost:4566
           SKYCTL_IT_S3_BUCKET: skyctl-it
-          SKYCTL_IT_AZURE_CONN: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;"
+          SKYCTL_IT_AZURE_CONN: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;"
           SKYCTL_IT_GCS_ENDPOINT: http://localhost:4443
 
   conformance:
@@ -61,7 +64,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -e .
-      - run: skyctl deploy check deploy/examples/skyctl.deploy.toml
+      - run: skyctl deploy check deploy/examples/managed.deploy.toml
+      - run: skyctl deploy check deploy/examples/kubernetes.deploy.toml
       - run: if [ -f "$DEPLOY_SPEC" ]; then skyctl deploy check "$DEPLOY_SPEC"; fi
 
   build:
@@ -143,3 +147,16 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform apply -auto-approve -input=false
+      # Kubernetes compute (eks/aks/gke): Terraform wrote bind.json; apply it, then the workloads.
+      - name: Cluster credentials
+        if: hashFiles(format('build/{0}/manifests.json', matrix.target)) != ''
+        run: |
+          case "${{ matrix.target }}" in
+            aws)   aws eks update-kubeconfig --name "${{ vars.K8S_CLUSTER }}" ;;
+            azure) az aks get-credentials --name "${{ vars.K8S_CLUSTER }}" --resource-group "${{ vars.K8S_RESOURCE_GROUP }}" ;;
+            gcp)   gcloud container clusters get-credentials "${{ vars.K8S_CLUSTER }}" --region "${{ vars.K8S_LOCATION }}" ;;
+          esac
+      - name: Apply manifests
+        if: hashFiles(format('build/{0}/manifests.json', matrix.target)) != ''
+        working-directory: build/${{ matrix.target }}
+        run: kubectl apply -f bind.json && kubectl apply -f manifests.json

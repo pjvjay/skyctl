@@ -21,12 +21,15 @@ dependencies = [
 [project.optional-dependencies]
 agents = ["anthropic>=0.40"]
 # MCP server (stdio and streamable HTTP), the HTTP service and inbound OIDC auth.
-mcp = ["mcp>=1.9", "starlette>=0.40", "uvicorn>=0.30", "anyio>=4", "pyjwt[crypto]>=2.7"]
+# mcp 2.x renamed FastMCP → MCPServer (breaking); stay on 1.x until migrated. Elicitation needs ≥ 1.10.
+mcp = ["mcp>=1.12,<2", "starlette>=0.40", "uvicorn>=0.30", "anyio>=4", "pyjwt[crypto]>=2.7"]
 server = ["skyctl[mcp]"]
 # Cloud adapters: each installs only the native SDKs its ports need
 # (state with real compare-and-swap, secrets, queue, delayed delivery).
 aws = ["boto3>=1.34", "awslambdaric>=2.0"]
-azure = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.8", "azure-storage-blob>=12.19", "azure-servicebus>=7.11"]
+azure = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.8", "azure-storage-blob>=12.19", "azure-storage-queue>=12.9"]
+# Only for bring-your-own Service Bus queues (servicebus://); rendered Azure deployments use Storage Queues.
+servicebus = ["azure-identity>=1.15", "azure-servicebus>=7.11"]
 gcp = ["google-cloud-storage>=2.14", "google-cloud-secret-manager>=2.18", "google-cloud-pubsub>=2.19", "google-cloud-tasks>=2.16"]
 # Generic fallback for other fsspec schemes (no atomic CAS; see CLOUD_FRAMEWORK.md §5).
 fsspec = ["fsspec>=2024.0"]
@@ -34,9 +37,10 @@ fsspec = ["fsspec>=2024.0"]
 all = ["skyctl[agents,mcp,aws,azure,gcp]"]
 otel = ["opentelemetry-sdk>=1.25", "opentelemetry-exporter-otlp>=1.25"]
 test = [
-    "pytest>=7", "fsspec>=2024.0", "mcp>=1.9", "starlette>=0.40", "anyio>=4", "pyjwt[crypto]>=2.7",
+    "pytest>=7", "fsspec>=2024.0", "mcp>=1.12,<2", "starlette>=0.40", "anyio>=4", "pyjwt[crypto]>=2.7",
     "moto[s3,sqs,scheduler]>=5.0", "boto3>=1.34",
-    "azure-storage-blob>=12.19", "azure-servicebus>=7.11", "google-cloud-storage>=2.14", "google-cloud-tasks>=2.16",
+    "azure-storage-blob>=12.19", "azure-storage-queue>=12.9", "azure-servicebus>=7.11",
+    "google-cloud-storage>=2.14", "google-cloud-tasks>=2.16",
 ]
 
 [project.entry-points."skyctl.platforms"]

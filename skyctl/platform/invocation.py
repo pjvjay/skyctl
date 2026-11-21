@@ -21,7 +21,8 @@ Payload kinds (the canonical vocabulary):
 
     {"kind": "tick"}
     {"kind": "post.send", "job_id": "..."}
-    {"kind": "task.run", "task": "<name>" | {TaskSpec fields}, "run_id": "...", "overrides": {...}}
+    {"kind": "task.run", "task": "<name>" | {TaskSpec fields}, "run_id": "...", "overrides": {...},
+     "slot": {"cron": "0 9 * * mon-fri", "timezone": "UTC"}}      # added to scheduled runs
     {"kind": "task.approve", "run_id": "...", "call_ids": [...]}
 
 Delivery is at-least-once on every platform, so every handler is
@@ -271,8 +272,17 @@ def default_dispatcher(runtime=None, manager=None, scheduler=None, runner=None) 
                 raise InvocationError(f"Unknown override {key!r}")
             setattr(task, key, value)
         if task.idempotency_key is None:
-            # A redelivered message must not repeat writes: key the ledger on the invocation.
-            task.idempotency_key = inv.payload.get("run_id") or inv.id
+            # Retries of the same logical run must not repeat writes:
+            #   scheduled run → task @ cron slot (same across platform retries and overlaps)
+            #   queued run    → its run_id;  anything else → the delivery id
+            slot = inv.payload.get("slot")
+            if isinstance(slot, dict) and slot.get("cron"):
+                from .cron import previous_fire
+
+                fired = previous_fire(slot["cron"], slot.get("timezone", "UTC"))
+                task.idempotency_key = f"{task.name or 'task'}@{fired.isoformat() if fired else 'unscheduled'}"
+            else:
+                task.idempotency_key = inv.payload.get("run_id") or inv.id
         apply_deployment_ceilings(task, rt().settings.agent)
         return run().run(task, run_id=inv.payload.get("run_id")).to_dict()
 
@@ -360,8 +370,9 @@ def run_worker(
     scale-to-zero ECS services); pass None to run forever.
 
     success → ack; retryable failure → nack with exponential backoff;
-    permanent failure or too many attempts → ack and log (the service's own
-    dead-letter policy is the second line of defence).
+    permanent failure or too many attempts → dead_letter() where the adapter
+    has one (Storage Queues: "<queue>-poison"), else ack and log (SQS,
+    Service Bus and Pub/Sub dead-letter policies are the second line).
 
     While a handler runs, a heartbeat extends the message's visibility every
     `heartbeat_seconds`, so a 20-minute agent run is not redelivered to a
@@ -395,5 +406,8 @@ def run_worker(
                 stats.dropped += 1
                 print(json.dumps({"event": "invocation.dropped", "kind": outcome.kind, "error": outcome.error,
                                   "attempt": msg.attempt, "message_id": msg.id}))
-                queue.ack(msg)
+                if hasattr(queue, "dead_letter"):
+                    queue.dead_letter(msg, outcome.error or "")   # services without a native DLQ
+                else:
+                    queue.ack(msg)
     return stats

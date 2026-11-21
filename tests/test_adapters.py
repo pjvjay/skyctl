@@ -250,3 +250,28 @@ def test_load_settings_merges_secrets_without_overriding_platform_env(monkeypatc
     assert __import__("os").environ["BSKY_ACCOUNTS"] == "platform"   # platform value kept
     assert isinstance(StaticSecretStore({}), SecretStore)
     assert Settings.from_env().agent.accounts is None
+
+
+def test_raw_value_secret_url_fragment():
+    from types import SimpleNamespace
+
+    from skyctl.adapters import RawValueSecretStore, secret_store_for
+    from skyctl.adapters.aws import AwsSecretsManagerStore
+
+    store = secret_store_for("aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN")
+    assert isinstance(store, RawValueSecretStore) and store.key == "SKYCTL_HTTP_TOKEN"
+    store.inner._client = SimpleNamespace(get_secret_value=lambda SecretId: {"SecretString": "s3cr3t-token\n"})
+    assert store.load() == {"SKYCTL_HTTP_TOKEN": "s3cr3t-token"}
+    # Without the fragment, a raw token parses to nothing (it is not a map).
+    plain = AwsSecretsManagerStore("x", client=SimpleNamespace(get_secret_value=lambda SecretId: {"SecretString": "s3cr3t-token"}))
+    assert plain.load() == {}
+
+
+def test_file_store_lists_under_a_relative_root(tmp_path, monkeypatch):
+    """Regression: the default local state URL is relative (file://./.skyctl)."""
+    monkeypatch.chdir(tmp_path)
+    store = FileObjectStore(".skyctl")
+    store.write("plans/a.json", b"{}")
+    store.write("runs/r.jsonl", b"")
+    assert store.list("plans/") == ["plans/a.json"]
+    assert store.list() == ["plans/a.json", "runs/r.jsonl"]

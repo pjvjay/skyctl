@@ -31,7 +31,9 @@ class GcpSecretManagerStore:
             self._client = secretmanager.SecretManagerServiceClient()
         return self._client
 
-    def load(self) -> dict[str, str]:
+    def load_raw(self) -> str:
         name = f"projects/{self.project}/secrets/{self.secret_id}/versions/{self.version}"
-        resp = self._sm_client().access_secret_version(request={"name": name})
-        return parse_secret_payload(resp.payload.data.decode("utf-8"))
+        return self._sm_client().access_secret_version(request={"name": name}).payload.data.decode("utf-8")
+
+    def load(self) -> dict[str, str]:
+        return parse_secret_payload(self.load_raw())

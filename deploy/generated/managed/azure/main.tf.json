@@ -83,24 +83,29 @@
         "role_definition_name": "Key Vault Secrets User",
         "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
       },
-      "blob_app": {
-        "scope": "${azurerm_storage_account.state.id}",
-        "role_definition_name": "Storage Blob Data Contributor",
-        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
-      },
       "blob_deployer": {
         "scope": "${azurerm_storage_account.state.id}",
         "role_definition_name": "Storage Blob Data Contributor",
         "principal_id": "${data.azurerm_client_config.current.object_id}"
       },
-      "sb_send": {
-        "scope": "${azurerm_servicebus_queue.work.id}",
-        "role_definition_name": "Azure Service Bus Data Sender",
+      "queue_deployer": {
+        "scope": "${azurerm_storage_account.state.id}",
+        "role_definition_name": "Storage Queue Data Contributor",
+        "principal_id": "${data.azurerm_client_config.current.object_id}"
+      },
+      "blob_app": {
+        "scope": "${azurerm_storage_container.state.resource_manager_id}",
+        "role_definition_name": "Storage Blob Data Contributor",
         "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
       },
-      "sb_receive": {
-        "scope": "${azurerm_servicebus_queue.work.id}",
-        "role_definition_name": "Azure Service Bus Data Receiver",
+      "queue_app": {
+        "scope": "${azurerm_storage_queue.work.resource_manager_id}",
+        "role_definition_name": "Storage Queue Data Contributor",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "poison_app": {
+        "scope": "${azurerm_storage_queue.poison.resource_manager_id}",
+        "role_definition_name": "Storage Queue Data Contributor",
         "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
       }
     },
@@ -134,6 +139,9 @@
         "shared_access_key_enabled": false,
         "blob_properties": {
           "versioning_enabled": true
+        },
+        "lifecycle": {
+          "prevent_destroy": true
         }
       }
     },
@@ -147,16 +155,33 @@
         ]
       }
     },
+    "azurerm_storage_queue": {
+      "work": {
+        "name": "skyctl-work",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "depends_on": [
+          "azurerm_role_assignment.queue_deployer"
+        ]
+      },
+      "poison": {
+        "name": "skyctl-work-poison",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "depends_on": [
+          "azurerm_role_assignment.queue_deployer"
+        ]
+      }
+    },
     "azurerm_storage_management_policy": {
       "state": {
         "storage_account_id": "${azurerm_storage_account.state.id}",
         "rule": [
           {
-            "name": "expire-run-transcripts",
+            "name": "expire-runs-and-ledger",
             "enabled": true,
             "filters": {
               "prefix_match": [
-                "skyctl/skyctl/runs/"
+                "skyctl/skyctl/runs/",
+                "skyctl/skyctl/ledger/"
               ],
               "blob_types": [
                 "blockBlob"
@@ -182,32 +207,6 @@
         "type": "Block",
         "source_content": "# Rendered by skyctl deploy from the deployment spec. Do not edit by hand.\n\n[tasks.daily-engagement]\ngoal = \"Read the work account's notifications and draft replies to genuine product questions.\"\naccounts = [\"work\"]\nallow_writes = true\nmax_writes = 5\napproval = \"writes\"\n",
         "content_type": "application/toml"
-      }
-    },
-    "azurerm_servicebus_namespace": {
-      "main": {
-        "name": "skyctl-sb-${random_string.suffix.result}",
-        "location": "westeurope",
-        "resource_group_name": "${azurerm_resource_group.main.name}",
-        "sku": "Standard"
-      }
-    },
-    "azurerm_servicebus_queue": {
-      "work": {
-        "name": "skyctl-work",
-        "namespace_id": "${azurerm_servicebus_namespace.main.id}",
-        "lock_duration": "PT5M",
-        "max_delivery_count": 5,
-        "dead_lettering_on_message_expiration": true
-      }
-    },
-    "azurerm_servicebus_queue_authorization_rule": {
-      "keda": {
-        "name": "keda-listen",
-        "queue_id": "${azurerm_servicebus_queue.work.id}",
-        "listen": true,
-        "send": false,
-        "manage": false
       }
     },
     "azurerm_log_analytics_workspace": {
@@ -281,7 +280,7 @@
                 },
                 {
                   "name": "SKYCTL_QUEUE_URL",
-                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                  "value": "azqueue://${azurerm_storage_account.state.name}/skyctl-work"
                 },
                 {
                   "name": "SKYCTL_DELAYED_URL",
@@ -357,10 +356,10 @@
           ]
         },
         "depends_on": [
-          "azurerm_role_assignment.blob_app",
           "azurerm_role_assignment.kv_app",
-          "azurerm_role_assignment.sb_send",
-          "azurerm_role_assignment.sb_receive"
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.queue_app",
+          "azurerm_role_assignment.poison_app"
         ],
         "secret": [
           {
@@ -385,37 +384,10 @@
             "${azurerm_user_assigned_identity.app.id}"
           ]
         },
-        "secret": [
-          {
-            "name": "sb-listen",
-            "value": "${azurerm_servicebus_queue_authorization_rule.keda.primary_connection_string}"
-          }
-        ],
-        "event_trigger_config": {
+        "schedule_trigger_config": {
+          "cron_expression": "* * * * *",
           "parallelism": 1,
-          "replica_completion_count": 1,
-          "scale": {
-            "min_executions": 0,
-            "max_executions": 2,
-            "polling_interval_in_seconds": 30,
-            "rules": [
-              {
-                "name": "servicebus",
-                "custom_rule_type": "azure-servicebus",
-                "metadata": {
-                  "queueName": "skyctl-work",
-                  "namespace": "${azurerm_servicebus_namespace.main.name}",
-                  "messageCount": "1"
-                },
-                "authentication": [
-                  {
-                    "secret_name": "sb-listen",
-                    "trigger_parameter": "connection"
-                  }
-                ]
-              }
-            ]
-          }
+          "replica_completion_count": 1
         },
         "template": {
           "container": [
@@ -447,7 +419,7 @@
                 },
                 {
                   "name": "SKYCTL_QUEUE_URL",
-                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                  "value": "azqueue://${azurerm_storage_account.state.name}/skyctl-work"
                 },
                 {
                   "name": "SKYCTL_DELAYED_URL",
@@ -514,10 +486,10 @@
           ]
         },
         "depends_on": [
-          "azurerm_role_assignment.blob_app",
           "azurerm_role_assignment.kv_app",
-          "azurerm_role_assignment.sb_send",
-          "azurerm_role_assignment.sb_receive"
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.queue_app",
+          "azurerm_role_assignment.poison_app"
         ]
       },
       "schedule_tick": {
@@ -568,7 +540,7 @@
                 },
                 {
                   "name": "SKYCTL_QUEUE_URL",
-                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                  "value": "azqueue://${azurerm_storage_account.state.name}/skyctl-work"
                 },
                 {
                   "name": "SKYCTL_DELAYED_URL",
@@ -635,10 +607,10 @@
           ]
         },
         "depends_on": [
-          "azurerm_role_assignment.blob_app",
           "azurerm_role_assignment.kv_app",
-          "azurerm_role_assignment.sb_send",
-          "azurerm_role_assignment.sb_receive"
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.queue_app",
+          "azurerm_role_assignment.poison_app"
         ]
       },
       "schedule_daily_engagement": {
@@ -668,7 +640,7 @@
               "memory": "1Gi",
               "args": [
                 "invoke",
-                "{\"kind\":\"task.run\",\"task\":\"daily-engagement\"}"
+                "{\"kind\":\"task.run\",\"slot\":{\"cron\":\"0 9 * * mon-fri\",\"timezone\":\"UTC\"},\"task\":\"daily-engagement\"}"
               ],
               "env": [
                 {
@@ -689,7 +661,7 @@
                 },
                 {
                   "name": "SKYCTL_QUEUE_URL",
-                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                  "value": "azqueue://${azurerm_storage_account.state.name}/skyctl-work"
                 },
                 {
                   "name": "SKYCTL_DELAYED_URL",
@@ -756,10 +728,10 @@
           ]
         },
         "depends_on": [
-          "azurerm_role_assignment.blob_app",
           "azurerm_role_assignment.kv_app",
-          "azurerm_role_assignment.sb_send",
-          "azurerm_role_assignment.sb_receive"
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.queue_app",
+          "azurerm_role_assignment.poison_app"
         ]
       }
     }
@@ -774,7 +746,7 @@
         "SKYCTL_COMPUTE": "container-apps-job",
         "SKYCTL_SECRETS": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config",
         "SKYCTL_STATE_URL": "az://skyctl/skyctl",
-        "SKYCTL_QUEUE_URL": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work",
+        "SKYCTL_QUEUE_URL": "azqueue://${azurerm_storage_account.state.name}/skyctl-work",
         "SKYCTL_DELAYED_URL": "queue",
         "SKYCTL_AGENT_MODEL": "azure-openai:gpt-4.1",
         "SKYCTL_AGENT_ALLOW_WRITES": "true",
@@ -792,8 +764,8 @@
         "AZURE_OPENAI_ENDPOINT": "https://skyctl-openai.openai.azure.com"
       }
     },
-    "key_vault": {
-      "value": "${azurerm_key_vault.main.name}"
+    "state_url": {
+      "value": "az://skyctl/skyctl (account ${azurerm_storage_account.state.name})"
     },
     "storage_account": {
       "value": "${azurerm_storage_account.state.name}"

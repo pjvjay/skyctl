@@ -1,6 +1,9 @@
-# One deployment, five targets. Render with:
-#   skyctl deploy check  deploy/examples/skyctl.deploy.toml
-#   skyctl deploy render deploy/examples/skyctl.deploy.toml --target gcp --out build/gcp
+# Managed serverless on every cloud: ECS/Lambda, Container Apps, Cloud Run
+# (+ a bring-your-own Kubernetes cluster and Compose).
+# kubernetes.deploy.toml has the SAME intent on EKS, AKS and GKE.
+#
+#   skyctl deploy check  deploy/examples/managed.deploy.toml
+#   skyctl deploy render deploy/examples/managed.deploy.toml --target gcp --out build
 #
 # Everything above [targets] is cloud-neutral intent. Secrets are never
 # written here: Terraform targets take them as sensitive variables
@@ -35,10 +38,12 @@ enabled = true
 max_concurrency = 2
 visibility_seconds = 900
 max_attempts = 5
+poll_minutes = 1              # Azure Container Apps drains the Storage Queue on this schedule
 
-[state]
+[state]                       # the bucket holding the JSON job document; created on every cloud target
 versioning = true
-retention_days = 90
+retention_days = 90           # runs/ and ledger/ expire after this
+protect = true                # prevent_destroy: `terraform destroy` keeps the scheduled posts
 
 [[schedules]]
 name = "tick"
@@ -62,7 +67,7 @@ approval = "writes"
 
 [targets.aws]
 region = "us-east-1"
-compute = "ecs"
+compute = "ecs"               # or "lambda"; "eks" → see kubernetes.deploy.toml
 model = "bedrock:anthropic.claude-opus-5-5"
 vpc_id = "vpc-0123456789abcdef0"
 subnet_ids = ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"]
@@ -71,12 +76,14 @@ certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-
 
 [targets.azure]
 location = "westeurope"
+compute = "container-apps"    # Storage Queues; worker drains every poll_minutes
 model = "azure-openai:gpt-4.1"
 openai_endpoint = "https://skyctl-openai.openai.azure.com"
 
 [targets.gcp]
 project = "my-skyctl-project"
 region = "europe-west1"
+compute = "cloud-run"
 model = "vertex:claude-opus-5-5"
 
 [targets.kubernetes]

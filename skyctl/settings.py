@@ -7,6 +7,7 @@ Everything is an environment variable; URL-style values choose adapters:
 
     SKYCTL_CLOUD       local | aws | azure | gcp   (auto-detected if unset)
     SKYCTL_SECRETS     env | aws-sm://<name> | azure-kv://<vault>/<secret> | gcp-sm://<project>/<secret>
+                       (comma-separated list allowed; earlier entries win)
     SKYCTL_STATE_URL   file://./.skyctl | s3://bucket/prefix | az://container/prefix | gs://bucket/prefix
     SKYCTL_AGENT_MODEL provider:model (see skyctl.llm / skyctl.agent.chat)
     SKYCTL_HTTP_TOKEN  bearer token protecting /mcp and /runs
@@ -108,8 +109,12 @@ class Settings:
         )
 
     @property
+    def secret_urls(self) -> list[str]:
+        return [u.strip() for u in self.secrets_url.split(",") if u.strip()] or ["env"]
+
+    @property
     def secrets_are_remote(self) -> bool:
-        return self.secrets_url != "env"
+        return any(u != "env" for u in self.secret_urls)
 
 
 _loaded: Optional[Settings] = None
@@ -126,9 +131,10 @@ def load_settings(force: bool = False) -> Settings:
     settings = Settings.from_env()
     from .adapters import secret_store_for  # local import: adapters import ports
 
-    store = secret_store_for(settings.secrets_url, env_file=settings.env_file)
-    for key, value in store.load().items():
-        os.environ.setdefault(key, value)
+    for url in settings.secret_urls:
+        store = secret_store_for(url, env_file=settings.env_file)
+        for key, value in store.load().items():
+            os.environ.setdefault(key, value)
     # Secrets may carry settings too (e.g. SKYCTL_HTTP_TOKEN); re-read them.
     settings = Settings.from_env()
     _loaded = settings

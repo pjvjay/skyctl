@@ -8,6 +8,8 @@ ack / nack(delay)), four very different services underneath:
     -------------   ------------------------------   --------------------   ----------------------
     memory          per-receive window               yes                    yes
     SQS             VisibilityTimeout per receive    ≤ 900 s (DelaySeconds) ApproximateReceiveCount
+    Storage Queue   visibility per receive; every    ≤ 7 days (initial      dequeue_count
+                    update returns a NEW pop receipt visibility; TTL -1)    (no DLQ: <queue>-poison)
     Service Bus     peek-lock; lock duration is a    yes (scheduled         delivery_count
                     queue setting, renewable         enqueue time)
     Pub/Sub         ack deadline; modAckDeadline     no                     delivery_attempt (only
@@ -20,6 +22,7 @@ platform's capability set (skyctl.platform) advertises the same facts.
 URLs (SKYCTL_QUEUE_URL):
     memory://name
     sqs://<queue-url-without-scheme>            e.g. sqs://sqs.us-east-1.amazonaws.com/123456789012/skyctl
+    azqueue://<storage-account>/<queue>         Azure Storage Queue (Entra auth)
     servicebus://<namespace>.servicebus.windows.net/<queue>
     pubsub://<project>/<topic>?subscription=<subscription>
 """
@@ -240,6 +243,92 @@ class ServiceBusQueue:
 
 
 # ----------------------------------------------------------------------
+# Azure Storage Queues
+# ----------------------------------------------------------------------
+
+class AzureStorageQueue:
+    """
+    Azure Storage Queue with Entra ID auth (DefaultAzureCredential; role
+    "Storage Queue Data Contributor").
+
+    * Delay = initial visibility timeout, at most 7 days. A message's
+      visibility cannot outlast its time-to-live (default 7 days), so every
+      message is sent with TTL -1 (never expires).
+    * update_message() returns a NEW pop receipt and invalidates the old
+      one, so extend()/nack() write it back into message.receipt.
+    * There is no dead-letter queue: dead_letter() copies the message to
+      "<queue>-poison" (the convention Azure Functions uses) and deletes it.
+    """
+
+    supports_delay = True
+    max_delay_seconds = 7 * 24 * 3600
+    MAX_VISIBILITY = 7 * 24 * 3600
+
+    def __init__(self, account: str, queue: str, client=None, poison_client=None):
+        self.account = account
+        self.queue = queue
+        self._client = client
+        self._poison = poison_client
+
+    def _make(self, name: str):
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.queue import QueueClient
+
+        return QueueClient(f"https://{self.account}.queue.core.windows.net", name, credential=DefaultAzureCredential())
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = self._make(self.queue)
+        return self._client
+
+    @property
+    def poison(self):
+        if self._poison is None:
+            self._poison = self._make(f"{self.queue}-poison")
+        return self._poison
+
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str:
+        if delay_seconds > self.max_delay_seconds:
+            raise QueueCapabilityError("Storage Queue delays are limited to 7 days; the tick reconciler covers longer.")
+        msg = self.client.send_message(json.dumps(body), visibility_timeout=int(delay_seconds) or None, time_to_live=-1)
+        return msg.id
+
+    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]:
+        # Storage Queues have no long polling; emulate a short wait.
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            msgs = list(self.client.receive_messages(
+                max_messages=max(1, min(max_messages, 32)),
+                visibility_timeout=min(visibility_seconds, self.MAX_VISIBILITY),
+            ))
+            if msgs or time.monotonic() >= deadline:
+                break
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        return [
+            QueueMessage(id=m.id, body=json.loads(m.content), receipt=m.pop_receipt, attempt=int(m.dequeue_count or 1))
+            for m in msgs
+        ]
+
+    def ack(self, message: QueueMessage) -> None:
+        self.client.delete_message(message.id, message.receipt)
+
+    def nack(self, message: QueueMessage, delay_seconds: int = 0) -> None:
+        updated = self.client.update_message(
+            message.id, message.receipt, visibility_timeout=min(max(delay_seconds, 0), self.MAX_VISIBILITY)
+        )
+        message.receipt = updated.pop_receipt        # the old receipt is now invalid
+
+    def extend(self, message: QueueMessage, seconds: int) -> None:
+        self.nack(message, delay_seconds=seconds)
+
+    def dead_letter(self, message: QueueMessage, reason: str = "") -> None:
+        self.poison.send_message(json.dumps({"body": message.body, "reason": reason, "attempt": message.attempt}),
+                                 time_to_live=-1)
+        self.ack(message)
+
+
+# ----------------------------------------------------------------------
 # Google Pub/Sub
 # ----------------------------------------------------------------------
 
@@ -340,6 +429,8 @@ def queue_for(url: str):
         return SqsQueue(f"https://{parsed.netloc}{parsed.path}")
     if scheme == "servicebus":
         return ServiceBusQueue(parsed.netloc, parsed.path.strip("/"))
+    if scheme == "azqueue":
+        return AzureStorageQueue(parsed.netloc, parsed.path.strip("/"))
     if scheme == "pubsub":
         topic = parsed.path.strip("/")
         sub = parse_qs(parsed.query).get("subscription", [f"{topic}-worker"])[0]

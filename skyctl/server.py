@@ -12,7 +12,16 @@ The HTTP entry point for cloud deployments (`skyctl serve`):
     POST    /runs                   start a task-agent run; body = TaskSpec JSON → {run_id}
     GET     /runs/{run_id}          status + transcript
     POST    /runs/{run_id}/approve  execute the writes a run queued for approval
-    *       /mcp                    MCP over streamable HTTP (stateless, so it scales out)
+    GET     /plans                  recent plans
+    GET     /plans/{plan_id}        one plan: steps, approval, results
+    POST    /plans/{plan_id}/approve   {"plan_hash"}: approvers only (SKYCTL_APPROVER_TOKEN / SKYCTL_PLAN_APPROVERS)
+    POST    /plans/{plan_id}/execute   {"plan_hash"}: run an approved plan
+    POST    /plans/{plan_id}/cancel
+    *       /mcp                    MCP over streamable HTTP
+
+MCP sessions are stateless by default (any instance serves any request).
+Elicitation and progress need a stateful streaming session: set
+SKYCTL_MCP_STATEFUL=true and give the service session affinity.
 
 Auth is the chain in SKYCTL_AUTH (skyctl.platform.auth); /healthz and the
 OPTIONS handshake are public.
@@ -41,7 +50,7 @@ from starlette.routing import Mount, Route
 
 from .agent import AgentRunner, PolicyCeilingError, RunLog, TaskConfigError, TaskSpec, apply_deployment_ceilings
 from .manager import BskyManager
-from .platform.auth import AuthChain, AuthError, build_auth_chain
+from .platform.auth import AuthChain, AuthError, build_auth_chain, plan_approvers
 from .platform.capabilities import CapabilityError
 from .platform.invocation import Dispatcher, InvocationError, decode_http, default_dispatcher
 from .platform.logging import log_event, set_trace
@@ -269,6 +278,72 @@ def create_app(
             return JSONResponse({"error": "unknown run"}, status_code=404)
         return JSONResponse({"run_id": run_id, "approved": records})
 
+    # -- plans ---------------------------------------------------------------
+    def plan_context(request: Request):
+        from .planning import PlanStore
+        from .tools import ToolContext, ToolPolicy
+
+        d = settings.agent
+        ctx = ToolContext(get_manager(), policy=ToolPolicy(accounts=d.accounts, allow_writes=d.allow_writes,
+                                                           allow_delete=d.allow_delete, max_writes=d.max_writes),
+                          scheduler=state["scheduler"])
+        ctx.plans = PlanStore(runtime.object_store())
+        principal = getattr(request.state, "principal", None)
+        ctx.principal = principal.subject if principal is not None else "anonymous"
+        return ctx
+
+    async def list_plans(request: Request) -> Response:
+        ctx = plan_context(request)
+        return JSONResponse({"plans": ctx.plans.list(status=request.query_params.get("status"))})
+
+    async def get_plan(request: Request) -> Response:
+        record = plan_context(request).plans.get(request.path_params["plan_id"])
+        return JSONResponse(record) if record else JSONResponse({"error": "unknown plan"}, status_code=404)
+
+    async def approve_plan(request: Request) -> Response:
+        from .planning import PlanError
+
+        ctx = plan_context(request)
+        approvers = plan_approvers()
+        if ctx.principal.lower() not in approvers:
+            return JSONResponse({"error": f"{ctx.principal!r} may not approve plans (SKYCTL_APPROVER_TOKEN / "
+                                          "SKYCTL_PLAN_APPROVERS)"}, status_code=403)
+        body = await request.json() if await request.body() else {}
+        try:
+            record = ctx.plans.approve(request.path_params["plan_id"], str(body.get("plan_hash", "")),
+                                       by=ctx.principal, via="http")
+        except PlanError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return JSONResponse({"plan_id": record["id"], "status": record["status"], "approval": record["approval"]})
+
+    async def execute_plan_route(request: Request) -> Response:
+        import anyio
+
+        from .planning import ApprovalRequired, PlanError, execute_plan
+        from .tools import registry
+        from .tools.plan_tools import _detail
+
+        ctx = plan_context(request)
+        body = await request.json() if await request.body() else {}
+        try:
+            record = await anyio.to_thread.run_sync(lambda: execute_plan(
+                ctx.plans, request.path_params["plan_id"], str(body.get("plan_hash", "")), ctx, registry))
+        except ApprovalRequired as e:
+            return JSONResponse({"error": str(e)}, status_code=403)
+        except PlanError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return JSONResponse(_detail(record))
+
+    async def cancel_plan(request: Request) -> Response:
+        from .planning import PlanError
+
+        ctx = plan_context(request)
+        try:
+            record = ctx.plans.cancel(request.path_params["plan_id"], by=ctx.principal)
+        except PlanError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return JSONResponse({"plan_id": record["id"], "status": record["status"]})
+
     routes = [
         Route("/healthz", healthz),
         Route("/readyz", readyz),
@@ -278,6 +353,11 @@ def create_app(
         Route("/runs", start_run, methods=["POST"]),
         Route("/runs/{run_id}", get_run),
         Route("/runs/{run_id}/approve", approve_run, methods=["POST"]),
+        Route("/plans", list_plans),
+        Route("/plans/{plan_id}", get_plan),
+        Route("/plans/{plan_id}/approve", approve_plan, methods=["POST"]),
+        Route("/plans/{plan_id}/execute", execute_plan_route, methods=["POST"]),
+        Route("/plans/{plan_id}/cancel", cancel_plan, methods=["POST"]),
     ]
 
     # -- MCP -----------------------------------------------------------
@@ -286,7 +366,7 @@ def create_app(
     if mcp_server is False:
         mcp_server = None
     elif mcp_server is None and os.getenv("SKYCTL_HTTP_MCP", "true").lower() not in ("0", "false", "no"):
-        from .mcp_server import build_mcp_server
+        from .mcp_server import McpConfig, build_mcp_server
 
         policy = ToolPolicy(
             accounts=settings.agent.accounts,
@@ -294,8 +374,18 @@ def create_app(
             allow_delete=settings.agent.allow_delete,
             max_writes=settings.agent.max_writes,
         )
+        config = McpConfig.from_env(default_profile="plan", default_approval="out_of_band")
+        config.principal = "mcp-http"
+        config.grounding = "error" if os.getenv("SKYCTL_MCP_STATEFUL", "").lower() in ("1", "true", "yes") else "warning"
+        stateful = os.getenv("SKYCTL_MCP_STATEFUL", "").lower() in ("1", "true", "yes")
+        if config.approval == "elicit" and not stateful:
+            log_event("mcp.config", level="warning",
+                      message="SKYCTL_MCP_APPROVAL=elicit needs SKYCTL_MCP_STATEFUL=true (and session affinity); "
+                              "stateless sessions cannot carry the elicitation round-trip.")
         mcp_server = build_mcp_server(
-            get_manager(), policy, streamable_http_path="/", stateless_http=True, json_response=True
+            get_manager(), policy, config=config, state=runtime.object_store(), runner=get_runner(),
+            scheduler=state["scheduler"], streamable_http_path="/",
+            stateless_http=not stateful, json_response=not stateful, **_transport_security(),
         )
     if mcp_server is not None:
         mcp_app = mcp_server.streamable_http_app()
@@ -315,6 +405,26 @@ def create_app(
         middleware=[Middleware(AuthMiddleware, chain=auth_chain, runtime=runtime)],
         lifespan=lifespan,
     )
+
+
+def _transport_security() -> dict:
+    """
+    MCP SDKs protect *unauthenticated localhost* servers against DNS rebinding
+    by checking the Host header. This server always sits behind the auth
+    chain and, in the cloud, behind a load balancer whose Host is your domain.
+    Set SKYCTL_MCP_ALLOWED_HOSTS (e.g. "mcp.example.com,*.run.app") to keep
+    the check with the right hosts; otherwise authentication is the guard.
+    """
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings
+    except ImportError:          # older SDKs have no such check
+        return {}
+    hosts = [h.strip() for h in os.getenv("SKYCTL_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    if hosts:
+        origins = [o.strip() for o in os.getenv("SKYCTL_MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+        return {"transport_security": TransportSecuritySettings(
+            enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)}
+    return {"transport_security": TransportSecuritySettings(enable_dns_rebinding_protection=False)}
 
 
 def serve(host: str = "0.0.0.0", port: Optional[int] = None) -> None:

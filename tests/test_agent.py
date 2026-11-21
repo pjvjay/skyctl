@@ -121,7 +121,7 @@ def test_run_reads_then_writes_then_reports(manager, fake_atproto):
     # Tool results were fed back in order, with the untrusted-content note.
     results = {r.name: json.loads(r.content) for r in provider.calls[1]["messages"][-1].tool_results}
     assert results["get_notifications"]["note"].startswith("Content fetched")
-    assert results["list_accounts"][0]["account"] == "work"
+    assert results["list_accounts"]["accounts"][0]["account"] == "work"
 
     # The reply actually went out, to the right parent.
     assert len(work_pds.sent) == 1 and work_pds.sent[0]["reply_to"].parent.cid == "cid-n1"
@@ -222,20 +222,32 @@ def test_approval_workflow(manager, fake_atproto):
 
 
 def test_retried_run_does_not_repeat_writes(manager, fake_atproto):
+    """Same idempotency key (a retry of one logical run) → the write is skipped."""
     state = MemoryObjectStore()
     script = lambda: [tool_turn(("post", {"account": "work", "text": "once"})), final()]
-    task = TaskSpec(goal="g", allow_writes=True, name="nightly")
-    first = AgentRunner(manager, provider=Scripted(script()), state=state).run(task)
+    task = lambda: TaskSpec(goal="g", allow_writes=True, name="nightly", idempotency_key="nightly@2026-03-02T09:00:00+00:00")
+    first = AgentRunner(manager, provider=Scripted(script()), state=state).run(task())
     second_provider = Scripted(script())
-    second = AgentRunner(manager, provider=second_provider, state=state).run(task)
+    second = AgentRunner(manager, provider=second_provider, state=state).run(task())
     assert first.writes == 1 and second.writes == 0
     fed = next(iter(last_tool_results(second_provider).values()))
     assert fed["skipped"] is True and fed["previous"]["run_id"] == first.run_id
     work = next(c for c in fake_atproto.instances if c.sent)
     assert len(work.sent) == 1
-    # A different task key is a different write.
-    third = AgentRunner(manager, provider=Scripted(script()), state=state).run(TaskSpec(goal="g", allow_writes=True, name="other"))
-    assert third.writes == 1
+
+
+def test_same_task_name_on_a_new_day_may_repeat_a_write(manager, fake_atproto):
+    """The ledger is scoped to a run, never to the bare task name."""
+    state = MemoryObjectStore()
+    script = lambda: [tool_turn(("post", {"account": "work", "text": "Good morning"})), final()]
+    for day in ("2026-03-02", "2026-03-03"):
+        r = AgentRunner(manager, provider=Scripted(script()), state=state).run(
+            TaskSpec(goal="g", allow_writes=True, name="daily", idempotency_key=f"daily@{day}T09:00:00+00:00"))
+        assert r.writes == 1
+    # Two manual runs without a key are two runs, too.
+    for _ in range(2):
+        assert AgentRunner(manager, provider=Scripted(script()), state=state).run(
+            TaskSpec(goal="g", allow_writes=True, name="daily")).writes == 1
 
 
 def test_tool_schema_format_follows_the_provider(manager):
@@ -457,3 +469,42 @@ def test_cli_tick(cli_env, fake_atproto):
     out = json.loads(ticked.output)
     assert len(out["sent"]) == 1 and out["failed"] == []
     assert any(c.sent and c.sent[0]["text"] == "late post" for c in fake_atproto.instances)
+
+
+def test_a_failed_write_is_not_recorded_in_the_ledger(manager, fake_atproto):
+    """Regression: a retry must re-attempt a write that failed, not skip it as 'already made'."""
+    state = MemoryObjectStore()
+    fake = manager.client("work").login()._client
+    fake.fail_sends = 1
+    script = lambda: [tool_turn(("post", {"account": "work", "text": "important"})), final()]   # noqa: E731
+    task = lambda: TaskSpec(goal="g", allow_writes=True, idempotency_key="k1")                   # noqa: E731
+    first = AgentRunner(manager, provider=Scripted(script()), state=state).run(task())
+    assert fake.sent == [] and first.writes == 1       # attempted, failed
+    AgentRunner(manager, provider=Scripted(script()), state=state).run(task())
+    assert [s["text"] for s in fake.sent] == ["important"]
+
+
+def test_cli_plan_review_flow(cli_env, fake_atproto):
+    from skyctl.adapters import object_store_for
+    from skyctl.cli import cli
+    from skyctl.planning import Plan, PlanStore, check_plan
+    from skyctl.tools import ToolContext, ToolPolicy, registry
+    from skyctl import BskyManager
+
+    manager = BskyManager.from_env()
+    state = object_store_for("file://./.skyctl")
+    ctx = ToolContext(manager, policy=ToolPolicy(allow_writes=True))
+    p = Plan.model_validate({"goal": "Say hi", "steps": [
+        {"id": "a", "tool": "post", "args": {"account": "work", "text": "hi from a plan"}, "why": "greeting"}]})
+    rec = PlanStore(state).create(p, check_plan(p, ctx, registry), created_by="agent", approval_mode="out_of_band")
+    runner = CliRunner()
+    listed = runner.invoke(cli, ["plan", "list", "--json"])
+    assert listed.exit_code == 0 and json.loads(listed.output)[0]["status"] == "awaiting_approval"
+    shown = runner.invoke(cli, ["plan", "show", rec["id"]])
+    assert "hi from a plan" in shown.output and "[a] post as @work.test" in shown.output
+    declined = runner.invoke(cli, ["plan", "approve", rec["id"]], input="n\n")
+    assert "Not approved" in declined.output
+    approved = runner.invoke(cli, ["plan", "approve", rec["id"], "--execute"], input="y\n")
+    assert approved.exit_code == 0, approved.output
+    assert "approved by cli:" in approved.output and "completed" in approved.output
+    assert runner.invoke(cli, ["plan", "cancel", rec["id"]]).exit_code == 1        # already completed

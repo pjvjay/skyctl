@@ -33,6 +33,8 @@ Commands:
     skyctl worker                    Drain the work queue (event jobs, KEDA, ECS worker)
     skyctl daemon                    Schedules + worker in one process (Compose / VM)
     skyctl platform info|list        What platform this is and what it can do
+    skyctl plan list|show|approve|execute|cancel   Review agent-proposed plans
+    skyctl eval list|run             Score how a model turns free text into plans
     skyctl deploy render|check       Render one deployment spec for every target
 
 Most commands accept --json for machine-readable output.
@@ -922,26 +924,35 @@ def serve(host, port):
 
 
 @cli.command()
-@click.option("--read-only", is_flag=True, help="Expose only non-mutating tools.")
-@click.option("--dry-run", is_flag=True, help="Expose write tools but only preview them.")
+@click.option("--profile", type=click.Choice(["read", "plan", "direct", "admin"]), default="direct", show_default=True,
+              help="What the client may call directly. 'plan': reads + plans only (recommended for autonomous agents).")
+@click.option("--approval", type=click.Choice(["none", "client", "elicit", "out_of_band"]), default="client", show_default=True,
+              help="How plans that write are approved.")
+@click.option("--read-only", is_flag=True, help="Shortcut for --profile read.")
+@click.option("--dry-run", is_flag=True, help="Writes (direct or planned) only preview.")
 @click.option("--account", "accounts", multiple=True, help="Restrict to these aliases. Repeatable.")
-def mcp(read_only, dry_run, accounts):
+@click.option("--no-agent", is_flag=True, help="Do not offer agent_run (skyctl's own model).")
+def mcp(profile, approval, read_only, dry_run, accounts, no_agent):
     """Serve skyctl as an MCP server over stdio.
 
     \b
     Claude Desktop / Claude Code config:
-        {"mcpServers": {"skyctl": {"command": "skyctl", "args": ["mcp"]}}}
+        {"mcpServers": {"skyctl": {"command": "skyctl", "args": ["mcp", "--profile", "plan", "--approval", "elicit"]}}}
+    See docs/MCP_AGENT.md for profiles and approval modes.
     """
-    from .mcp_server import run_stdio
+    from .mcp_server import McpConfig, run_stdio
     from .tools import ToolPolicy
 
+    if read_only:
+        profile = "read"
     policy = ToolPolicy(
         accounts=list(accounts) or None,
-        allow_writes=not read_only,
-        allow_delete=not read_only,
+        allow_writes=profile != "read",
+        allow_delete=profile in ("direct", "admin"),
         max_writes=10_000,
     )
-    run_stdio(policy=policy, dry_run=dry_run)
+    run_stdio(policy=policy, dry_run=dry_run, config=McpConfig(profile=profile, approval=approval),
+              with_agent=not no_agent)
 
 
 # ------------------------------------------------------------------
@@ -1414,6 +1425,192 @@ def deploy_check(spec_file, as_json):
                 if not c.ok:
                     console.print(f"[red]✗[/red] {c.name} {c.target}: {escape(c.detail)}")
     if errors or any(not c.ok for c in results):
+        sys.exit(1)
+
+
+# ------------------------------------------------------------------
+# Plans (the human side of out-of-band approval)
+# ------------------------------------------------------------------
+
+@cli.group()
+def plan():
+    """Review, approve and execute plans proposed by agents (docs/MCP_AGENT.md)."""
+
+
+def _plan_ctx():
+    from .planning import PlanStore
+    from .settings import Settings
+    from .tools import ToolContext, ToolPolicy
+
+    runner = get_runner()
+    d = Settings.from_env().agent
+    ctx = ToolContext(runner.manager, policy=ToolPolicy(accounts=d.accounts, allow_writes=True,
+                                                        allow_delete=d.allow_delete, max_writes=max(d.max_writes, 50)))
+    ctx.plans = PlanStore(runner.state)
+    ctx.principal = f"cli:{os.getenv('USER', 'operator')}"
+    return ctx
+
+
+def _show_record(record: dict) -> None:
+    from .planning import Plan, PlanCheck, render_preview
+
+    check = PlanCheck(ok=True, plan_hash=record["plan_hash"], summary=record["check"]["summary"],
+                      preview=record["check"]["preview"])
+    console.print(f"[bold]{record['id']}[/bold] [cyan]{record['status']}[/cyan] "
+                  f"[dim](by {escape(record['created_by'])}, approval {record['approval']['mode']})[/dim]")
+    console.print(escape(render_preview(check, Plan.model_validate(record["plan"]))))
+    for w in record["check"].get("warnings", []):
+        console.print(f"[yellow]warning[/yellow] {escape(w['message'])}")
+    for sid, st in record["steps"].items():
+        if st["status"] != "pending":
+            link = (st.get("result") or {}).get("url", "") if isinstance(st.get("result"), dict) else ""
+            console.print(f"  {sid}: {st['status']} {escape(link or st.get('error') or '')}")
+
+
+@plan.command("list")
+@click.option("--status", default=None, help="Filter by status, e.g. awaiting_approval.")
+@json_option
+def plan_list(status, as_json):
+    """Recent plans."""
+    plans = _plan_ctx().plans.list(status=status)
+    if as_json:
+        emit_json(plans)
+        return
+    table = Table(title="Plans")
+    for col in ("Id", "Status", "Writes", "By", "Goal"):
+        table.add_column(col)
+    for p in plans:
+        table.add_row(p["id"], p["status"], str(p["writes"]), escape(p["created_by"]), escape(p["goal"][:60]))
+    console.print(table)
+
+
+@plan.command("show")
+@click.argument("plan_id")
+@json_option
+def plan_show(plan_id, as_json):
+    """Show a plan's preview, approval and step results."""
+    from .planning import PlanError
+
+    try:
+        record = _plan_ctx().plans.require(plan_id)
+    except PlanError as e:
+        fail(str(e), as_json)
+    emit_json(record) if as_json else _show_record(record)
+
+
+@plan.command("approve")
+@click.argument("plan_id")
+@click.option("--yes", "-y", is_flag=True, help="Approve without asking.")
+@click.option("--execute", "then_execute", is_flag=True, help="Execute right after approving.")
+def plan_approve(plan_id, yes, then_execute):
+    """Approve a plan after reviewing it. Approval binds to the plan's hash."""
+    from .planning import PlanError, execute_plan
+    from .tools import registry
+
+    ctx = _plan_ctx()
+    try:
+        record = ctx.plans.require(plan_id)
+        _show_record(record)
+        if not yes and not click.confirm("Approve this exact plan?", default=False):
+            console.print("Not approved.")
+            return
+        record = ctx.plans.approve(plan_id, record["plan_hash"], by=ctx.principal, via="cli")
+        console.print(f"[green]✓[/green] approved by {escape(ctx.principal)}")
+        if then_execute:
+            record = execute_plan(ctx.plans, plan_id, record["plan_hash"], ctx, registry)
+            _show_record(record)
+    except PlanError as e:
+        fail(str(e))
+
+
+@plan.command("execute")
+@click.argument("plan_id")
+@json_option
+def plan_execute_cmd(plan_id, as_json):
+    """Execute (or resume) an approved plan."""
+    from .planning import PlanError, execute_plan
+    from .tools import registry
+
+    ctx = _plan_ctx()
+    try:
+        record = ctx.plans.require(plan_id)
+        record = execute_plan(ctx.plans, plan_id, record["plan_hash"], ctx, registry)
+    except PlanError as e:
+        fail(str(e), as_json)
+    emit_json(record) if as_json else _show_record(record)
+    if record["status"] == "failed":
+        sys.exit(1)
+
+
+@plan.command("cancel")
+@click.argument("plan_id")
+def plan_cancel_cmd(plan_id):
+    """Cancel a plan that has not finished."""
+    from .planning import PlanError
+
+    try:
+        _plan_ctx().plans.cancel(plan_id, by=f"cli:{os.getenv('USER', 'operator')}")
+    except PlanError as e:
+        fail(str(e))
+    console.print(f"[green]✓[/green] cancelled {plan_id}")
+
+
+# ------------------------------------------------------------------
+# Evaluations
+# ------------------------------------------------------------------
+
+@cli.group("eval")
+def eval_group():
+    """Evaluate how well a model turns free-text requests into plans (no network, nothing executed)."""
+
+
+@eval_group.command("list")
+def eval_list():
+    """List the built-in scenarios."""
+    from .evals import SCENARIOS
+
+    for s in SCENARIOS:
+        console.print(f"[cyan]{s['id']}[/cyan]  {escape(s['request'][:90])}")
+
+
+@eval_group.command("run")
+@click.option("--model", default=None, help="provider:model (default: SKYCTL_AGENT_MODEL).")
+@click.option("--scenario", "only", multiple=True, help="Run only these scenario ids.")
+@click.option("--repeat", default=1, show_default=True, help="Runs per scenario (reports pass@N and pass^N).")
+@click.option("--file", "scenario_file", type=click.Path(exists=True), default=None,
+              help="A TOML file with [[scenarios]] in the same format as the built-ins.")
+@json_option
+def eval_run(model, only, repeat, scenario_file, as_json):
+    """Run scenarios against a model and score the plans it proposes."""
+    from .agent.chat import get_chat_provider
+    from .evals import SCENARIOS, run_suite
+    from .llm import LLMError, default_model
+
+    scenarios = SCENARIOS
+    if scenario_file:
+        import tomllib
+
+        with open(scenario_file, "rb") as f:
+            scenarios = tomllib.load(f)["scenarios"]
+    spec = model or default_model()
+    try:
+        get_chat_provider(spec)
+    except LLMError as e:
+        fail(str(e), as_json)
+    with status(f"Evaluating {spec}...", as_json):
+        report = run_suite(lambda: get_chat_provider(spec), scenarios=scenarios, repeat=repeat, only=list(only) or None)
+    data = report.to_dict()
+    if as_json:
+        emit_json({"model": spec, **data})
+    else:
+        table = Table(title=f"{spec}: pass^{repeat} {data['pass_all_n']:.0%}  pass@{repeat} {data['pass_at_n']:.0%}")
+        for col in ("Scenario", "Passed", "Failures"):
+            table.add_column(col)
+        for sid, row in data["scenarios"].items():
+            fails = "; ".join(sorted({f for run in row["failures"] for f in run}))[:120]
+            table.add_row(sid, f"{row['passed']}/{row['runs']}", escape(fails))
+        console.print(table)
+    if data["pass_all_n"] < 1:
         sys.exit(1)
 
 if __name__ == "__main__":

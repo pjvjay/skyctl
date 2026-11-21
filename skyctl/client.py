@@ -109,6 +109,7 @@ class BskyClient:
         session_dir: Optional[Union[str, Path]] = None,
         session_store: Optional["SessionStore"] = None,
         media_store: Optional["ObjectStore"] = None,
+        atproto_factory=None,
     ):
         """
         Args:
@@ -119,6 +120,9 @@ class BskyClient:
                 this is backed by the shared state bucket.
             media_store: Where image keys are read from when an image path
                 is not a local file (e.g. "media/kite.jpg" in the state bucket).
+            atproto_factory: Builds the underlying atproto client from a base
+                URL (or None); defaults to atproto.Client. Evaluation harnesses
+                pass a simulated network here (skyctl.testing.world).
         """
         self.config = config
         self.alias = config.alias
@@ -128,6 +132,7 @@ class BskyClient:
             session_store = FileSessionStore(session_dir)
         self.session_store = session_store
         self.media_store = media_store
+        self._atproto_factory = atproto_factory
         self._client = self._new_client()
         self._profile = None
         self._logged_in = False
@@ -137,9 +142,10 @@ class BskyClient:
     # ------------------------------------------------------------------
 
     def _new_client(self):
+        factory = self._atproto_factory or AtProtoClient
         if self.config.pds_url:
-            return AtProtoClient(self.config.pds_url)
-        return AtProtoClient()
+            return factory(self.config.pds_url)
+        return factory()
 
     @property
     def did(self) -> str:

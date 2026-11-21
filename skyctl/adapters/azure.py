@@ -33,5 +33,8 @@ class AzureKeyVaultStore:
             self._client = SecretClient(vault_url=url, credential=DefaultAzureCredential())
         return self._client
 
+    def load_raw(self) -> str:
+        return self._kv_client().get_secret(self.secret_name).value or ""
+
     def load(self) -> dict[str, str]:
-        return parse_secret_payload(self._kv_client().get_secret(self.secret_name).value or "")
+        return parse_secret_payload(self.load_raw())

@@ -16,26 +16,29 @@ from ..platform.cron import CronError, CronSpec, to_eventbridge
 from .render.base import Finding
 from .spec import DeploySpec
 
-# Which compute profile runs scheduled work on each target.
+# Which compute profile runs scheduled work, by (target, compute).
 SCHEDULE_PROFILE = {
     ("aws", "ecs"): ("aws", "ecs"),
     ("aws", "lambda"): ("aws", "lambda"),
-    "azure": ("azure", "container-apps-job"),
-    "gcp": ("gcp", "cloud-run-job"),
-    "kubernetes": ("kubernetes", "cronjob"),
-    "compose": ("compose", "compose"),
+    ("aws", "eks"): ("kubernetes", "cronjob"),
+    ("azure", "container-apps"): ("azure", "container-apps-job"),
+    ("azure", "aks"): ("kubernetes", "cronjob"),
+    ("gcp", "cloud-run"): ("gcp", "cloud-run-job"),
+    ("gcp", "gke"): ("kubernetes", "cronjob"),
+    ("kubernetes", "kubernetes"): ("kubernetes", "cronjob"),
+    ("compose", "compose"): ("compose", "compose"),
 }
-# The longest a queued/pushed invocation may run before the platform redelivers it.
+# The longest a queued/pushed invocation may run before the platform redelivers it
+# (and the worker heartbeat cannot extend it).
 DELIVERY_DEADLINE = {
-    "gcp": (600, "Pub/Sub push ack deadline"),
+    ("gcp", "cloud-run"): (600, "Pub/Sub push ack deadline"),
     ("aws", "lambda"): (900, "Lambda timeout"),
 }
 _ECR = re.compile(r"^\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/")
 
 
 def _schedule_profile(target: str, spec: DeploySpec):
-    key = ("aws", spec.targets.aws.compute) if target == "aws" else target
-    name, compute = SCHEDULE_PROFILE[key]
+    name, compute = SCHEDULE_PROFILE[(target, spec.compute_for(target))]
     platform = get_platform(name)
     return platform, platform.profile(compute)
 
@@ -73,26 +76,49 @@ def validate(spec: DeploySpec, target: str) -> list[Finding]:
                 add("error", f"schedule {s.name!r}: {e}")
 
     # -- delivery deadlines vs run time -----------------------------------
-    key = ("aws", spec.targets.aws.compute) if target == "aws" else target
+    key = (target, spec.compute_for(target))
     if key in DELIVERY_DEADLINE:
         deadline, what = DELIVERY_DEADLINE[key]
         if spec.policy.max_run_seconds > deadline - 30:
             add("error", f"policy.max_run_seconds={spec.policy.max_run_seconds} exceeds the {what} ({deadline}s) "
                          "less a safety margin; a long run would be redelivered and start again in parallel",
                 f"Set policy.max_run_seconds ≤ {deadline - 30}.")
+    compute = spec.compute_for(target)
     if target == "azure":
-        add("info", "Service Bus locks last at most 5 minutes; the worker renews them while a run is in progress")
+        add("info", "one-time posts more than 7 days ahead wait for the tick catch-up (Storage Queue delay limit)")
+        if compute == "container-apps" and spec.worker.enabled:
+            add("info", f"the worker drains the Storage Queue every {spec.worker.poll_minutes} min; "
+                        f"queued agent runs start within that time")
+    if compute == "gke" and spec.runtime.delayed_delivery:
+        add("info", "no native delayed delivery on GKE (Cloud Tasks needs a reachable endpoint); "
+                    "one-time posts are sent by the tick catch-up")
+    if compute in ("eks", "aks", "gke"):
+        cluster = getattr(spec.targets, target).kubernetes
+        if spec.service.enabled and spec.service.public:
+            if not cluster.ingress_host:
+                add("warning", "service.public on Kubernetes without kubernetes.ingress_host: no Ingress is rendered")
+        if compute == "eks":
+            if cluster.identity == "irsa" and not (cluster.oidc_provider_arn and cluster.oidc_issuer):
+                add("error", "identity = \"irsa\" needs oidc_provider_arn and oidc_issuer",
+                    "Or use identity = \"pod-identity\" (needs the EKS Pod Identity Agent add-on).")
+            if cluster.keda and not cluster.keda_operator_role_arn:
+                add("warning", "keda = true without keda_operator_role_arn: the KEDA operator must be able to "
+                               "assume the app role to read queue depth")
+        if compute == "aks":
+            add("info", "AKS needs the OIDC issuer and workload identity enabled on the cluster")
+        if compute == "gke":
+            add("info", "GKE needs Workload Identity enabled on the cluster and node pools")
 
     # -- HTTP service --------------------------------------------------------
     svc = spec.service
     if svc.enabled and target == "aws" and spec.targets.aws.compute == "lambda":
         add("error", "the HTTP service is not rendered for compute = \"lambda\"",
             "Use compute = \"ecs\", or run `skyctl serve` behind the Lambda Web Adapter yourself.")
-    if svc.enabled and svc.public and svc.auth == ["platform"] and target != "gcp":
+    if svc.enabled and svc.public and svc.auth == ["platform"] and (target, spec.compute_for(target)) != ("gcp", "cloud-run"):
         add("error", "public service with auth = [\"platform\"], but this renderer configures no platform "
                      "authentication for that target: anyone could call it",
             "Add \"bearer\" or an OIDC method to service.auth.")
-    if svc.enabled and target == "aws":
+    if svc.enabled and target == "aws" and spec.targets.aws.compute == "ecs":
         aws = spec.targets.aws
         missing = [n for n in ("vpc_id", "certificate_arn") if not getattr(aws, n)] + ([] if aws.subnet_ids else ["subnet_ids"])
         if missing and aws.compute == "ecs":

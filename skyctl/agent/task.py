@@ -57,12 +57,16 @@ class TaskSpec:
     deny_tools: list[str] = field(default_factory=list)
     context: dict = field(default_factory=dict)   # extra facts for the prompt
     idempotency_key: Optional[str] = None      # dedupe writes across retried runs
+    mode: str = "direct"                       # direct: call write tools | plan: propose a plan (docs/MCP_AGENT.md)
+    plan_approval: Optional[str] = None        # plan mode: none | out_of_band (default: from `approval`)
 
     def __post_init__(self):
         if not self.goal or not self.goal.strip():
             raise TaskConfigError("A task needs a goal.")
         if self.approval not in APPROVAL_MODES:
             raise TaskConfigError(f"approval must be one of {APPROVAL_MODES}, got {self.approval!r}.")
+        if self.mode not in ("direct", "plan"):
+            raise TaskConfigError(f"mode must be 'direct' or 'plan', got {self.mode!r}.")
         if self.accounts is not None:
             self.accounts = [a.lower() for a in self.accounts]
 
@@ -105,6 +109,8 @@ class RunResult:
     error: Optional[str] = None
     model: str = ""
     task: Optional[dict] = None
+    plan_id: Optional[str] = None              # plan mode: the plan the agent proposed
+    plan_status: Optional[str] = None
 
     @property
     def ok(self) -> bool:

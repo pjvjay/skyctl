@@ -7,7 +7,7 @@ the framework; it is independent of the compute platform.
     kind      schemes (built in)
     state     file, memory, s3, az, gs          (+ any fsspec scheme as a non-atomic fallback)
     secrets   env, aws-sm, azure-kv, gcp-sm
-    queue     memory, sqs, servicebus, pubsub
+    queue     memory, sqs, servicebus, azqueue, pubsub
     delayed   none, queue, eventbridge, cloudtasks
 
 Plugins add schemes via the `skyctl.services` entry point group; the entry
@@ -124,7 +124,7 @@ for _s, _f in (("file", _state_file), ("memory", _state_memory), ("s3", _state_s
     register_scheme("state", _s, _f)
 for _s in ("env", "aws-sm", "azure-kv", "gcp-sm"):
     register_scheme("secrets", _s, _secrets)
-for _s in ("memory", "sqs", "servicebus", "pubsub", "none"):
+for _s in ("memory", "sqs", "servicebus", "azqueue", "pubsub", "none"):
     register_scheme("queue", _s, _queue)
 for _s in ("none", "queue", "eventbridge", "cloudtasks"):
     register_scheme("delayed", _s, _delayed)

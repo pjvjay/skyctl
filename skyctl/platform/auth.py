@@ -6,7 +6,7 @@ as a chain of methods tried in order. Configure with SKYCTL_AUTH:
 
     method        who calls with it                               settings
     -----------   ---------------------------------------------   -----------------------------------------
-    bearer        humans, MCP clients, scripts                    SKYCTL_HTTP_TOKEN
+    bearer        humans, MCP clients, scripts                    SKYCTL_HTTP_TOKEN (+ SKYCTL_APPROVER_TOKEN)
     google-oidc   Cloud Run IAM callers, Pub/Sub push,            SKYCTL_OIDC_AUDIENCE, SKYCTL_OIDC_ALLOWED
                   Cloud Tasks, Cloud Scheduler (ID tokens)
     entra-oidc    Event Grid (Entra auth), Entra apps,            AZURE_TENANT_ID, SKYCTL_OIDC_AUDIENCE,
@@ -68,20 +68,29 @@ def _looks_like_jwt(token: str) -> bool:
 
 
 class StaticBearer(Authenticator):
+    """
+    Static bearer tokens, each mapped to a subject. SKYCTL_HTTP_TOKEN is the
+    "static-token" (agents, MCP clients); SKYCTL_APPROVER_TOKEN, if set, is
+    the "approver-token", the only static credential that may approve plans.
+    """
+
     name = "bearer"
 
-    def __init__(self, token: str):
-        if not token:
+    def __init__(self, token: str = "", approver_token: str = ""):
+        self.tokens = {t: subj for t, subj in ((token, "static-token"), (approver_token, "approver-token")) if t}
+        if not self.tokens:
             raise ValueError("bearer auth needs SKYCTL_HTTP_TOKEN")
-        self.token = token
+        if token and approver_token and token == approver_token:
+            raise ValueError("SKYCTL_APPROVER_TOKEN must differ from SKYCTL_HTTP_TOKEN")
 
     def authenticate(self, headers):
         presented = _bearer(headers)
         if presented is None or _looks_like_jwt(presented):
             return None                     # leave JWTs to the OIDC methods
-        if not hmac.compare_digest(presented, self.token):
-            raise AuthError("invalid bearer token")
-        return Principal("static-token", self.name)
+        for token, subject in self.tokens.items():
+            if hmac.compare_digest(presented, token):
+                return Principal(subject, self.name)
+        raise AuthError("invalid bearer token")
 
 
 class OidcJwt(Authenticator):
@@ -261,7 +270,7 @@ def build_auth_chain(spec: Optional[str] = None, env: Optional[Mapping[str, str]
     names = [n.strip().lower() for n in raw.split(",") if n.strip()]
     if not names:
         # Backwards compatible default: the static bearer token, or explicit anonymous.
-        if env.get("SKYCTL_HTTP_TOKEN"):
+        if env.get("SKYCTL_HTTP_TOKEN") or env.get("SKYCTL_APPROVER_TOKEN"):
             names = ["bearer"]
         elif env.get("SKYCTL_HTTP_ALLOW_ANON", "").lower() in ("1", "true", "yes"):
             names = ["platform"]
@@ -270,7 +279,7 @@ def build_auth_chain(spec: Optional[str] = None, env: Optional[Mapping[str, str]
     methods: list[Authenticator] = []
     for name in names:
         if name == "bearer":
-            methods.append(StaticBearer(env.get("SKYCTL_HTTP_TOKEN", "")))
+            methods.append(StaticBearer(env.get("SKYCTL_HTTP_TOKEN", ""), env.get("SKYCTL_APPROVER_TOKEN", "")))
         elif name == "google-oidc":
             methods.append(google_oidc(audience, allowed))
         elif name == "entra-oidc":
@@ -287,3 +296,12 @@ def build_auth_chain(spec: Optional[str] = None, env: Optional[Mapping[str, str]
         else:
             raise ValueError(f"Unknown auth method {name!r} in SKYCTL_AUTH")
     return AuthChain(methods)
+
+
+def plan_approvers(env: Optional[Mapping[str, str]] = None) -> set[str]:
+    """Principals allowed to approve plans: the approver token plus SKYCTL_PLAN_APPROVERS (subjects/emails)."""
+    env = os.environ if env is None else env
+    approvers = {a.strip().lower() for a in env.get("SKYCTL_PLAN_APPROVERS", "").split(",") if a.strip()}
+    if env.get("SKYCTL_APPROVER_TOKEN"):
+        approvers.add("approver-token")
+    return approvers

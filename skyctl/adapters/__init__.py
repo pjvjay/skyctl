@@ -39,14 +39,32 @@ __all__ = [
 ]
 
 
+class RawValueSecretStore:
+    """A secret holding one raw value (e.g. a token), exposed under a fixed name."""
+
+    def __init__(self, inner, key: str):
+        self.inner, self.key = inner, key
+
+    def load(self) -> dict[str, str]:
+        # The inner store parses JSON/dotenv; a raw token parses to nothing, so read it raw.
+        raw = self.inner.load_raw() if hasattr(self.inner, "load_raw") else None
+        return {self.key: raw.strip()} if raw else {}
+
+
 def secret_store_for(url: str, env_file: str = ".env"):
     """
     env                                   → .env / process env
     aws-sm://<name-or-arn>                → AWS Secrets Manager
     azure-kv://<vault>/<secret>           → Azure Key Vault
     gcp-sm://<project>/<secret>[@version] → Google Secret Manager
+
+    A "#NAME" suffix means the secret holds one raw value for variable NAME,
+    e.g. aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN.
     """
     url = (url or "env").strip()
+    if "#" in url:
+        base, _, key = url.partition("#")
+        return RawValueSecretStore(secret_store_for(base, env_file), key)
     if url in ("", "env"):
         return EnvSecretStore(env_file)
     scheme, sep, rest = url.partition("://")

@@ -112,13 +112,15 @@ def test_mcp_over_streamable_http(app):
         assert init.status_code == 200 and init.json()["result"]["serverInfo"]["name"] == "skyctl"
         listed = c.post("/mcp/", headers=h, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = [t["name"] for t in listed.json()["result"]["tools"]]
-        assert "post" in names and "delete_post" not in names
+        # Remote sessions default to the "plan" profile: reads + plans, no direct writes.
+        assert {"plan_create", "plan_execute", "get_notifications"} <= set(names)
+        assert "post" not in names and "delete_post" not in names
         called = c.post("/mcp/", headers=h, json={
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "list_accounts", "arguments": {}},
         })
         payload = json.loads(called.json()["result"]["content"][0]["text"])
-        assert payload == [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]
+        assert payload == {"accounts": [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]}
         assert c.post("/mcp/", headers=MCP_HEADERS, json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"}).status_code == 401
 
 
@@ -179,3 +181,54 @@ def test_readyz_describes_the_runtime(app):
         body = c.get("/readyz", headers={"Authorization": "Bearer tok"}).json()
         assert body["runtime"]["platform"] == "local" and body["auth"] == ["bearer"]
         assert "compute.background_after_response" in body["runtime"]["capabilities"]
+
+
+# ----------------------------------------------------------------------
+# Plans over HTTP: approval is separated from the agent's credential
+# ----------------------------------------------------------------------
+
+def _plan_app(manager, monkeypatch, state):
+    from skyctl.platform import Runtime, get_platform
+    from skyctl.platform.auth import build_auth_chain
+
+    monkeypatch.setenv("SKYCTL_HTTP_TOKEN", "agent-tok")
+    monkeypatch.setenv("SKYCTL_APPROVER_TOKEN", "human-tok")
+    settings = Settings(http_token="agent-tok", state_url="memory://plans",
+                        agent=AgentDefaults(allow_writes=True, max_writes=5, accounts=["work"]))
+    runtime = Runtime(settings, platform=get_platform("local"))
+    runtime._state = state
+    runner = AgentRunner(manager, provider=Scripted(), state=state)
+    return create_app(settings, manager=manager, runner=runner, runtime=runtime, mcp_server=False,
+                      auth_chain=build_auth_chain())
+
+
+def test_agent_token_cannot_approve_its_own_plan(manager, monkeypatch, fake_atproto):
+    from skyctl.planning import Plan, PlanStore, check_plan
+    from skyctl.tools import ToolContext, ToolPolicy, registry
+
+    state = MemoryObjectStore()
+    ctx = ToolContext(manager, policy=ToolPolicy(accounts=["work"], allow_writes=True))
+    p = Plan.model_validate({"goal": "g", "steps": [{"id": "a", "tool": "post", "args": {"account": "work", "text": "hello"}}]})
+    rec = PlanStore(state).create(p, check_plan(p, ctx, registry), created_by="mcp-http", approval_mode="out_of_band")
+    agent, human = {"Authorization": "Bearer agent-tok"}, {"Authorization": "Bearer human-tok"}
+    body = {"plan_hash": rec["plan_hash"]}
+    with TestClient(_plan_app(manager, monkeypatch, state)) as c:
+        assert c.get("/plans", headers=agent).json()["plans"][0]["status"] == "awaiting_approval"
+        assert c.post(f"/plans/{rec['id']}/execute", json=body, headers=agent).status_code == 403
+        denied = c.post(f"/plans/{rec['id']}/approve", json=body, headers=agent)
+        assert denied.status_code == 403 and "may not approve" in denied.json()["error"]
+        assert c.post(f"/plans/{rec['id']}/approve", json={"plan_hash": "sha256:x"}, headers=human).status_code == 409
+        ok = c.post(f"/plans/{rec['id']}/approve", json=body, headers=human)
+        assert ok.status_code == 200 and ok.json()["approval"]["by"] == "approver-token"
+        done = c.post(f"/plans/{rec['id']}/execute", json=body, headers=agent)
+        assert done.status_code == 200 and done.json()["status"] == "completed"
+        assert c.get(f"/plans/{rec['id']}", headers=agent).json()["events"][-1]["type"] == "completed"
+        assert c.get("/plans/nope", headers=agent).status_code == 404
+    assert [s["text"] for s in manager.client("work")._client.sent] == ["hello"]
+
+
+def test_approver_token_must_differ_from_agent_token():
+    from skyctl.platform.auth import StaticBearer
+
+    with pytest.raises(ValueError, match="must differ"):
+        StaticBearer("same", "same")

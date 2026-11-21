@@ -553,3 +553,67 @@ def test_worker_stops_between_messages_when_asked():
     run_worker(q, Dispatcher({"ok": lambda inv: handled.append(1)}), idle_exit_seconds=None,
                stop=stop_after_two, wait_seconds=0)
     assert len(handled) == 2 and len(q) == 3             # the rest stays queued for the next worker
+
+
+# ----------------------------------------------------------------------
+# Schedule slots: the portable idempotency key for scheduled runs
+# ----------------------------------------------------------------------
+
+def test_previous_fire_finds_the_slot():
+    from skyctl.platform.cron import previous_fire
+
+    utc = timezone.utc
+    assert previous_fire("0 9 * * mon-fri", now=datetime(2026, 3, 3, 9, 0, 30, tzinfo=utc)) == datetime(2026, 3, 3, 9, 0, tzinfo=utc)
+    # Saturday: the slot is still Friday's run.
+    assert previous_fire("0 9 * * mon-fri", now=datetime(2026, 3, 7, 12, 0, tzinfo=utc)) == datetime(2026, 3, 6, 9, 0, tzinfo=utc)
+    assert previous_fire("*/5 * * * *", now=datetime(2026, 3, 3, 9, 7, tzinfo=utc)) == datetime(2026, 3, 3, 9, 5, tzinfo=utc)
+    assert previous_fire("0 0 1 * *", now=datetime(2026, 3, 20, tzinfo=utc)) == datetime(2026, 3, 1, tzinfo=utc)
+    london = previous_fire("0 9 * * *", "Europe/London", now=datetime(2026, 7, 1, 8, 30, tzinfo=utc))
+    assert london.isoformat() == "2026-07-01T09:00:00+01:00"
+
+
+def test_scheduled_task_runs_key_the_ledger_by_slot(manager, fake_atproto, monkeypatch):
+    from skyctl.agent import AgentRunner
+    from skyctl.ports import ChatTurn, ToolCall
+    import skyctl.platform.cron as cron_mod
+
+    class Script:
+        model, tool_format = "s", "anthropic"
+
+        def chat(self, system, messages, tools):
+            if len(messages) == 1:
+                return ChatTurn("", [ToolCall("c", "post", {"account": "work", "text": "Good morning"})], "tool_use")
+            return ChatTurn("done", [], "end")
+
+    state = MemoryObjectStore()
+    runner = AgentRunner(manager, provider=Script(), state=state)
+    d = default_dispatcher(_runtime(agent=AgentDefaults(allow_writes=True)), manager=manager, runner=runner)
+    payload = {"kind": "task.run", "task": {"goal": "greet", "name": "greet", "allow_writes": True},
+               "slot": {"cron": "0 9 * * *", "timezone": "UTC"}}
+    monday = datetime(2026, 3, 2, 9, 0, 20, tzinfo=timezone.utc)
+    real = cron_mod.previous_fire
+    monkeypatch.setattr(cron_mod, "previous_fire", lambda c, tz="UTC", now=None: real(c, tz, now or clock["now"]))
+    clock = {"now": monday}
+    assert d.dispatch(Invocation("task.run", payload)).result["writes"] == 1
+    clock["now"] = monday + timedelta(minutes=3)          # platform retry / overlapping execution, same slot
+    assert d.dispatch(Invocation("task.run", payload)).result["writes"] == 0
+    clock["now"] = monday + timedelta(days=1)             # next day's slot
+    assert d.dispatch(Invocation("task.run", payload)).result["writes"] == 1
+    assert len(manager.client("work")._client.sent) == 2
+
+
+def test_multiple_secret_urls_merge_in_order(monkeypatch):
+    import os
+
+    import skyctl.adapters as adapters_mod
+    from skyctl.adapters.local import StaticSecretStore
+    from skyctl.settings import load_settings
+
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setenv("SKYCTL_SECRETS", "aws-sm://app/config, aws-sm://app/http-token")
+    maps = {"aws-sm://app/config": {"BSKY_ACCOUNTS": "work", "SKYCTL_HTTP_TOKEN": "from-config"},
+            "aws-sm://app/http-token": {"SKYCTL_HTTP_TOKEN": "from-token-secret", "OTHER": "x"}}
+    monkeypatch.setattr(adapters_mod, "secret_store_for", lambda url, env_file=".env": StaticSecretStore(maps[url]))
+    settings = load_settings(force=True)
+    assert settings.secret_urls == ["aws-sm://app/config", "aws-sm://app/http-token"]
+    assert settings.http_token == "from-config" and os.environ["OTHER"] == "x"

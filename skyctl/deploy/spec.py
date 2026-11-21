@@ -67,6 +67,8 @@ class WorkerSpec(_Strict):
     max_concurrency: int = Field(2, ge=1)
     visibility_seconds: int = Field(900, ge=60)
     max_attempts: int = Field(5, ge=1)
+    poll_minutes: int = Field(1, ge=1, le=60, description="Where the worker drains the queue on a schedule "
+                              "(Azure Container Apps + Storage Queues): how often.")
 
 
 class ScheduleSpec(_Strict):
@@ -83,6 +85,16 @@ class ScheduleSpec(_Strict):
             raise ValueError(f"invoke.kind must be one of {sorted(KNOWN_KINDS)}")
         return v
 
+    def payload(self) -> dict:
+        """
+        The Invocation a target delivers. Scheduled agent runs carry their
+        cron slot so retries and overlapping executions share one write-ledger
+        key (skyctl.platform.cron.previous_fire).
+        """
+        if self.invoke.get("kind") == "task.run":
+            return {**self.invoke, "slot": {"cron": self.cron, "timezone": self.timezone}}
+        return dict(self.invoke)
+
     @field_validator("cron")
     @classmethod
     def _cron(cls, v: str) -> str:
@@ -95,17 +107,53 @@ class ScheduleSpec(_Strict):
 
 
 class StateSpec(_Strict):
+    """
+    The state bucket: one JSON document for scheduled posts (queue.json, CAS),
+    plus sessions/, runs/, ledger/ and config/. Every cloud target creates it.
+    """
     versioning: bool = True
-    retention_days: int = Field(90, ge=1, description="Run transcripts (runs/) expire after this.")
+    retention_days: int = Field(90, ge=1, description="runs/ transcripts and ledger/ entries expire after this.")
+    protect: bool = Field(True, description="Terraform prevent_destroy on the bucket: the job document is the "
+                          "source of truth, so `terraform destroy` must not take it with the compute.")
 
 
 # ----------------------------------------------------------------------
 # Targets
 # ----------------------------------------------------------------------
 
+class ClusterSpec(_Strict):
+    """An existing Kubernetes cluster to run on (skyctl does not create clusters)."""
+    namespace: str = "skyctl"
+    keda: bool = False                          # scale the worker to zero with KEDA (must be installed)
+    keda_namespace: str = "keda"
+    ingress_host: Optional[str] = None
+    ingress_class: Optional[str] = None
+
+
+class EksSpec(ClusterSpec):
+    cluster_name: str
+    identity: Literal["pod-identity", "irsa"] = "pod-identity"
+    oidc_provider_arn: Optional[str] = None     # irsa only
+    oidc_issuer: Optional[str] = None           # irsa only, e.g. oidc.eks.us-east-1.amazonaws.com/id/ABC123
+    keda_operator_role_arn: Optional[str] = None  # lets the KEDA operator assume the app role to read SQS depth
+
+
+class AksSpec(ClusterSpec):
+    cluster_name: str
+    cluster_resource_group: str                 # needs OIDC issuer + workload identity enabled
+
+
+class GkeSpec(ClusterSpec):
+    pass                                        # needs GKE Workload Identity enabled
+
+
+K8S_COMPUTE = {"eks", "aks", "gke"}
+
+
 class AwsTarget(_Strict):
     region: str
-    compute: Literal["ecs", "lambda"] = "ecs"
+    compute: Literal["ecs", "lambda", "eks"] = "ecs"
+    kubernetes: Optional[EksSpec] = None
     model: Optional[str] = None
     vpc_id: Optional[str] = None
     subnet_ids: list[str] = []
@@ -113,21 +161,44 @@ class AwsTarget(_Strict):
     assign_public_ip: bool = True
     certificate_arn: Optional[str] = None       # HTTPS listener for the service
 
+    @model_validator(mode="after")
+    def _k8s(self):
+        if self.compute == "eks" and self.kubernetes is None:
+            raise ValueError('compute = "eks" needs a [targets.aws.kubernetes] table (cluster_name, ...)')
+        return self
+
 
 class AzureTarget(_Strict):
     location: str
+    compute: Literal["container-apps", "aks"] = "container-apps"
+    kubernetes: Optional[AksSpec] = None
     model: Optional[str] = None
     openai_endpoint: Optional[str] = None       # https://<resource>.openai.azure.com
     openai_resource_id: Optional[str] = None    # grants the identity "Cognitive Services OpenAI User"
+
+    @model_validator(mode="after")
+    def _k8s(self):
+        if self.compute == "aks" and self.kubernetes is None:
+            raise ValueError('compute = "aks" needs a [targets.azure.kubernetes] table (cluster_name, cluster_resource_group)')
+        return self
 
 
 class GcpTarget(_Strict):
     project: str
     region: str
+    compute: Literal["cloud-run", "gke"] = "cloud-run"
+    kubernetes: Optional[GkeSpec] = None
     model: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _k8s(self):
+        if self.compute == "gke" and self.kubernetes is None:
+            raise ValueError('compute = "gke" needs a [targets.gcp.kubernetes] table')
+        return self
 
 
 class KubernetesTarget(_Strict):
+    """Any cluster, bring-your-own services: nothing cloud-side is provisioned."""
     namespace: str = "skyctl"
     cloud: Literal["aws", "azure", "gcp", "none"] = "none"
     identity: Optional[str] = None              # IAM role ARN / UAMI client id / GSA email
@@ -191,6 +262,10 @@ class DeploySpec(_Strict):
         return self
 
     # -- helpers for renderers ------------------------------------------
+
+    def compute_for(self, target: str) -> str:
+        t = getattr(self.targets, target)
+        return getattr(t, "compute", None) or {"kubernetes": "kubernetes", "compose": "compose"}[target]
 
     def model_for(self, target: str) -> str:
         t = getattr(self.targets, target, None)

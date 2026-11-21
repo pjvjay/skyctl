@@ -3,16 +3,18 @@ skyctl.deploy.render.aws
 ========================
 DeploySpec → Terraform JSON for AWS.
 
-    intent              compute = "ecs"                              compute = "lambda"
-    ------------------  -------------------------------------------  ----------------------------------
-    secrets             Secrets Manager (runtime fetch); the HTTP    Secrets Manager (runtime fetch; Lambda
-                        token injected natively by ECS               has no native secret injection)
-    state               S3 (CAS via If-Match), versioned, KMS, lifecycle on runs/
-    worker              ECS service scaled 0..N on queue depth        SQS event source mapping,
-                        (visible + in-flight, so scale-in waits)      ReportBatchItemFailures
-    schedules           EventBridge Scheduler → ECS RunTask           EventBridge Scheduler → Lambda
-    delayed delivery    EventBridge Scheduler at() → SQS work queue (self-deleting)
-    HTTP service        ECS service behind an ALB (HTTPS)             (not rendered; see validate)
+Backing services (identical for every compute mode, see aws_backing()):
+secrets in Secrets Manager; the state bucket (S3, CAS via If-Match, KMS,
+versioned, lifecycle on runs/ and ledger/, prevent_destroy); SQS work queue
++ DLQ; EventBridge Scheduler group for delayed delivery; one IAM policy.
+
+    intent          compute = "ecs"                    "lambda"                          "eks" (existing cluster)
+    --------------  ---------------------------------  --------------------------------  -------------------------------
+    identity        ECS task role                      Lambda role                       EKS Pod Identity (or IRSA)
+    HTTP token      ECS native secret injection        (no HTTP service)                 fetched: …/http-token#SKYCTL_HTTP_TOKEN
+    worker          ECS service 0..N on queue depth    SQS event source mapping          Deployment or KEDA ScaledJob
+    schedules       EventBridge Scheduler → RunTask    EventBridge Scheduler → Lambda    CronJob (Forbid, timeZone)
+    HTTP service    ECS behind an ALB (HTTPS)          —                                 Deployment + Service (+ Ingress)
 
 Gotchas handled here, each worth a comment because each has bitten someone:
 * ECS `secrets` are fetched by the *execution* role, not the task role.
@@ -26,10 +28,13 @@ Gotchas handled here, each worth a comment because each has bitten someone:
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from typing import Optional
 
 from ...platform.cron import CronSpec, to_eventbridge
 from ..spec import DeploySpec
 from .base import Artifact, RenderedSchedule, TfDoc, Workload, common_env, iam_json, invoke_args, ref
+from .k8s_common import KedaTrigger, build_k8s, emit_k8s
 
 CONTAINER = "skyctl"
 
@@ -38,30 +43,39 @@ def _assume(service: str) -> str:
     return iam_json([{"Effect": "Allow", "Principal": {"Service": service}, "Action": "sts:AssumeRole"}])
 
 
-def render_aws(spec: DeploySpec) -> Artifact:
+@dataclass
+class AwsBacking:
+    """The backing services every compute mode shares."""
+    secrets_url: str
+    state_url: str
+    queue_url: str
+    delayed_url: str
+    bucket: str
+    queue: str
+    token_secret: Optional[str]
+    statements: list
+
+
+def aws_backing(spec: DeploySpec, tf: TfDoc, account_id: str, *, fetch_token: bool, visibility: int) -> AwsBacking:
     t = spec.targets.aws
     app = spec.app.name
-    art = Artifact("aws")
-    tf = TfDoc({"aws": {"source": "hashicorp/aws", "version": ">= 5.60"}}, {"aws": {"region": t.region}})
-    image = tf.variable("image", default=spec.app.image, description="Container image (ECR for Lambda).")
-    tf.variable("secrets_json", sensitive=True, description="The BSKY_* / API-key map as JSON or dotenv text.")
-    bearer = spec.service.enabled and "bearer" in spec.service.auth
-    if bearer:
-        tf.variable("http_token", sensitive=True, description="Bearer token for the HTTP service.")
-    account = tf.data("aws_caller_identity", "current")
-    account_id = ref(account, "account_id")
-    lam = t.compute == "lambda"
 
     # -- secrets -----------------------------------------------------------
     secret = tf.resource("aws_secretsmanager_secret", "config", {"name": f"{app}/config", "recovery_window_in_days": 7})
     tf.resource("aws_secretsmanager_secret_version", "config", {"secret_id": ref(secret, "id"), "secret_string": "${var.secrets_json}"})
     token_secret = None
-    if bearer:
+    if spec.service.enabled and "bearer" in spec.service.auth:
         token_secret = tf.resource("aws_secretsmanager_secret", "http_token", {"name": f"{app}/http-token", "recovery_window_in_days": 7})
         tf.resource("aws_secretsmanager_secret_version", "http_token", {"secret_id": ref(token_secret, "id"), "secret_string": "${var.http_token}"})
+    secrets_url = f"aws-sm://{app}/config"
+    if token_secret and fetch_token:
+        secrets_url += f",aws-sm://{app}/http-token#SKYCTL_HTTP_TOKEN"
 
-    # -- state ---------------------------------------------------------------
-    bucket = tf.resource("aws_s3_bucket", "state", {"bucket_prefix": f"{app}-state-"})
+    # -- state bucket: one JSON document (queue.json) + sessions/ runs/ ledger/ config/ ----
+    bucket_body = {"bucket_prefix": f"{app}-state-"}
+    if spec.state.protect:
+        bucket_body["lifecycle"] = {"prevent_destroy": True}
+    bucket = tf.resource("aws_s3_bucket", "state", bucket_body)
     tf.resource("aws_s3_bucket_public_access_block", "state", {
         "bucket": ref(bucket, "id"), "block_public_acls": True, "block_public_policy": True,
         "ignore_public_acls": True, "restrict_public_buckets": True,
@@ -77,6 +91,8 @@ def render_aws(spec: DeploySpec) -> Artifact:
         "rule": [
             {"id": "expire-run-transcripts", "status": "Enabled", "filter": {"prefix": "skyctl/runs/"},
              "expiration": {"days": spec.state.retention_days}},
+            {"id": "expire-write-ledger", "status": "Enabled", "filter": {"prefix": "skyctl/ledger/"},
+             "expiration": {"days": spec.state.retention_days}},
             {"id": "expire-old-versions", "status": "Enabled", "filter": {},
              "noncurrent_version_expiration": {"noncurrent_days": 30}},
         ],
@@ -88,10 +104,6 @@ def render_aws(spec: DeploySpec) -> Artifact:
         })
 
     # -- queue + delayed delivery -------------------------------------------
-    max_timeout = max([s.timeout_s for s in spec.schedules] + [spec.policy.max_run_seconds + 60])
-    visibility = spec.worker.visibility_seconds
-    if lam:
-        visibility = max(visibility, min(6 * min(max_timeout, 900), 43_200))
     dlq = tf.resource("aws_sqs_queue", "dlq", {"name": f"{app}-work-dlq", "message_retention_seconds": 1_209_600,
                                                 "sqs_managed_sse_enabled": True})
     queue = tf.resource("aws_sqs_queue", "work", {
@@ -100,7 +112,6 @@ def render_aws(spec: DeploySpec) -> Artifact:
         "sqs_managed_sse_enabled": True,
         "redrive_policy": json.dumps({"deadLetterTargetArn": ref(dlq, "arn"), "maxReceiveCount": spec.worker.max_attempts}),
     })
-    queue_url = f"sqs://sqs.{t.region}.amazonaws.com/{account_id}/{app}-work"
     delayed_url = "none"
     group = f"{app}-delayed"
     if spec.runtime.delayed_delivery:
@@ -112,9 +123,10 @@ def render_aws(spec: DeploySpec) -> Artifact:
         })
         delayed_url = f"eventbridge://{group}?target={ref(queue, 'arn')}&role={ref(delivery, 'arn')}"
 
-    # -- identity ------------------------------------------------------------
+    # -- what the workload may do -------------------------------------------
+    secret_arns = [ref(secret, "arn")] + ([ref(token_secret, "arn")] if token_secret and fetch_token else [])
     statements = [
-        {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": ref(secret, "arn")},
+        {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret_arns if len(secret_arns) > 1 else secret_arns[0]},
         {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], "Resource": f"{ref(bucket, 'arn')}/*"},
         {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": ref(bucket, "arn")},
         {"Effect": "Allow", "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage",
@@ -129,27 +141,94 @@ def render_aws(spec: DeploySpec) -> Artifact:
     if spec.model_for("aws").startswith("bedrock:"):
         # Model and inference-profile ARNs vary by region; narrow this once you pin a model.
         statements.append({"Effect": "Allow", "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], "Resource": "*"})
-    app_policy = iam_json(statements)
 
-    auth = list(spec.service.auth)
+    return AwsBacking(
+        secrets_url=secrets_url, state_url=f"s3://{ref(bucket, 'bucket')}/skyctl",
+        queue_url=f"sqs://sqs.{t.region}.amazonaws.com/{account_id}/{app}-work", delayed_url=delayed_url,
+        bucket=bucket, queue=queue, token_secret=token_secret, statements=statements,
+    )
+
+
+def render_aws(spec: DeploySpec) -> Artifact:
+    t = spec.targets.aws
+    art = Artifact("aws")
+    providers = {"aws": {"source": "hashicorp/aws", "version": ">= 5.60"}}
+    if t.compute == "eks":
+        providers["local"] = {"source": "hashicorp/local", "version": ">= 2.4"}
+    tf = TfDoc(providers, {"aws": {"region": t.region}})
+    image = tf.variable("image", default=spec.app.image, description="Container image (ECR for Lambda).")
+    tf.variable("secrets_json", sensitive=True, description="The BSKY_* / API-key map as JSON or dotenv text.")
+    if spec.service.enabled and "bearer" in spec.service.auth:
+        tf.variable("http_token", sensitive=True, description="Bearer token for the HTTP service.")
+    account_id = ref(tf.data("aws_caller_identity", "current"), "account_id")
+
+    max_timeout = max([s.timeout_s for s in spec.schedules] + [spec.policy.max_run_seconds + 60])
+    visibility = spec.worker.visibility_seconds
+    if t.compute == "lambda":
+        visibility = max(visibility, min(6 * min(max_timeout, 900), 43_200))
+    backing = aws_backing(spec, tf, account_id, fetch_token=t.compute == "eks", visibility=visibility)
+
+    k8s = t.compute == "eks"
     env = common_env(
-        spec, "aws", platform="aws", compute=t.compute, secrets=f"aws-sm://{app}/config",
-        state_url=f"s3://{ref(bucket, 'bucket')}/skyctl", queue_url=queue_url, delayed_url=delayed_url, auth=auth,
-        extra={} if lam else {"AWS_REGION": t.region},
+        spec, "aws", platform="kubernetes" if k8s else "aws",
+        compute="deployment" if k8s else t.compute, secrets=backing.secrets_url,
+        state_url=backing.state_url, queue_url=backing.queue_url, delayed_url=backing.delayed_url,
+        auth=list(spec.service.auth),
+        extra={} if t.compute == "lambda" else {"AWS_REGION": t.region},
     )
     art.env = env
+    app_policy = iam_json(backing.statements)
 
-    if lam:
-        _render_lambda(spec, tf, art, image, env, app_policy, queue, max_timeout)
+    if t.compute == "lambda":
+        _render_lambda(spec, tf, art, image, env, app_policy, backing.queue, max_timeout)
+    elif t.compute == "eks":
+        _render_eks(spec, tf, art, env, app_policy, backing)
     else:
-        _render_ecs(spec, tf, art, image, env, app_policy, queue, token_secret, account_id)
+        _render_ecs(spec, tf, art, image, env, app_policy, backing.queue, backing.token_secret, account_id)
 
     tf.output("env", env)
-    tf.output("state_bucket", ref(bucket, "bucket"))
-    tf.output("queue_url", ref(queue, "url"))
+    tf.output("state_url", backing.state_url)
+    tf.output("queue_url", ref(backing.queue, "url"))
     art.terraform = tf.doc
     art.files["main.tf.json"] = tf.to_json()
     return art
+
+
+# ----------------------------------------------------------------------
+# EKS (existing cluster)
+# ----------------------------------------------------------------------
+
+def _render_eks(spec, tf: TfDoc, art: Artifact, env, app_policy, backing: AwsBacking):
+    t = spec.targets.aws
+    k = t.kubernetes
+    app = spec.app.name
+    subject = f"system:serviceaccount:{k.namespace}:{app}"
+    if k.identity == "irsa":
+        trust = [{"Effect": "Allow", "Principal": {"Federated": k.oidc_provider_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
+                  "Condition": {"StringEquals": {f"{k.oidc_issuer}:sub": subject, f"{k.oidc_issuer}:aud": "sts.amazonaws.com"}}}]
+    else:
+        trust = [{"Effect": "Allow", "Principal": {"Service": "pods.eks.amazonaws.com"}, "Action": ["sts:AssumeRole", "sts:TagSession"]}]
+    if k.keda and k.keda_operator_role_arn:
+        # KEDA reads queue depth by assuming this role from its own identity.
+        trust.append({"Effect": "Allow", "Principal": {"AWS": k.keda_operator_role_arn}, "Action": "sts:AssumeRole"})
+    role = tf.resource("aws_iam_role", "app", {"name": f"{app}-eks", "assume_role_policy": iam_json(trust)})
+    tf.resource("aws_iam_role_policy", "app", {"name": "skyctl", "role": ref(role, "id"), "policy": app_policy})
+    annotations = None
+    if k.identity == "pod-identity":
+        tf.resource("aws_eks_pod_identity_association", "app", {
+            "cluster_name": k.cluster_name, "namespace": k.namespace, "service_account": app, "role_arn": ref(role, "arn"),
+        })
+    else:
+        annotations = {"eks.amazonaws.com/role-arn": ref(role, "arn")}
+    keda = None
+    if k.keda:
+        keda = KedaTrigger("aws-sqs-queue",
+                           {"queueURL": ref(backing.queue, "url"), "queueLength": "1", "awsRegion": t.region},
+                           {"provider": "aws", "roleArn": ref(role, "arn")})
+    emit_k8s(tf, art, build_k8s(
+        spec, namespace=k.namespace, env=env, sa_annotations=annotations, keda=keda,
+        ingress_host=k.ingress_host, ingress_class=k.ingress_class,
+    ))
 
 
 # ----------------------------------------------------------------------
@@ -307,7 +386,7 @@ def _render_ecs(spec, tf: TfDoc, art: Artifact, image, env, app_policy, queue, t
         })
         for s in spec.schedules:
             expr = to_eventbridge(CronSpec(s.cron, s.timezone))
-            overrides = {"containerOverrides": [{"name": CONTAINER, "command": invoke_args(s.invoke)}]}
+            overrides = {"containerOverrides": [{"name": CONTAINER, "command": invoke_args(s.payload())}]}
             tf.resource("aws_scheduler_schedule", s.name.replace("-", "_"), {
                 "name": f"{app}-{s.name}", "group_name": "default",
                 "schedule_expression": expr, "schedule_expression_timezone": s.timezone,
@@ -321,7 +400,7 @@ def _render_ecs(spec, tf: TfDoc, art: Artifact, image, env, app_policy, queue, t
                     },
                 },
             })
-            art.schedules.append(RenderedSchedule(s.name, expr, s.timezone, s.invoke, overlap_guard="app"))
+            art.schedules.append(RenderedSchedule(s.name, expr, s.timezone, s.payload(), overlap_guard="app"))
         art.workloads.append(Workload("job", "job", "ecs", ["invoke", "<schedule payload>"]))
 
 
@@ -361,8 +440,8 @@ def _render_lambda(spec, tf: TfDoc, art: Artifact, image, env, app_policy, queue
                 "name": f"{app}-{s.name}", "group_name": "default",
                 "schedule_expression": expr, "schedule_expression_timezone": s.timezone,
                 "flexible_time_window": {"mode": "OFF"},
-                "target": {"arn": ref(fn, "arn"), "role_arn": ref(sched_role, "arn"), "input": json.dumps(s.invoke),
+                "target": {"arn": ref(fn, "arn"), "role_arn": ref(sched_role, "arn"), "input": json.dumps(s.payload()),
                            "retry_policy": {"maximum_retry_attempts": 2}},
             })
-            art.schedules.append(RenderedSchedule(s.name, expr, s.timezone, s.invoke, overlap_guard="app"))
+            art.schedules.append(RenderedSchedule(s.name, expr, s.timezone, s.payload(), overlap_guard="app"))
     art.workloads.append(Workload("function", "job", "lambda", ["skyctl.platform.lambda_handler.handler"]))

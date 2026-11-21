@@ -20,11 +20,24 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from pydantic import ValidationError, create_model
+
+
+_AT_URI = re.compile(r"at://[A-Za-z0-9:._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._~-]+")
+MAX_SEEN_URIS = 10_000
+
+
+def _remember_uris(ctx, result) -> None:
+    """Grounding: note every at:// URI a tool returned, so plans can be checked against what was observed."""
+    seen = getattr(ctx, "seen_uris", None)
+    if seen is None or len(seen) >= MAX_SEEN_URIS:
+        return
+    seen.update(_AT_URI.findall(json.dumps(result, default=str)))
 
 
 class ToolError(Exception):
@@ -48,7 +61,7 @@ class ToolSpec:
 
     @property
     def input_schema(self) -> dict:
-        schema = self.input_model.model_json_schema()
+        schema = _inline_refs(self.input_model.model_json_schema())
         schema.pop("title", None)
         for prop in schema.get("properties", {}).values():
             prop.pop("title", None)
@@ -72,6 +85,29 @@ class ToolSpec:
         wrapper.__name__ = self.name
         wrapper.__doc__ = self.description
         return wrapper
+
+
+def _inline_refs(schema: dict) -> dict:
+    """
+    Replace {"$ref": "#/$defs/X"} with the definition and drop $defs, so every
+    consumer (Anthropic, OpenAI-compatible, MCP clients) gets a self-contained
+    schema. Tool schemas here are not recursive.
+    """
+    defs = schema.pop("$defs", {})
+
+    def walk(node):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                target = walk(dict(defs[ref.split("/")[-1]]))
+                extra = {k: v for k, v in node.items() if k != "$ref"}
+                return {**target, **extra}
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return node
+
+    return walk(schema)
 
 
 def _model_from_signature(fn: Callable, name: str):
@@ -137,6 +173,8 @@ class ToolRegistry:
         def decorate(fn: Callable) -> Callable:
             tool_name = name or fn.__name__
             description = inspect.cleandoc(fn.__doc__ or tool_name)
+            # Tags drive exposure profiles; default: read | write | destructive.
+            inferred = ("destructive",) if destructive else ("write",) if mutating else ("read",)
             self.register(
                 ToolSpec(
                     name=tool_name,
@@ -146,7 +184,7 @@ class ToolRegistry:
                     mutating=mutating or destructive,
                     destructive=destructive,
                     account_param=account_param,
-                    tags=tags,
+                    tags=tuple(tags) or inferred,
                 )
             )
             return fn
@@ -260,10 +298,14 @@ class ToolRegistry:
                     return record
             record.result = spec.fn(ctx, **clean)
             record.ok = True
+            _remember_uris(ctx, record.result)
             if spec.mutating:
                 if policy is not None:
                     policy.count_write(ctx)
-                if ledger is not None:
+                # Only a write that took effect goes in the ledger: recording a failed attempt
+                # would make a retry skip it and report success for a post that never went out.
+                took_effect = not (isinstance(record.result, dict) and record.result.get("success") is False)
+                if ledger is not None and took_effect:
                     ledger.record(ledger.key_for(name, clean), {"run_id": getattr(ctx, "run_id", ""), "result": record.result})
             return record
         except ToolDenied as e:

@@ -280,3 +280,67 @@ class FakeCloudTasks:
         if request["name"] not in self.tasks:
             raise NotFound("no task")
         del self.tasks[request["name"]]
+
+
+# ----------------------------------------------------------------------
+# Azure Storage Queue (azure-storage-queue QueueClient)
+# ----------------------------------------------------------------------
+
+
+class FakeStorageQueue:
+    """
+    Models the parts skyctl relies on: visibility timeouts, a fresh pop
+    receipt on every receive/update (old receipts are rejected), dequeue_count,
+    and the 7-day visibility cap.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.messages: dict[str, dict] = {}
+
+    def send_message(self, content, visibility_timeout=None, time_to_live=None, **_):
+        if visibility_timeout is not None and visibility_timeout > 7 * 24 * 3600:
+            raise ValueError("visibility_timeout cannot exceed 7 days")
+        if visibility_timeout and time_to_live not in (-1, None) and visibility_timeout >= time_to_live:
+            raise ValueError("visibility must be earlier than expiry")
+        msg_id = uuid.uuid4().hex
+        with self.lock:
+            self.messages[msg_id] = {"content": content, "visible_at": self.clock() + (visibility_timeout or 0),
+                                     "dequeue_count": 0, "pop_receipt": None, "ttl": time_to_live}
+        return SimpleNamespace(id=msg_id)
+
+    def receive_messages(self, max_messages=1, visibility_timeout=30, **_):
+        now = self.clock()
+        out = []
+        with self.lock:
+            for msg_id, m in self.messages.items():
+                if len(out) >= max_messages:
+                    break
+                if m["visible_at"] <= now:
+                    m["dequeue_count"] += 1
+                    m["pop_receipt"] = uuid.uuid4().hex
+                    m["visible_at"] = now + visibility_timeout
+                    out.append(SimpleNamespace(id=msg_id, content=m["content"], pop_receipt=m["pop_receipt"],
+                                               dequeue_count=m["dequeue_count"]))
+        return iter(out)
+
+    def _check(self, msg_id, pop_receipt):
+        from azure.core.exceptions import ResourceNotFoundError
+
+        m = self.messages.get(msg_id)
+        if m is None or m["pop_receipt"] != pop_receipt:
+            raise ResourceNotFoundError("MessageNotFound (stale pop receipt)")
+        return m
+
+    def update_message(self, msg_id, pop_receipt=None, content=None, visibility_timeout=None, **_):
+        with self.lock:
+            m = self._check(msg_id, pop_receipt)
+            m["visible_at"] = self.clock() + (visibility_timeout or 0)
+            m["pop_receipt"] = uuid.uuid4().hex
+            return SimpleNamespace(id=msg_id, pop_receipt=m["pop_receipt"])
+
+    def delete_message(self, msg_id, pop_receipt=None, **_):
+        with self.lock:
+            self._check(msg_id, pop_receipt)
+            del self.messages[msg_id]

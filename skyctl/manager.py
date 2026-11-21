@@ -38,6 +38,7 @@ class BskyManager:
         session_dir: Optional[Union[str, Path]] = None,
         session_store: Optional["SessionStore"] = None,
         media_store: Optional["ObjectStore"] = None,
+        atproto_factory=None,
     ):
         self.accounts = dict(accounts)
         self._clients: dict[str, BskyClient] = {
@@ -46,6 +47,7 @@ class BskyManager:
                 session_dir=session_dir,
                 session_store=session_store,
                 media_store=media_store,
+                atproto_factory=atproto_factory,
             )
             for alias, config in accounts.items()
         }

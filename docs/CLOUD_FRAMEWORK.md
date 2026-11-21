@@ -7,7 +7,9 @@ same?** It covers the model, the per-cloud toolsets and implementation
 designs, the evidence for each decision, and what remains unverified.
 
 It supersedes the infrastructure parts of [DESIGN.md](DESIGN.md) (see §14 for
-the corrections). Everything described here is implemented in
+the corrections). §15 records the decisions taken after review (state in one
+bucket document, Azure Storage Queues, managed serverless *and* Kubernetes on
+every cloud) and what each changed. Everything described here is implemented in
 `skyctl/platform/`, `skyctl/adapters/`, `skyctl/deploy/` and
 `skyctl/testing/`, and covered by the test suite.
 
@@ -204,11 +206,29 @@ Reconciliation notes:
 Every mutation is `update(mutate)`, a CAS loop over one JSON document. That
 removes lost updates between the CLI, tick, worker and HTTP (defect 2).
 
+**Decision: stay on one document** (§15). Every cloud target creates the
+bucket, in both compute options, with versioning, encryption, public access
+blocked, lifecycle expiry on `runs/` and `ledger/`, and `prevent_destroy`
+(`state.protect`, default on): the document is the source of truth for
+scheduled posts, so `terraform destroy` of the compute must not take it.
+Conformance check `state.protected` enforces this on every Terraform target.
+
+```
+<bucket>/skyctl/
+  queue.json            scheduled posts, ONE JSON document, every write a CAS update
+  queue.json.lease      tick lease (its version is the fencing token)
+  sessions/<alias>.session
+  runs/<run-id>.jsonl   agent transcripts          (expire after retention_days)
+  ledger/<sha256>.json  write idempotency ledger   (expire after retention_days)
+  config/tasks.toml     named tasks (uploaded by Terraform)
+  media/…               images referenced by posts
+```
+
 **When to move to a database:** past roughly 10³ jobs, or several writes per
 second, one document becomes a contention point. The port is ready for
 DynamoDB (conditional writes), Cosmos DB (ETag) or Firestore (transactions),
-each implementing the same `update()` per item. This is not built; nothing
-at skyctl's scale needs it yet.
+each implementing the same `update()` per item. Not built; not needed at this
+scale.
 
 ### 4.3 Work queue: `WorkQueue`
 
@@ -216,24 +236,31 @@ Contract: at-least-once; a received message is hidden for the visibility
 window; `ack` removes it; `nack(delay)` redelivers after `delay`; `extend`
 keeps it hidden; handlers are idempotent.
 
-| | SQS | Service Bus | Pub/Sub (pull) | memory |
-|---|---|---|---|---|
-| Visibility model | per-receive `VisibilityTimeout` (≤ 12 h) | peek-lock; **lock duration is a queue setting, ≤ 5 min**, renewable | ack deadline ≤ 600 s, `modifyAckDeadline` | per receive |
-| `nack(delay)` | `ChangeMessageVisibility` | abandon (0), else **complete + re-send scheduled** (emulated) | `modifyAckDeadline(delay)` | native |
-| `extend` | `ChangeMessageVisibility` | `renew_message_lock` | `modifyAckDeadline` | native |
-| Per-message delay | ≤ 900 s | any (`scheduled_enqueue_time_utc`) | **none** → `QueueCapabilityError` | any |
-| Redelivery count | `ApproximateReceiveCount` | `delivery_count` | `delivery_attempt` (only with a DLQ policy) | exact |
-| Dead-lettering | redrive policy | built in (`max_delivery_count`) | dead-letter topic | worker drops after `max_attempts` |
-| Settlement constraint | receipt handle | **same receiver link** (adapter keeps it open) | ack id | — |
+| | SQS | **Azure Storage Queue** (rendered) | Service Bus (BYO only) | Pub/Sub (pull) | memory |
+|---|---|---|---|---|---|
+| Visibility model | per-receive `VisibilityTimeout` (≤ 12 h) | per-receive visibility (≤ 7 days) | peek-lock; **lock is a queue setting, ≤ 5 min**, renewable | ack deadline ≤ 600 s | per receive |
+| `nack(delay)` | `ChangeMessageVisibility` | `update_message` → **new pop receipt** | abandon, or complete + scheduled re-send | `modifyAckDeadline` | native |
+| `extend` | `ChangeMessageVisibility` | `update_message` (receipt written back) | `renew_message_lock` | `modifyAckDeadline` | native |
+| Per-message delay | ≤ 900 s | **≤ 7 days** (initial visibility; sent with TTL -1, else the default 7-day TTL expires it first) | any | **none** | any |
+| Redelivery count | `ApproximateReceiveCount` | `dequeue_count` | `delivery_count` | `delivery_attempt` (with DLQ policy) | exact |
+| Dead-lettering | redrive policy | **none native** → `dead_letter()` to `<queue>-poison` | built in | dead-letter topic | dropped after `max_attempts` |
+| Auth | IAM | Entra ("Storage Queue Data Contributor") | Entra | IAM | — |
+
+The Storage Queue quirks (new pop receipt on every update, TTL vs. delay,
+no DLQ) are all covered by the contract test and adapter-specific tests.
 
 ### 4.4 Delayed delivery: `DelayedDelivery` (the fast path)
 
 | | AWS | Azure | GCP | Kubernetes / Compose |
 |---|---|---|---|---|
-| Service | EventBridge Scheduler `at()` with `ActionAfterCompletion=DELETE` | Service Bus scheduled message | Cloud Tasks HTTP task with OIDC | none |
-| Horizon | unlimited | unlimited | 30 days | — |
+| Service | EventBridge Scheduler `at()` with `ActionAfterCompletion=DELETE` | Storage Queue initial visibility | Cloud Tasks HTTP task with OIDC (Cloud Run only) | none |
+| Horizon | unlimited | **7 days** | 30 days | — |
 | Cancel | delete schedule | no-op (stray delivery is harmless) | delete task (name stays reserved for a while) | — |
 | Delivers to | SQS work queue → worker | the queue → worker | `POST /invoke` | tick reconciler |
+
+Posts scheduled beyond a horizon (over 7 days ahead on Azure, and always on
+GKE and Compose) are sent by the periodic catch-up (the tick, every 5
+minutes by default).
 
 The scheduler registers the fast path when a job is created within the
 horizon. Delivery calls `send_now()`, which is a no-op if the job isn't due
@@ -317,9 +344,20 @@ recover   (next tick)       sending + claimed_until passed → verify, then re-s
 
 ### 5.4 Agent runs
 
-`task.run` invocations set the write ledger's idempotency key from the
-message / run id, so a redelivered run re-plans but **skips writes it already
-made**. Deployment policy ceilings are re-applied **where work executes**,
+A redelivered run re-plans but **skips writes it already made**, because the
+write ledger is keyed per *logical run*:
+
+* a **scheduled** run → `task@<cron slot>`. The slot is the cron's most
+  recent fire time, computed from the cron expression itself
+  (`platform.cron.previous_fire`). Platform retries and overlapping
+  executions share the key on every platform, and tomorrow's run gets a
+  fresh one;
+* a **queued** run → its `run_id`;
+* anything else → the delivery id.
+
+The ledger is never keyed on the bare task name. An earlier version did
+that, which meant a daily task could never repeat a write (for example, the
+same "good morning" post) on a later day. Deployment policy ceilings are re-applied **where work executes**,
 because a queue message can be injected by anyone with send permission.
 
 ---
@@ -408,11 +446,35 @@ Kubernetes identity and bucket requirements.
 
 | Target | Output | Compute | Notable design |
 |---|---|---|---|
-| `aws` | `main.tf.json` | ECS Fargate **or** Lambda (same image) | ALB + HTTPS; worker 0..N on queue depth; Scheduler → RunTask with `arn_without_revision`; `at()` delayed delivery |
-| `azure` | `main.tf.json` | Container Apps app + jobs | KEDA Service Bus event job; Key Vault references; Entra-only storage; one UAMI for everything, including Azure OpenAI |
-| `gcp` | `main.tf.json` | Cloud Run service + jobs | Pub/Sub **push** into `/invoke` with OIDC and a DLQ; Cloud Tasks; deterministic service URL to avoid a self-reference cycle |
-| `kubernetes` | `manifests.json` (v1 List) | Deployment / CronJob / KEDA ScaledJob | the portable tier; only the SA annotation and KEDA trigger are cloud-specific |
-| `compose` | `compose.json` | daemon + http | capability substitution made concrete |
+| Target | `compute` | Output | Notable design |
+|---|---|---|---|
+| `aws` | `ecs` / `lambda` | `main.tf.json` | ALB + HTTPS; worker 0..N on queue depth; Scheduler → RunTask with `arn_without_revision`; `at()` delayed delivery |
+| `aws` | `eks` | `main.tf.json` + `manifests.json` | same backing IaC; Pod Identity (or IRSA); Terraform writes `bind.json` |
+| `azure` | `container-apps` | `main.tf.json` | Storage Queues drained by a scheduled job; Key Vault references; Entra-only storage; one UAMI, including Azure OpenAI |
+| `azure` | `aks` | `main.tf.json` + `manifests.json` | same backing IaC; federated credentials for the pod (and KEDA) service accounts |
+| `gcp` | `cloud-run` | `main.tf.json` | Pub/Sub **push** into `/invoke` with OIDC and a DLQ; Cloud Tasks; deterministic service URL to avoid a self-reference cycle |
+| `gcp` | `gke` | `main.tf.json` + `manifests.json` | same bucket/topic/secrets; **pull** subscription; GKE Workload Identity |
+| `kubernetes` | — | `manifests.json` | any cluster, bring-your-own services; nothing cloud-side is created |
+| `compose` | — | `compose.json` | capability substitution made concrete |
+
+**Both compute options share one backing function per cloud** (`aws_backing`,
+`azure_backing`, `gcp_backing`). A test asserts that the state bucket, queue
+and secret resources are identical whether a spec chooses serverless or
+Kubernetes. The one intended difference is on GCP, where Cloud Run consumes
+through a push subscription and GKE through a pull subscription on the same
+topic.
+
+**Kubernetes on a cloud without giving Terraform cluster credentials.**
+Bucket names, queue URLs, role ARNs and client IDs exist only after `apply`.
+Terraform therefore writes them into `bind.json` (a `local_file`): the
+Namespace, the ServiceAccount with its workload-identity annotation, one
+ConfigMap holding the whole env contract, and the KEDA objects.
+`manifests.json` (Deployments, Service, Ingress, CronJobs) is static and
+contains no Terraform references. This is asserted by a test.
+
+```
+terraform apply  →  kubectl apply -f bind.json  →  kubectl apply -f manifests.json
+```
 
 Why **Terraform JSON** rather than HCL templates, CDKTF or Pulumi:
 
@@ -438,7 +500,7 @@ lock-file CAS.
 
 ### 7.5 Conformance (after rendering)
 
-`skyctl deploy check` runs 11 cross-target invariants on the *facts* each
+`skyctl deploy check` runs 12 cross-target invariants on the *facts* each
 renderer reports (env, schedules, workloads, exposure) and on the generated
 Terraform:
 
@@ -455,6 +517,7 @@ Terraform:
 | `secrets.handling` | secret inputs are `sensitive`; no app-password-shaped literals |
 | `iam.least-privilege` | AWS: no wildcard actions, `Resource:*` only for the allow-listed Bedrock actions. Azure: no subscription scope, Owner or Contributor. GCP: no `allUsers`, only allow-listed project roles |
 | `workloads.worker` | a worker exists wherever the spec asks for one |
+| `state.protected` | the state bucket is provisioned, versioned and `prevent_destroy` on every Terraform target |
 
 Each check is **mutation-tested**: a test breaks the invariant in a rendered
 artifact and asserts the check fails (`tests/test_deploy.py`).
@@ -502,7 +565,7 @@ OTLP endpoint.
 |---|---|---|---|---|
 | ECS Fargate | none | ALB idle ≤ 4000 s | SQS visibility (≤ 12 h, extendable) | 64 KiB |
 | Lambda | 900 s | 900 s | function timeout | 64 KiB (env total 4 KB) |
-| Container Apps | configurable (`replicaTimeout`) | ~4 min ingress | Service Bus lock ≤ 5 min (renewed) | 25 KB |
+| Container Apps | configurable (`replicaTimeout`) | ~4 min ingress | Storage Queue visibility (≤ 7 days, extendable) | 25 KB |
 | Cloud Run | jobs 24 h | 60 min | Pub/Sub push 600 s | 64 KiB |
 | Kubernetes | none | your ingress | your queue | 1 MiB (etcd object) |
 
@@ -512,12 +575,16 @@ Every cloud target scales to zero except these:
 
 * **ECS**: the HTTP service keeps ≥ 1 task running, and a NAT gateway is
   needed for private subnets.
-* **Service Bus Standard** has a base charge; Standard was chosen for
-  reliable scheduled-message support.
-* **Container Apps**: the KEDA poller itself is free.
+* **Azure Container Apps**: the worker drain job starts every
+  `worker.poll_minutes` (default 1) and runs for a few seconds when the
+  queue is empty. Storage Queues themselves cost fractions of a cent per
+  million operations. This replaced Service Bus Standard and its base charge
+  (§15).
+* **Kubernetes** options: the cluster is yours, so the marginal cost is
+  pods. With `keda = true` the worker scales to zero.
 
-The tick job's per-invocation start-up is the main recurring cost. A
-5-minute tick is the default.
+The scheduled jobs' start-up is the main recurring cost. A 5-minute tick is
+the default.
 
 ---
 
@@ -530,11 +597,11 @@ their implementation?"* directly.
 
 | | AWS | Azure | Google Cloud | Kubernetes |
 |---|---|---|---|---|
-| Python SDKs (`skyctl[…]` extra) | `boto3`, `awslambdaric` | `azure-identity`, `azure-storage-blob`, `azure-keyvault-secrets`, `azure-servicebus` | `google-cloud-storage`, `-secret-manager`, `-pubsub`, `-tasks` | none (services by URL) |
+| Python SDKs (`skyctl[…]` extra) | `boto3`, `awslambdaric` | `azure-identity`, `azure-storage-blob`, `azure-storage-queue`, `azure-keyvault-secrets` | `google-cloud-storage`, `-secret-manager`, `-pubsub`, `-tasks` | none (services by URL) |
 | Credential chain | botocore default | `DefaultAzureCredential` | `google.auth.default()` | the hosting cloud's workload identity |
 | IaC | Terraform/OpenTofu `hashicorp/aws`; CDK; CloudFormation | `azurerm` (+ `azapi`); Bicep; `azd` | `hashicorp/google`; Infrastructure Manager; Config Connector | manifests / Kustomize / Helm; KEDA; Secrets Store CSI / External Secrets |
 | CLI | `aws` | `az` | `gcloud` | `kubectl` |
-| Emulators | **moto** (in-process; API shape), **LocalStack** | **Azurite**, Service Bus emulator | **fake-gcs-server**, Pub/Sub and Firestore emulators | kind, k3d |
+| Emulators | **moto** (in-process; API shape), **LocalStack** | **Azurite** (Blob + Queue) | **fake-gcs-server**, Pub/Sub and Firestore emulators | kind, k3d |
 | CI auth | `aws-actions/configure-aws-credentials` (OIDC → role) | `azure/login` (OIDC → federated credential) | `google-github-actions/auth` (WIF) | the cloud's, then `kubectl` |
 | Observability | CloudWatch, EMF, ADOT → X-Ray | Log Analytics, App Insights (OTel distro) | Cloud Logging, Cloud Trace (OTLP) | OTel Collector |
 | Registry | ECR (**required for Lambda**) | ACR | Artifact Registry | any |
@@ -575,30 +642,46 @@ their implementation?"* directly.
 ### 9.3 Azure implementation design
 
 ```
- ACA Job (schedule trigger, UTC cron) ──► skyctl invoke '<json>'
- ACA App (ingress; Easy Auth optional) ──/runs──► Service Bus queue ──KEDA──► ACA Job (event trigger)
-                                                     │ scheduled messages = delayed delivery     skyctl worker --once
-                                                     └ built-in DLQ (max_delivery_count)
- one user-assigned identity: Key Vault Secrets User · Blob Data Contributor · SB Data Sender/Receiver · OpenAI User
+ one storage account (Entra-only, prevent_destroy)
+   ├─ container "skyctl"   queue.json (CAS document) · sessions/ · runs/ · ledger/ · config/
+   ├─ queue "<app>-work"   agent runs + delayed post.send (initial visibility ≤ 7 days)
+   └─ queue "<app>-work-poison"
+
+ compute = "container-apps"                               compute = "aks" (existing cluster)
+   ACA Job (schedule, UTC) ──► skyctl invoke '<json>'       CronJob (Forbid, any TZ) ──► skyctl invoke
+   ACA Job every poll_minutes ──► skyctl worker --once      Deployment or KEDA ScaledJob (azure-queue)
+   ACA App (ingress) ──/runs──► enqueue                     Deployment + Service (+ Ingress)
+   UAMI attached to apps/jobs                               UAMI + federated credential(s)
+
+ one user-assigned identity: KV Secrets User · Blob Data Contributor (container) ·
+                             Queue Data Contributor (work + poison queues) · OpenAI User
 ```
 
-* **Compute:** Container Apps for HTTP; Container Apps **Jobs** for both
-  schedules and the event-driven worker (KEDA `azure-servicebus`).
-* **Identity:** one UAMI, selected with `AZURE_CLIENT_ID`. Azure OpenAI uses
-  an Entra token minted from it; no API key is needed.
-* **State:** Blob with `shared_access_key_enabled = false` (Entra only), so
-  the provider runs with `storage_use_azuread = true`.
-* **Queue:** Service Bus Standard, `lock_duration = PT5M` (the maximum). The
-  worker renews locks. `nack(delay)` is emulated as complete + scheduled
-  re-send.
-* **Delayed delivery:** scheduled messages on the same queue
-  (`SKYCTL_DELAYED_URL=queue`).
-* **Limits enforced:** schedule cron is **UTC only**, so non-UTC schedules
-  are a validation error.
-* **Deliberate compromise:** the KEDA scale rule uses a *listen-only* SAS
-  rule. It only counts messages; the app itself uses Entra. Managed-identity
-  auth for ACA scale rules exists in newer API versions; adopt it once the
-  `azurerm` provider exposes it.
+* **Queue: Azure Storage Queues** (§15). The work and poison queues live in
+  the same storage account as the state container, so there is no second
+  service to pay for or secure. Delays up to 7 days use the initial
+  visibility timeout; posts further out are sent by the periodic catch-up.
+  Messages are sent with TTL -1, because otherwise the default 7-day TTL
+  would expire a 7-day-delayed message before it became visible.
+* **Worker on Container Apps = a scheduled drain**
+  (`skyctl worker --once`, every `worker.poll_minutes`, default 1). KEDA's
+  azure-queue scaler on Container Apps authenticates with a connection
+  string, which would mean re-enabling shared-key access on the account. A
+  scheduled drain keeps the account Entra-only, at the cost of up to
+  `poll_minutes` of latency for queued agent runs. Overlapping drains are
+  safe, because each message is received by one drainer.
+* **Worker on AKS**: a Deployment, or a KEDA ScaledJob (azure-queue with
+  `azure-workload` identity). KEDA gets its own federated credential on the
+  same UAMI, so no keys are needed there either.
+* **Identity:** one UAMI, selected with `AZURE_CLIENT_ID`. Grants are scoped
+  to the container and the two queues (only the deployer is scoped to the
+  account). Azure OpenAI uses an Entra token minted from the same identity;
+  no API key is needed.
+* **State:** Blob with `shared_access_key_enabled = false`, so the provider
+  runs with `storage_use_azuread = true`.
+* **Limits enforced:** Container Apps schedule cron is **UTC only**, so a
+  non-UTC schedule is a validation error there. On AKS, CronJobs accept any
+  time zone.
 
 ### 9.4 Google Cloud implementation design
 
@@ -625,31 +708,45 @@ their implementation?"* directly.
 * **Limits enforced:** `max_run_seconds` must stay under the 600 s push
   deadline.
 
-### 9.5 Kubernetes implementation design (the portable tier)
+### 9.5 Kubernetes implementation design (both ways in)
 
 Kubernetes is the strongest generaliser for compute: Deployment, CronJob and
-KEDA ScaledJob behave the same on EKS, AKS and GKE. Only two things vary by
-cloud: the ServiceAccount annotation for workload identity, and the KEDA
-trigger type and its `podIdentity` provider. Secrets are injected natively
-(`envFrom`); sync them from the cloud store with the Secrets Store CSI Driver
-or External Secrets Operator. It is also the only target where the platform
-itself prevents overlapping schedule runs (`concurrencyPolicy: Forbid`).
-Pods run non-root with a read-only root FS, all capabilities dropped, and
-`RuntimeDefault` seccomp.
+KEDA ScaledJob behave the same on EKS, AKS and GKE. It is also the only
+option where the platform itself prevents overlapping schedule runs
+(`concurrencyPolicy: Forbid`). Pods run non-root with a read-only root FS,
+all capabilities dropped, and `RuntimeDefault` seccomp. All manifests come
+from one builder (`render/k8s_common.py`).
 
-Trade-off: you operate a cluster. For one small service, the managed
-serverless targets are cheaper and simpler. Kubernetes wins when you already
-run a platform team's cluster or need the same operational surface
-everywhere.
+There are two ways to target a cluster:
 
----
+| | Cloud target with `compute = "eks" \| "aks" \| "gke"` | `kubernetes` target |
+|---|---|---|
+| For | an existing EKS/AKS/GKE cluster; skyctl creates the cloud side | any cluster, bring-your-own services |
+| Backing services | **created**, identical to the managed option (bucket, queue, secrets) | existing URLs |
+| Identity | created and bound: EKS Pod Identity (or IRSA) · AKS federated credential · GKE Workload Identity | an existing role / client id / GSA |
+| Secrets | fetched from the cloud store (`…/http-token#SKYCTL_HTTP_TOKEN`) | `envFrom` an existing Secret |
+| Output | `main.tf.json` (writes `bind.json`) + static `manifests.json` | `manifests.json` |
+
+Per cloud, only these differ:
+
+| | EKS | AKS | GKE |
+|---|---|---|---|
+| Pod identity | Pod Identity association (default) or IRSA trust on the OIDC provider | UAMI federated credential for `system:serviceaccount:<ns>:<app>` | `roles/iam.workloadIdentityUser` for `<project>.svc.id.goog[<ns>/<app>]` |
+| KEDA trigger | `aws-sqs-queue`, KEDA assumes the app role (`keda_operator_role_arn` trusted) | `azure-queue`, `azure-workload` (federated credential for `keda-operator`) | `gcp-pubsub`, KEDA's federated principal gets `monitoring.viewer` |
+| Delayed delivery | EventBridge `at()` → SQS (same as ECS) | Storage Queue visibility (same as Container Apps) | none: tick catch-up (Cloud Tasks needs a reachable endpoint) |
+| Cluster prerequisite | Pod Identity Agent add-on (or OIDC provider for IRSA) | OIDC issuer + workload identity enabled | Workload Identity enabled |
+
+Trade-off: you operate the cluster. For one small service the managed
+serverless option is cheaper and simpler. Kubernetes wins when a platform
+team already runs clusters. Since both options share backing IaC, you can
+move between them without migrating state.
 
 ## 10. Testing strategy: what each tier proves
 
 | Tier | Proves | Does **not** prove | Where |
 |---|---|---|---|
 | Contract kit over in-memory / file stores | the semantics as written | anything about clouds | `tests/test_contracts.py` |
-| SDK-faithful fakes (Azure Blob, GCS, Service Bus, Pub/Sub, Cloud Tasks) | adapters call the SDK correctly and map its exceptions | server behaviour | `skyctl/testing/fakes.py` |
+| SDK-faithful fakes (Azure Blob, Azure Storage Queue, GCS, Service Bus, Pub/Sub, Cloud Tasks) | adapters call the SDK correctly and map its exceptions | server behaviour | `skyctl/testing/fakes.py` |
 | **moto** (S3, SQS, EventBridge Scheduler) | real request/response shapes and error codes | **concurrency**: moto checks S3 preconditions *without a lock* (found while writing these tests) | `tests/test_contracts.py`, `tests/test_messaging.py` |
 | Emulators (LocalStack, Azurite, fake-gcs-server) in CI | wire compatibility, and some concurrency | production concurrency guarantees | `tests/test_integration.py` (`-m integration`) |
 | Real cloud sandbox | the actual guarantees | — | same tests, pointed at a real bucket |
@@ -727,16 +824,16 @@ clouds):
 * Emulator-backed integration tests are written and wired into CI, but were
   skipped here (no Docker).
 
-Open decisions for you:
+Also not verified: the Kubernetes modes' cloud-side identity resources
+(`aws_eks_pod_identity_association`, `azurerm_federated_identity_credential`,
+GKE Workload Identity bindings) against live clusters. The same goes for
+KEDA's `podIdentity` provider options (`aws` with `roleArn`,
+`azure-workload` with `identityId`, `gcp`), which depend on the KEDA
+version you run (2.13+ assumed).
 
-1. **JobStore backend:** stay on one CAS document (proposed), or move to
-   DynamoDB / Cosmos / Firestore now.
-2. **Azure queue tier:** Service Bus Standard (proposed, for scheduled
-   messages) vs. Storage Queues (cheaper, no scheduled enqueue, so
-   tick-only).
-3. **Kubernetes as primary target** if you already run clusters, versus the
-   managed serverless targets (proposed for a single service).
-4. **OpenDAL** to replace the three native stores with one dependency, once
+Still open:
+
+1. **OpenDAL** to replace the three native stores with one dependency, once
    its conditional-write coverage is confirmed for all three.
 
 ---
@@ -750,3 +847,28 @@ Open decisions for you:
 | §3: fsspec as the `ObjectStore` for all buckets | Native S3 / Blob / GCS stores with real CAS; fsspec is a non-atomic fallback |
 | §8: `POST /runs` runs on a worker thread | Strategy depends on `compute.background_after_response`; queue + worker on Lambda, Cloud Run and Container Apps |
 | §10: hand-written Terraform roots per cloud | Generated from one spec (`skyctl deploy render`), gated by `skyctl deploy check` |
+
+---
+
+## 15. Decisions taken after review
+
+| Decision | What it changed |
+|---|---|
+| **State stays one JSON document in a bucket, with IaC for that bucket** | Every cloud target now creates the bucket in *both* compute options. Before this, the Kubernetes path assumed it already existed. New `state.protect` (default on) renders `prevent_destroy`, and the new conformance check `state.protected` requires a provisioned, versioned, protected bucket on every Terraform target. `ledger/` now expires alongside `runs/`. Layout in §4.2. |
+| **Azure uses Storage Queues, with periodic catch-ups and delays** | New `AzureStorageQueue` adapter (`azqueue://`) passing the shared contract: 7-day delays, new pop receipt on every update, TTL -1, `<queue>-poison` instead of a DLQ. The worker dead-letters where a service has no native DLQ. Service Bus is gone from the rendered IaC (the adapter remains for BYO). The Container Apps worker is a scheduled drain (`worker.poll_minutes`), which keeps the storage account Entra-only. |
+| **Allow both Kubernetes and managed serverless** | Each cloud target has `compute = ecs\|lambda\|eks`, `container-apps\|aks`, `cloud-run\|gke`. One backing function per cloud serves both options, and a test asserts identical backing IaC. Kubernetes modes create the identity binding and let Terraform write `bind.json`, so Terraform never needs cluster credentials. Two example specs with the same intent: `deploy/examples/managed.deploy.toml` and `kubernetes.deploy.toml`. |
+
+Corrections found while implementing these:
+
+* **§13 (previous version) understated Storage Queues** as "no scheduled
+  enqueue, so tick-only". They support delays up to 7 days via initial
+  visibility. Verified against the SDK.
+* **The write ledger was keyed on the task name for named tasks.** A daily
+  task could therefore never repeat a write on a later day. Scheduled runs
+  are now keyed per cron slot and manual runs per run (§5.4), with tests for
+  same-slot retries and next-day repeats.
+* **The Kubernetes HTTP token.** There is no ECS/Cloud Run-style native
+  injection there, so the token is fetched from the same cloud secret store
+  with a `#KEY` URL fragment, keeping one set of secret resources for both
+  options. `SKYCTL_SECRETS` now accepts a comma-separated list.
+

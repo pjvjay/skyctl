@@ -53,9 +53,9 @@ class FakeAtProto:
         self.sent.append(
             {"text": text, "reply_to": reply_to, "embed": embed, "langs": langs, "facets": facets}
         )
-        return SimpleNamespace(
-            uri=f"at://did:plc:me/app.bsky.feed.post/sent{n}", cid=f"cid-sent{n}"
-        )
+        uri, cid = f"at://did:plc:me/app.bsky.feed.post/sent{n}", f"cid-sent{n}"
+        self.posts[uri] = make_post_view(uri, cid)     # like a real PDS, a new post can be fetched
+        return SimpleNamespace(uri=uri, cid=cid)
 
     def upload_blob(self, data):
         self.uploads.append(data)

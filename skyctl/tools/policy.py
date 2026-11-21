@@ -11,7 +11,14 @@ Evaluated in code before every call, so nothing in a prompt can widen it.
         max_writes=5,             # hard cap on executed mutating calls
         allow_public_writes=True, # False: writes only to accounts on a private PDS
         deny_tools=["thread"],    # hidden and denied
+        expose_tags={"read", "plan"},  # profile: what a session may call DIRECTLY
     )
+
+Exposure vs permission: `visible()` decides what a session can call
+directly (profiles use tags, e.g. the "plan" profile exposes reads and plan
+tools but no direct writes). `permits()` decides what a validated plan may
+execute. A direct call must be visible; a plan step need only be permitted,
+which is how an agent can propose `post` without being able to call it.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ class ToolPolicy:
     deny_tools: list[str] = field(default_factory=list)
     allow_tools: Optional[list[str]] = None   # None → everything not denied
     approval: str = "none"                    # "writes": record mutating calls for a human instead of sending
+    expose_tags: Optional[set] = None         # None → every permitted tool is directly callable
 
     def __post_init__(self):
         self.accounts = [a.lower() for a in self.accounts] if self.accounts is not None else None
@@ -41,13 +49,21 @@ class ToolPolicy:
 
     # -- visibility ----------------------------------------------------
 
-    def visible(self, spec: ToolSpec) -> bool:
-        """Whether a consumer should even be shown this tool."""
+    def permits(self, spec: ToolSpec) -> bool:
+        """Whether this tool may run at all (directly or as a plan step)."""
         if spec.name in self.deny_tools:
             return False
         if self.allow_tools is not None and spec.name not in self.allow_tools:
             return False
         if spec.destructive and not self.allow_delete:
+            return False
+        return True
+
+    def visible(self, spec: ToolSpec) -> bool:
+        """Whether a session may call (and be shown) this tool directly."""
+        if not self.permits(spec):
+            return False
+        if self.expose_tags is not None and not (set(spec.tags) & set(self.expose_tags)):
             return False
         return True
 
@@ -61,8 +77,10 @@ class ToolPolicy:
 
     def check(self, spec: ToolSpec, args: dict, ctx) -> None:
         """Raise ToolDenied if this call must not happen."""
-        if not self.visible(spec):
-            raise ToolDenied(f"Tool {spec.name!r} is not permitted by policy.")
+        allowed = self.permits(spec) if getattr(ctx, "via_plan", False) else self.visible(spec)
+        if not allowed:
+            hint = " Propose it as a step in a plan (plan_create) instead." if self.permits(spec) else ""
+            raise ToolDenied(f"Tool {spec.name!r} is not permitted by policy.{hint}")
         if spec.account_param and spec.account_param in args:
             alias = str(args[spec.account_param] or "").lower()
             if not self.account_allowed(alias):

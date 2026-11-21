@@ -62,7 +62,7 @@ def test_custom_registry_derives_schema_from_signature():
 
 def test_read_tools_wrap_network_content_as_untrusted(manager):
     ctx = ToolContext(manager)
-    accounts = registry.call("list_accounts", {}, ctx).result
+    accounts = registry.call("list_accounts", {}, ctx).result["accounts"]
     assert [a["account"] for a in accounts] == ["personal", "work"]
     search = registry.call("search_posts", {"account": "personal", "query": "x"}, ctx)
     assert search.ok and search.result["note"].startswith("Content fetched from the network")
@@ -102,7 +102,7 @@ def test_scheduling_tools_use_the_context_scheduler(manager):
     assert not bad.ok
     bad_time = registry.call("schedule_post", {"account": "work", "text": "x", "run_at": "tomorrow"}, ctx)
     assert not bad_time.ok and "ISO 8601" in bad_time.error
-    jobs = registry.call("list_jobs", {}, ctx).result
+    jobs = registry.call("list_jobs", {}, ctx).result["jobs"]
     assert {j["id"] for j in jobs} == {one.result["job_id"], cron.result["job_id"]}
     cancelled = registry.call("cancel_job", {"job_id": one.result["job_id"]}, ctx).result
     assert cancelled["cancelled"] is True
@@ -119,9 +119,9 @@ def test_policy_hides_and_denies(manager):
     assert "post" in visible
 
     ctx = ToolContext(manager, policy=policy)
-    assert registry.call("list_accounts", {}, ctx).result == [
+    assert registry.call("list_accounts", {}, ctx).result == {"accounts": [
         {"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}
-    ]
+    ]}
     denied = registry.call("get_timeline", {"account": "personal"}, ctx)
     assert denied.denied and "outside this run's scope" in denied.error
     hidden = registry.call("delete_post", {"account": "work", "uri": "at://x"}, ctx)
@@ -172,9 +172,12 @@ def test_policy_describe_mentions_mode():
 
 def test_mcp_server_exposes_policy_filtered_tools(manager, fake_atproto):
     pytest.importorskip("mcp")
-    from skyctl.mcp_server import build_mcp_server
+    from mcp.server.fastmcp.exceptions import ToolError
 
-    server = build_mcp_server(manager, ToolPolicy(accounts=["work"], allow_writes=True, max_writes=1))
+    from skyctl.mcp_server import McpConfig, build_mcp_server
+
+    server = build_mcp_server(manager, ToolPolicy(accounts=["work"], allow_writes=True, max_writes=1),
+                              config=McpConfig(profile="direct"))
 
     async def scenario():
         tools = {t.name: t for t in await server.list_tools()}
@@ -183,20 +186,22 @@ def test_mcp_server_exposes_policy_filtered_tools(manager, fake_atproto):
         assert tools["post"].annotations.readOnlyHint is False
         assert tools["post"].inputSchema["required"] == ["account", "text"]
 
-        def text(res):
-            return json.loads(res[0].text)
+        def payload(res):
+            content = res[0] if isinstance(res, tuple) else res
+            return json.loads(content[0].text)
 
-        assert text(await server.call_tool("list_accounts", {})) == [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]
-        ok = text(await server.call_tool("post", {"account": "work", "text": "hello"}))
-        assert ok["success"] is True
-        denied = text(await server.call_tool("post", {"account": "personal", "text": "x"}))
-        assert denied["denied"] is True
-        budget = text(await server.call_tool("post", {"account": "work", "text": "again"}))
-        assert "budget" in budget["error"]
+        assert payload(await server.call_tool("list_accounts", {})) == {
+            "accounts": [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]}
+        assert payload(await server.call_tool("post", {"account": "work", "text": "hello"}))["success"] is True
+        # Failures are real MCP errors (isError), not data the model might misread.
+        with pytest.raises(ToolError, match="outside this run's scope"):
+            await server.call_tool("post", {"account": "personal", "text": "x"})
+        with pytest.raises(ToolError, match="budget"):
+            await server.call_tool("post", {"account": "work", "text": "again"})
         resources = [str(r.uri) for r in await server.list_resources()]
-        assert "skyctl://accounts" in resources
+        assert {"skyctl://accounts", "skyctl://policy", "skyctl://guide"} <= set(resources)
         prompts = [p.name for p in await server.list_prompts()]
-        assert "engage_with_mentions" in prompts
+        assert {"act_on_request", "triage_mentions", "publish_announcement"} <= set(prompts)
 
     asyncio.run(scenario())
     assert [s["text"] for s in fake_atproto.instances[-1].sent] == ["hello"]

@@ -58,7 +58,10 @@
     },
     "aws_s3_bucket": {
       "state": {
-        "bucket_prefix": "skyctl-state-"
+        "bucket_prefix": "skyctl-state-",
+        "lifecycle": {
+          "prevent_destroy": true
+        }
       }
     },
     "aws_s3_bucket_public_access_block": {
@@ -97,6 +100,16 @@
             "status": "Enabled",
             "filter": {
               "prefix": "skyctl/runs/"
+            },
+            "expiration": {
+              "days": 90
+            }
+          },
+          {
+            "id": "expire-write-ledger",
+            "status": "Enabled",
+            "filter": {
+              "prefix": "skyctl/ledger/"
             },
             "expiration": {
               "days": 90
@@ -541,7 +554,7 @@
         "target": {
           "arn": "${aws_ecs_cluster.main.arn}",
           "role_arn": "${aws_iam_role.scheduler.arn}",
-          "input": "{\"containerOverrides\": [{\"name\": \"skyctl\", \"command\": [\"invoke\", \"{\\\"kind\\\":\\\"task.run\\\",\\\"task\\\":\\\"daily-engagement\\\"}\"]}]}",
+          "input": "{\"containerOverrides\": [{\"name\": \"skyctl\", \"command\": [\"invoke\", \"{\\\"kind\\\":\\\"task.run\\\",\\\"slot\\\":{\\\"cron\\\":\\\"0 9 * * mon-fri\\\",\\\"timezone\\\":\\\"UTC\\\"},\\\"task\\\":\\\"daily-engagement\\\"}\"]}]}",
           "retry_policy": {
             "maximum_retry_attempts": 2
           },
@@ -587,8 +600,8 @@
         "AWS_REGION": "us-east-1"
       }
     },
-    "state_bucket": {
-      "value": "${aws_s3_bucket.state.bucket}"
+    "state_url": {
+      "value": "s3://${aws_s3_bucket.state.bucket}/skyctl"
     },
     "queue_url": {
       "value": "${aws_sqs_queue.work.url}"

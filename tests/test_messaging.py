@@ -138,3 +138,59 @@ def test_delayed_url_factory():
     assert (eb.group, eb.target_arn, eb.role_arn) == ("skyctl", "arn:aws:sqs:x", "arn:aws:iam::1:role/r")
     ct = delayed_for("cloudtasks://proj/europe-west1/skyctl?url=https://x/invoke&sa=a@b")
     assert ct.parent == "projects/proj/locations/europe-west1/queues/skyctl"
+
+
+# ----------------------------------------------------------------------
+# Azure Storage Queues (the chosen Azure queue)
+# ----------------------------------------------------------------------
+
+def _storage_queue():
+    from skyctl.adapters.queues import AzureStorageQueue
+    from skyctl.testing.fakes import FakeStorageQueue
+
+    main, poison = FakeStorageQueue(), FakeStorageQueue()
+    return AzureStorageQueue("acct", "skyctl-work", client=main, poison_client=poison), main, poison
+
+
+def test_storage_queue_contract():
+    q, _, _ = _storage_queue()
+    check_work_queue(q)
+
+
+def test_storage_queue_delay_up_to_seven_days_never_expires():
+    q, main, _ = _storage_queue()
+    q.send({"kind": "post.send", "job_id": "j"}, delay_seconds=7 * 24 * 3600)
+    [m] = main.messages.values()
+    assert m["ttl"] == -1                                  # otherwise a 7-day delay would expire first
+    with pytest.raises(QueueCapabilityError):
+        q.send({"kind": "x"}, delay_seconds=7 * 24 * 3600 + 1)
+    assert QueueDelayDelivery(q).max_horizon_seconds == 7 * 24 * 3600
+
+
+def test_storage_queue_tracks_the_new_pop_receipt_after_extend():
+    q, _, _ = _storage_queue()
+    q.send({"kind": "tick"})
+    [m] = q.receive(visibility_seconds=30)
+    first = m.receipt
+    q.extend(m, 60)                                       # heartbeat during a long run
+    assert m.receipt != first
+    q.ack(m)                                              # would fail with the stale receipt
+    assert q.receive(visibility_seconds=1) == []
+
+
+def test_storage_queue_poison_messages_go_to_a_poison_queue():
+    from skyctl.platform.invocation import Dispatcher, run_worker
+
+    q, main, poison = _storage_queue()
+    q.send({"kind": "unknown-kind"})
+    stats = run_worker(q, Dispatcher({}), idle_exit_seconds=0, wait_seconds=0)
+    assert stats.dropped == 1 and main.messages == {}
+    [p] = poison.messages.values()
+    assert json.loads(p["content"])["body"] == {"kind": "unknown-kind"} and "No handler" in json.loads(p["content"])["reason"]
+
+
+def test_storage_queue_url():
+    from skyctl.adapters.queues import AzureStorageQueue
+
+    q = queue_for("azqueue://skyctlst1234/skyctl-work")
+    assert isinstance(q, AzureStorageQueue) and (q.account, q.queue) == ("skyctlst1234", "skyctl-work")

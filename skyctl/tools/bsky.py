@@ -58,6 +58,12 @@ class ToolContext:
         self.run_id = run_id
         self.ledger = ledger          # WriteLedger: dedupes writes across retried runs
         self.approved = approved      # True while replaying human-approved calls
+        self.via_plan = False         # True inside the plan executor (permission, not exposure)
+        self.plans = None             # PlanStore, when a state store is available
+        self.plan_approval = "none"   # none | client | elicit | out_of_band
+        self.principal = "local"      # who is acting (for plan records)
+        self.seen_uris: set = set()   # at:// URIs returned by tools in this session (grounding)
+        self.grounding = "error"      # error | warning | off: may plans target URIs never observed?
         self.writes_done = 0
 
     @property
@@ -92,16 +98,16 @@ def _result(result) -> dict:
 # ----------------------------------------------------------------------
 
 @registry.tool(account_param=None)
-def list_accounts(ctx: ToolContext) -> list[dict]:
+def list_accounts(ctx: ToolContext) -> dict:
     """List the Bluesky accounts available in this session, with alias and handle."""
-    return [
+    return {"accounts": [
         {
             "account": alias,
             "handle": ctx.manager.client(alias).config.handle,
             "pds_url": ctx.manager.client(alias).config.pds_url or "https://bsky.social",
         }
         for alias in ctx.visible_accounts()
-    ]
+    ]}
 
 
 @registry.tool()
@@ -295,12 +301,12 @@ def schedule_cron(
 
 
 @registry.tool(account_param=None)
-def list_jobs(ctx: ToolContext) -> list[dict]:
+def list_jobs(ctx: ToolContext) -> dict:
     """List scheduled and recurring posts with their status and next run."""
     jobs = ctx.scheduler.list_jobs()
     if ctx.policy is not None:
         jobs = [j for j in jobs if ctx.policy.account_allowed(j["account"])]
-    return jobs
+    return {"jobs": jobs}
 
 
 @registry.tool(destructive=True, account_param=None)

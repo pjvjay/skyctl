@@ -31,9 +31,10 @@ class AwsSecretsManagerStore:
             self._client = boto3.client("secretsmanager", region_name=self.region)
         return self._client
 
-    def load(self) -> dict[str, str]:
+    def load_raw(self) -> str:
         resp = self._boto_client().get_secret_value(SecretId=self.secret_id)
         text = resp.get("SecretString")
-        if text is None:
-            text = resp["SecretBinary"].decode("utf-8")
-        return parse_secret_payload(text)
+        return text if text is not None else resp["SecretBinary"].decode("utf-8")
+
+    def load(self) -> dict[str, str]:
+        return parse_secret_payload(self.load_raw())

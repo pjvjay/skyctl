@@ -31,7 +31,7 @@ def render_compose(spec: DeploySpec) -> Artifact:
     env = common_env(spec, "compose", platform="compose", compute="compose", secrets="env", state_url="file:///data",
                      queue_url="none", delayed_url="none")
     art.env = env
-    schedules = [{"name": s.name, "cron": s.cron, "timezone": s.timezone, "invoke": s.invoke} for s in spec.schedules]
+    schedules = [{"name": s.name, "cron": s.cron, "timezone": s.timezone, "invoke": s.payload()} for s in spec.schedules]
     base = {
         "image": spec.app.image, "env_file": [".env"], "environment": dict(env),
         "volumes": ["state:/data"], "read_only": True, "tmpfs": ["/tmp"], "user": "10001",
@@ -48,7 +48,7 @@ def render_compose(spec: DeploySpec) -> Artifact:
         if spec.service.public:
             art.public_endpoints.append(f"host:{c.port}")
     for s in spec.schedules:
-        art.schedules.append(RenderedSchedule(s.name, s.cron, s.timezone, s.invoke, overlap_guard="platform"))
+        art.schedules.append(RenderedSchedule(s.name, s.cron, s.timezone, s.payload(), overlap_guard="platform"))
     doc = {"name": app, "services": services, "volumes": {"state": {}}}
     art.files["compose.json"] = json.dumps(doc, indent=2) + "\n"
     art.notes.append("docker compose -f compose.json up -d   (secrets come from .env beside it)")

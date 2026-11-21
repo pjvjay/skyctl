@@ -347,27 +347,48 @@ its capabilities as **MCP tools**, and ships a **task agent** that uses those
 tools to carry out a goal you give it. The full design, with the reasoning
 behind each choice, is in [docs/DESIGN.md](docs/DESIGN.md).
 
-### MCP server
+### MCP server: free text → plan → approved action
+
+skyctl is an MCP server designed for agents that turn a free-text request
+into an action plan. The full design is in [docs/MCP_AGENT.md](docs/MCP_AGENT.md).
 
 ```bash
 pip install -e ".[mcp]"
-skyctl mcp                              # stdio; everything allowed (you are driving)
-skyctl mcp --read-only                  # no write tools at all
-skyctl mcp --dry-run --account work     # write tools preview only, one account
+skyctl mcp                                        # a person at the keyboard: direct tools, client confirmation
+skyctl mcp --profile plan --approval elicit       # agents plan; you approve the preview in the client
+skyctl mcp --read-only                            # research / dashboards
 ```
 
-Claude Desktop / Claude Code / Cursor:
+Claude Desktop / Claude Code:
 
 ```json
-{"mcpServers": {"skyctl": {"command": "skyctl", "args": ["mcp"], "cwd": "/path/to/your/skyctl/.env dir"}}}
+{"mcpServers": {"skyctl": {"command": "skyctl", "args": ["mcp", "--profile", "plan", "--approval", "elicit"]}}}
 ```
 
-Tools: `list_accounts`, `get_profile`, `get_timeline`, `get_notifications`,
-`search_posts`, `list_posts`, `get_post`, `preview_post`, `fetch_link_metadata`,
-`post`, `reply`, `thread`, `repost`, `like`, `delete_post`, `schedule_post`,
-`schedule_cron`, `list_jobs`, `cancel_job`. Resources: `skyctl://accounts`,
-`skyctl://jobs`. The same registry produces Anthropic and OpenAI tool schemas
-for the task agent (`skyctl.tool_registry.to_anthropic()` / `.to_openai()`).
+In the `plan` profile the agent can read everything but cannot write
+directly. It proposes a **plan** (`plan_check` → `plan_create`). You see a
+preview. The plan is approved against its hash and then executed
+deterministically, with no model in the loop, so injected instructions in
+a mention cannot change what is done:
+
+```bash
+skyctl plan list                     # plans proposed by agents
+skyctl plan show <id>                # the preview: every write, with account and text
+skyctl plan approve <id> --execute   # approve exactly this plan, then run it
+```
+
+Tools: reads (`get_notifications`, `get_timeline`, `search_posts`, `get_post`, …),
+writes (`post`, `reply`, `thread`, `like`, `repost`, `schedule_*`), destructive
+(`delete_post`, `cancel_job`), plans (`plan_*`) and delegation (`agent_run`).
+Resources: `skyctl://policy`, `skyctl://guide`, `skyctl://accounts`,
+`skyctl://plans/{id}`, … Prompts: `act_on_request`, `triage_mentions`,
+`publish_announcement`, `schedule_campaign`, `daily_digest`.
+
+Measure how well a model interprets free text (simulated network, nothing executed):
+
+```bash
+skyctl eval run --model anthropic:claude-opus-5-5 --repeat 5
+```
 
 ### Task agent
 
@@ -450,11 +471,16 @@ The full design, per-cloud toolsets and implementation notes are in
 [docs/CLOUD_FRAMEWORK.md](docs/CLOUD_FRAMEWORK.md). In short:
 
 ```bash
-# One spec → AWS, Azure, GCP, Kubernetes and Compose
-skyctl deploy validate deploy/examples/skyctl.deploy.toml     # capability/limit checks per target
-skyctl deploy check    deploy/examples/skyctl.deploy.toml     # + render all + cross-target conformance
-skyctl deploy render   deploy/examples/skyctl.deploy.toml --target gcp --out build
+# One spec → AWS, Azure, GCP (managed serverless OR their Kubernetes services), any cluster, Compose
+skyctl deploy validate deploy/examples/managed.deploy.toml    # capability/limit checks per target
+skyctl deploy check    deploy/examples/managed.deploy.toml    # + render all + cross-target conformance
+skyctl deploy render   deploy/examples/managed.deploy.toml --target gcp --out build
 cd build/gcp && terraform init && TF_VAR_secrets_json="$(cat ../../.env)" terraform apply
+
+# Same intent on existing EKS / AKS / GKE clusters (compute = "eks" | "aks" | "gke")
+skyctl deploy render   deploy/examples/kubernetes.deploy.toml --target aws --out build
+cd build/aws && terraform init && terraform apply     # bucket, queue, secrets, identity; writes bind.json
+kubectl apply -f bind.json && kubectl apply -f manifests.json
 
 # What the runtime sees
 skyctl platform list                  # platforms × compute profiles × capabilities
@@ -471,7 +497,14 @@ skyctl daemon                         # schedules + worker in one process (Compo
 |---|---|
 | Runtime (what the code calls) | ports with stated semantics (CAS state, at-least-once queues, delayed delivery), native adapters per cloud chosen by URL scheme, a contract test kit |
 | Invocation (how platforms call the code) | one `Invocation` vocabulary, decoders for CloudEvents, Pub/Sub push, Event Grid, SQS/Lambda, EventBridge; one dispatcher; one worker |
-| Provisioning (how it comes to exist) | `skyctl.deploy.toml` → validated against each target's capabilities → rendered → 11 cross-target conformance checks |
+| Provisioning (how it comes to exist) | one `*.deploy.toml` → validated against each target's capabilities → rendered → 12 cross-target conformance checks |
+
+Each cloud target chooses its compute: managed serverless (`ecs`/`lambda`,
+`container-apps`, `cloud-run`) or its Kubernetes service (`eks`, `aks`,
+`gke`). The backing services (the protected state bucket holding the job
+document, the queue, secrets, identity) are the same IaC either way, and a
+test asserts it. Azure queues are Storage Queues (delays up to 7 days; later
+posts go to the periodic catch-up).
 
 ---
 
@@ -498,11 +531,13 @@ skyctl/
 │   ├── testing/         # Port contract kit and SDK-faithful fakes
 │   ├── tools/           # Tool registry, catalogue and policy
 │   ├── agent/           # Task agent: chat providers, runner, TaskSpec
-│   ├── mcp_server.py    # MCP server built from the registry
+│   ├── planning/        # Plan protocol: model, checks, store, deterministic executor
+│   ├── evals/           # Free-text → plan evaluation harness and scenarios
+│   ├── mcp_server.py    # MCP server: profiles, plan protocol, elicitation, prompts, resources
 │   └── server.py        # HTTP service: /mcp, /runs, /invoke, /tick
 ├── tests/               # Offline pytest suite (+ emulator-backed integration tests)
-├── docs/                # DESIGN.md (agent/tools), CLOUD_FRAMEWORK.md (cross-cloud framework)
-├── deploy/              # examples/skyctl.deploy.toml and generated/<target>/ (golden files)
+├── docs/                # DESIGN.md, CLOUD_FRAMEWORK.md (cross-cloud), MCP_AGENT.md (agentic MCP server)
+├── deploy/              # examples/{managed,kubernetes}.deploy.toml and generated/<example>/<target>/ (golden files)
 ├── Dockerfile, docker-compose.yml
 ├── .env.example, agents.example.toml, tasks.example.toml
 ├── pyproject.toml

@@ -9,7 +9,7 @@ are the final authority: point the same variables at them in a sandbox.
 
     SKYCTL_IT_S3_ENDPOINT      e.g. http://localhost:4566   (LocalStack; unset + AWS creds = real S3)
     SKYCTL_IT_S3_BUCKET        bucket to use (created if missing)
-    SKYCTL_IT_AZURE_CONN       Azurite / storage connection string
+    SKYCTL_IT_AZURE_CONN       Azurite / storage connection string (Blob and Queue endpoints)
     SKYCTL_IT_GCS_ENDPOINT     e.g. http://localhost:4443   (fake-gcs-server)
 """
 
@@ -19,7 +19,12 @@ import uuid
 import pytest
 
 from skyctl.adapters import ObjectJobStore
-from skyctl.testing.contracts import check_cas_under_contention, check_job_store_lease, check_object_store
+from skyctl.testing.contracts import (
+    check_cas_under_contention,
+    check_job_store_lease,
+    check_object_store,
+    check_work_queue,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -80,3 +85,18 @@ def test_contract(fixture, request):
 @pytest.mark.parametrize("fixture", ["s3_store", "azure_store", "gcs_store"])
 def test_cas_under_contention(fixture, request):
     check_cas_under_contention(request.getfixturevalue(fixture), threads=6, increments=5)
+
+
+def test_azure_storage_queue_contract():
+    """The Azure queue the renderers use, against Azurite's queue service (or a real account)."""
+    conn = os.getenv("SKYCTL_IT_AZURE_CONN")
+    if not conn:
+        pytest.skip("SKYCTL_IT_AZURE_CONN not set")
+    from azure.storage.queue import QueueServiceClient
+
+    from skyctl.adapters.queues import AzureStorageQueue
+
+    svc = QueueServiceClient.from_connection_string(conn)
+    name = f"it{uuid.uuid4().hex[:10]}"
+    main, poison = svc.create_queue(name), svc.create_queue(f"{name}-poison")
+    check_work_queue(AzureStorageQueue("devstoreaccount1", name, client=main, poison_client=poison))

@@ -167,13 +167,14 @@ class FileObjectStore:
             path.unlink()
 
     def list(self, prefix: str = "") -> list[str]:
-        base = self._path(prefix) if prefix else self.root
+        root = self.root.resolve()               # _path() resolves; compare like with like
+        base = self._path(prefix) if prefix else root
         if not base.exists():
             return []
         if base.is_file():
             return [prefix]
         return sorted(
-            str(p.relative_to(self.root)).replace(os.sep, "/")
+            str(p.relative_to(root)).replace(os.sep, "/")
             for p in base.rglob("*")
             if p.is_file() and not p.name.endswith((".tmp", ".lock"))
         )

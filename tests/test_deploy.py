@@ -10,12 +10,19 @@ from skyctl.deploy import check, load_spec, render, validate, validate_all
 from skyctl.deploy.render.base import check_references
 from skyctl.deploy.spec import DeploySpec
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "deploy" / "examples" / "skyctl.deploy.toml"
+EXAMPLES = Path(__file__).resolve().parents[1] / "deploy" / "examples"
+EXAMPLE = EXAMPLES / "managed.deploy.toml"
+K8S_EXAMPLE = EXAMPLES / "kubernetes.deploy.toml"
 
 
 @pytest.fixture
 def spec() -> DeploySpec:
     return load_spec(EXAMPLE)
+
+
+@pytest.fixture
+def k8s_spec() -> DeploySpec:
+    return load_spec(K8S_EXAMPLE)
 
 
 def rendered(spec):
@@ -35,7 +42,7 @@ def test_example_spec_loads_validates_and_conforms(spec):
     assert [f for f in validate_all(spec) if f.level == "error"] == []
     checks = check(spec, rendered(spec))
     assert failing(checks) == [], [str(c) for c in failing(checks)]
-    assert len({c.name for c in checks}) == 11
+    assert len({c.name for c in checks}) == 12
 
 
 def test_spec_rejects_bad_input():
@@ -142,7 +149,7 @@ def test_cron_dialects_per_target(spec):
     cron = next(i for i in k8s["items"] if i["kind"] == "CronJob" and i["metadata"]["name"] == "skyctl-daily-engagement")
     assert cron["spec"]["concurrencyPolicy"] == "Forbid" and cron["spec"]["timeZone"] == "UTC"
     args = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"]
-    assert args == ["invoke", '{"kind":"task.run","task":"daily-engagement"}']
+    assert args == ["invoke", '{"kind":"task.run","slot":{"cron":"0 9 * * mon-fri","timezone":"UTC"},"task":"daily-engagement"}']
 
 
 def test_every_target_uses_native_identity_and_no_static_cloud_keys(spec):
@@ -154,6 +161,7 @@ def test_every_target_uses_native_identity_and_no_static_cloud_keys(spec):
     k8s = json.loads(arts["kubernetes"].files["manifests.json"])
     sa = next(i for i in k8s["items"] if i["kind"] == "ServiceAccount")
     assert sa["metadata"]["annotations"] == {"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/skyctl-eks"}
+    assert any(i["kind"] == "ConfigMap" and i["metadata"]["name"] == "skyctl-env" for i in k8s["items"])
     scaled = next(i for i in k8s["items"] if i["kind"] == "ScaledJob")
     assert scaled["spec"]["triggers"][0]["type"] == "aws-sqs-queue"
 
@@ -183,18 +191,22 @@ def test_compose_substitutes_missing_capabilities(spec):
     doc = json.loads(art.files["compose.json"])
     daemon = doc["services"]["daemon"]
     assert daemon["command"] == ["daemon"]
-    assert [x["name"] for x in json.loads(daemon["environment"]["SKYCTL_SCHEDULES_JSON"])] == ["tick", "daily-engagement"]
+    schedules = json.loads(daemon["environment"]["SKYCTL_SCHEDULES_JSON"])
+    assert [x["name"] for x in schedules] == ["tick", "daily-engagement"]
+    assert schedules[1]["invoke"]["slot"] == {"cron": "0 9 * * mon-fri", "timezone": "UTC"}
     assert doc["services"]["http"]["ports"] == ["127.0.0.1:8080:8080"]
 
 
-def test_generated_examples_are_up_to_date(spec):
-    """deploy/generated/ is rendered from the example spec; regenerate with `skyctl deploy render`."""
-    root = EXAMPLE.parents[1] / "generated"
-    for target, art in rendered(spec).items():
+@pytest.mark.parametrize("example", ["managed", "kubernetes"])
+def test_generated_examples_are_up_to_date(example):
+    """deploy/generated/<example>/ is rendered from deploy/examples/<example>.deploy.toml."""
+    src = EXAMPLES / f"{example}.deploy.toml"
+    root = EXAMPLES.parent / "generated" / example
+    for target, art in rendered(load_spec(src)).items():
         for name, content in art.files.items():
             path = root / target / name
-            assert path.exists(), f"missing {path}; run: skyctl deploy render {EXAMPLE} --all --out deploy/generated"
-            assert path.read_text() == content, f"{path} is stale; re-render it"
+            assert path.exists(), f"missing {path}; run: skyctl deploy render {src} --all --out {root}"
+            assert path.read_text() == content, f"{path} is stale; run: skyctl deploy render {src} --all --out {root}"
 
 
 # ----------------------------------------------------------------------
@@ -262,3 +274,153 @@ def test_common_env_cannot_be_overridden_by_a_renderer(spec):
     with pytest.raises(ValueError, match="override"):
         common_env(spec, "aws", platform="aws", compute="ecs", secrets="env", state_url="s3://b",
                    extra={"SKYCTL_AGENT_MAX_WRITES": "999"})
+
+
+
+# ----------------------------------------------------------------------
+# Decision 1: the state bucket is always provisioned and protected
+# ----------------------------------------------------------------------
+
+def test_every_cloud_target_provisions_a_protected_versioned_state_bucket(spec, k8s_spec):
+    for s in (spec, k8s_spec):
+        checks = check(s, rendered(s))
+        protected = [c for c in checks if c.name == "state.protected"]
+        assert {c.target for c in protected} == {"aws", "azure", "gcp"} and all(c.ok for c in protected), protected
+
+
+def test_state_protected_check_can_fail(spec):
+    arts = rendered(spec)
+    del arts["aws"].terraform["resource"]["aws_s3_bucket"]["state"]["lifecycle"]
+    arts["gcp"].terraform["resource"]["google_storage_bucket"]["state"]["versioning"]["enabled"] = False
+    del arts["azure"].terraform["resource"]["azurerm_storage_account"]
+    checks = check(spec, arts)
+    assert failing(checks, "state.protected", "aws") and failing(checks, "state.protected", "gcp")
+    assert "not provisioned" in failing(checks, "state.protected", "azure")[0].detail
+
+
+def test_protection_can_be_turned_off_deliberately(spec):
+    s = _with(spec, state__protect=False)
+    bucket = render(s, "aws").terraform["resource"]["aws_s3_bucket"]["state"]
+    assert "lifecycle" not in bucket and failing(check(s, rendered(s))) == []
+
+
+# ----------------------------------------------------------------------
+# Decision 2: Azure uses Storage Queues
+# ----------------------------------------------------------------------
+
+def test_azure_uses_storage_queues_not_service_bus(spec):
+    art = render(spec, "azure")
+    res = art.terraform["resource"]
+    assert not any(t.startswith("azurerm_servicebus") for t in res)
+    assert set(res["azurerm_storage_queue"]) == {"work", "poison"}
+    assert art.env["SKYCTL_QUEUE_URL"] == "azqueue://${azurerm_storage_account.state.name}/skyctl-work"
+    assert art.env["SKYCTL_DELAYED_URL"] == "queue"
+    # Entra-only: no shared keys, so nothing renders a connection string.
+    assert res["azurerm_storage_account"]["state"]["shared_access_key_enabled"] is False
+    assert "connection_string" not in art.files["main.tf.json"]
+    # The Container Apps worker is a scheduled drain, not an event trigger.
+    worker = res["azurerm_container_app_job"]["worker"]
+    assert worker["schedule_trigger_config"]["cron_expression"] == "* * * * *"
+    assert worker["template"]["container"][0]["args"] == ["worker", "--once"]
+    assert "event_trigger_config" not in worker
+
+
+def test_azure_poll_interval_is_configurable(spec):
+    art = render(_with(spec, worker__poll_minutes=5), "azure")
+    assert art.terraform["resource"]["azurerm_container_app_job"]["worker"]["schedule_trigger_config"]["cron_expression"] == "*/5 * * * *"
+
+
+# ----------------------------------------------------------------------
+# Decision 3: managed serverless OR Kubernetes on each cloud
+# ----------------------------------------------------------------------
+
+def test_kubernetes_example_validates_and_conforms(k8s_spec):
+    assert [k8s_spec.compute_for(t) for t in k8s_spec.targets.names()] == ["eks", "aks", "gke"]
+    assert [f for f in validate_all(k8s_spec) if f.level == "error"] == []
+    assert failing(check(k8s_spec, rendered(k8s_spec))) == []
+
+
+def _backing(art, types):
+    return {t: art.terraform["resource"].get(t) for t in types}
+
+
+@pytest.mark.parametrize("target,types", [
+    ("aws", ["aws_s3_bucket", "aws_s3_bucket_versioning", "aws_s3_bucket_lifecycle_configuration",
+             "aws_s3_bucket_server_side_encryption_configuration", "aws_s3_bucket_public_access_block",
+             "aws_s3_object", "aws_sqs_queue", "aws_secretsmanager_secret", "aws_scheduler_schedule_group"]),
+    ("azure", ["azurerm_storage_account", "azurerm_storage_container", "azurerm_storage_queue",
+               "azurerm_storage_management_policy", "azurerm_storage_blob", "azurerm_key_vault", "azurerm_key_vault_secret"]),
+    ("gcp", ["google_storage_bucket", "google_storage_bucket_object", "google_pubsub_topic", "google_secret_manager_secret"]),
+])
+def test_backing_services_are_identical_in_both_compute_options(spec, k8s_spec, target, types):
+    """Choosing Kubernetes or managed serverless must not change the state, queue or secrets IaC."""
+    managed, k8s = render(spec, target), render(k8s_spec, target)
+    assert _backing(managed, types) == _backing(k8s, types)
+    for key in ("SKYCTL_STATE_URL", "SKYCTL_AGENT_MAX_WRITES", "SKYCTL_AGENT_ACCOUNTS"):
+        assert managed.env[key] == k8s.env[key], key
+    # Same queue. The one intended difference: on GCP, Cloud Run consumes through a
+    # push subscription and GKE through a pull subscription on the same topic.
+    topic = lambda url: url.split("?", 1)[0]     # noqa: E731
+    assert topic(managed.env["SKYCTL_QUEUE_URL"]) == topic(k8s.env["SKYCTL_QUEUE_URL"])
+    if target != "gcp":
+        assert managed.env["SKYCTL_QUEUE_URL"] == k8s.env["SKYCTL_QUEUE_URL"]
+
+
+def test_k8s_modes_bind_cloud_values_without_cluster_credentials(k8s_spec):
+    for target in ("aws", "azure", "gcp"):
+        art = render(k8s_spec, target)
+        res = art.terraform["resource"]
+        assert "local_file" in res and not any(t.startswith("kubernetes_") for t in res)   # no cluster creds needed
+        bind = json.loads(res["local_file"]["k8s_bind"]["content"])
+        kinds = [i["kind"] for i in bind["items"]]
+        assert kinds[:3] == ["Namespace", "ServiceAccount", "ConfigMap"]
+        assert {"TriggerAuthentication", "ScaledJob"} <= set(kinds)
+        cm = next(i for i in bind["items"] if i["kind"] == "ConfigMap")["data"]
+        assert cm["SKYCTL_PLATFORM"] == "kubernetes" and cm["SKYCTL_STATE_URL"] == art.env["SKYCTL_STATE_URL"]
+        # Static manifests carry no Terraform references.
+        assert "${" not in art.files["manifests.json"]
+        cron = next(i for i in json.loads(art.files["manifests.json"])["items"] if i["kind"] == "CronJob")
+        assert cron["spec"]["concurrencyPolicy"] == "Forbid"
+        assert all(s.overlap_guard == "platform" for s in art.schedules)
+
+
+def test_k8s_identity_per_cloud(k8s_spec):
+    aws = render(k8s_spec, "aws").terraform["resource"]
+    assert aws["aws_eks_pod_identity_association"]["app"]["service_account"] == "skyctl"
+    irsa = render(_with(k8s_spec, targets__aws__kubernetes__identity="irsa",
+                        targets__aws__kubernetes__oidc_provider_arn="arn:aws:iam::1:oidc-provider/oidc.eks.x/id/A",
+                        targets__aws__kubernetes__oidc_issuer="oidc.eks.x/id/A"), "aws").terraform["resource"]
+    assert "aws_eks_pod_identity_association" not in irsa
+    trust = json.loads(irsa["aws_iam_role"]["app"]["assume_role_policy"])["Statement"][0]
+    assert trust["Condition"]["StringEquals"]["oidc.eks.x/id/A:sub"] == "system:serviceaccount:skyctl:skyctl"
+    bind = json.loads(irsa["local_file"]["k8s_bind"]["content"])
+    sa = next(i for i in bind["items"] if i["kind"] == "ServiceAccount")
+    assert sa["metadata"]["annotations"] == {"eks.amazonaws.com/role-arn": "${aws_iam_role.app.arn}"}
+
+    az = render(k8s_spec, "azure").terraform["resource"]
+    assert az["azurerm_federated_identity_credential"]["k8s_app"]["issuer"] == "${data.azurerm_kubernetes_cluster.aks.oidc_issuer_url}"
+    gcp = render(k8s_spec, "gcp").terraform["resource"]
+    assert gcp["google_service_account_iam_member"]["workload_identity"]["role"] == "roles/iam.workloadIdentityUser"
+    assert "google_cloud_run_v2_service" not in gcp and "push_config" not in gcp["google_pubsub_subscription"]["work"]
+
+
+def test_k8s_mode_fetches_the_http_token_from_the_cloud_secret_store(k8s_spec):
+    for target, expected in (("aws", "aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN"),
+                             ("gcp", "gcp-sm://my-skyctl-project/skyctl-http-token#SKYCTL_HTTP_TOKEN")):
+        assert expected in render(k8s_spec, target).env["SKYCTL_SECRETS"]
+    aws = render(k8s_spec, "aws").terraform["resource"]
+    policy = json.loads(aws["aws_iam_role_policy"]["app"]["policy"])
+    assert policy["Statement"][0]["Resource"] == ["${aws_secretsmanager_secret.config.arn}", "${aws_secretsmanager_secret.http_token.arn}"]
+
+
+def test_k8s_validation(k8s_spec):
+    assert any("oidc_provider_arn" in m for m in errors(_with(k8s_spec, targets__aws__kubernetes__identity="irsa"), "aws"))
+    warn = [f.message for f in validate(_with(k8s_spec, targets__aws__kubernetes__keda_operator_role_arn=None), "aws")]
+    assert any("KEDA operator" in m for m in warn)
+    assert any("tick catch-up" in f.message for f in validate(k8s_spec, "gcp"))
+    # Time zones are fine on every Kubernetes target, including Azure's.
+    data = k8s_spec.model_dump()
+    data["schedules"][1]["timezone"] = "Europe/London"
+    assert errors(DeploySpec.model_validate(data), "azure") == []
+    with pytest.raises(ValueError, match="targets.gcp.kubernetes"):
+        DeploySpec.model_validate({**k8s_spec.model_dump(), "targets": {"gcp": {"project": "p", "region": "r", "compute": "gke"}}})

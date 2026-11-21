@@ -92,3 +92,28 @@ def to_eventbridge(spec: CronSpec) -> str:
     else:
         dow = "?"
     return f"cron({_step_base(m, '0')} {_step_base(h, '0')} {_step_base(dom, '1')} {mon.upper()} {dow} *)"
+
+
+def previous_fire(cron: str, timezone_name: str = "UTC", now=None):
+    """
+    The most recent fire time of `cron` at or before `now`: the "slot" a
+    scheduled run belongs to. Retries of the same run land in the same slot
+    on every platform, which makes it a portable idempotency key (no need
+    for EventBridge's scheduled-time or any other platform-specific context).
+    """
+    from datetime import datetime, timedelta, timezone as tz
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    now = now or datetime.now(tz.utc)
+    trigger = CronTrigger.from_crontab(cron, timezone=timezone_name)
+    for lookback in (timedelta(hours=1), timedelta(days=1), timedelta(days=8), timedelta(days=32), timedelta(days=370)):
+        fire = trigger.get_next_fire_time(None, now - lookback)
+        if fire is None or fire > now:
+            continue
+        while True:                     # walk forward to the last fire <= now
+            nxt = trigger.get_next_fire_time(fire, fire)
+            if nxt is None or nxt > now:
+                return fire
+            fire = nxt
+    return None
