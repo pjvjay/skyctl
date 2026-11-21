@@ -116,12 +116,24 @@ jobs:
     services:
       localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
       azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000", "10001:10001"] }
-      gcs: { image: "fsouza/fake-gcs-server", ports: ["4443:4443"], options: "--entrypoint /bin/fake-gcs-server -- -scheme http" }
     steps:
       - uses: actions/checkout@v4
+      # fake-gcs-server needs "-scheme http". A service container cannot be given
+      # arguments (they would have to go through `options`, which docker reads
+      # before the image name), so it is started as a step instead.
+      - name: Start fake-gcs-server
+        run: docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -e ".[test,all]"
+      - name: Wait for fake-gcs-server
+        run: |
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:4443/storage/v1/b > /dev/null && exit 0
+            sleep 1
+          done
+          docker logs gcs
+          exit 1
       - run: pytest -q -m integration -rs
         env:
           AWS_ACCESS_KEY_ID: test

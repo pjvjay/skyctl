@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - The type check failed with `atproto` 0.0.74 and later, which ship `py.typed`: `BskyClient._build_facets` bound one variable to three different facet types. The variable is now annotated; behaviour is unchanged.
+- CI: the `integration` job could not start its containers. fake-gcs-server was given its arguments through the service's `options`, which makes `docker create` fail; it is now started as a step.
 
 ## [0.2.0] - 2026-11-17
 
