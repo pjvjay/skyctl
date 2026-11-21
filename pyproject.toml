@@ -17,7 +17,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+# Cloud object stores: each extra installs only the SDK its adapter needs.
+# boto3 >= 1.35.69: S3 conditional writes (If-None-Match / If-Match on PutObject).
+aws = ["boto3>=1.35.69"]
+azure = ["azure-identity>=1.15", "azure-storage-blob>=12.19"]
+gcp = ["google-cloud-storage>=2.14"]
+# Generic fallback for other fsspec schemes (no atomic compare-and-swap).
+fsspec = ["fsspec>=2024.0"]
+test = [
+    "pytest>=7", "fsspec>=2024.0",
+    "moto[s3]>=5.1.5", "boto3>=1.35.69",  # moto < 5.1.5 ignores S3 If-Match
+    "azure-storage-blob>=12.19", "google-cloud-storage>=2.14",
+]
 
 [project.scripts]
 skyctl = "skyctl.cli:cli"

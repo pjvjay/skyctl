@@ -8,17 +8,19 @@ All methods return typed result objects rather than raw API dicts.
 from __future__ import annotations
 
 import html as html_lib
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from atproto import Client as AtProtoClient
 from atproto import models as at_models
 
 from .models import AccountConfig, PostResult
 from .richtext import detect_facets, split_thread, validate_length
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .ports import ObjectStore, SessionStore
 
 MAX_IMAGES = 4
 MAX_THUMB_BYTES = 1_000_000
@@ -104,10 +106,27 @@ class BskyClient:
         self,
         config: AccountConfig,
         session_dir: Optional[Union[str, Path]] = None,
+        session_store: Optional["SessionStore"] = None,
+        media_store: Optional["ObjectStore"] = None,
     ):
+        """
+        Args:
+            config: Account credentials.
+            session_dir: Directory for cached sessions (legacy; wraps a
+                FileSessionStore). Ignored when session_store is given.
+            session_store: Any SessionStore (see skyctl.ports). In the cloud
+                this is backed by the shared state bucket.
+            media_store: Where image keys are read from when an image path
+                is not a local file (e.g. "media/kite.jpg" in the state bucket).
+        """
         self.config = config
         self.alias = config.alias
-        self.session_dir = Path(session_dir) if session_dir else None
+        if session_store is None and session_dir is not None:
+            from .adapters.local import FileSessionStore
+
+            session_store = FileSessionStore(session_dir)
+        self.session_store = session_store
+        self.media_store = media_store
         self._client = self._new_client()
         self._profile = None
         self._logged_in = False
@@ -127,12 +146,6 @@ class BskyClient:
         self._ensure_logged_in()
         return self._client.me.did
 
-    @property
-    def _session_file(self) -> Optional[Path]:
-        if self.session_dir is None:
-            return None
-        return self.session_dir / f"{self.alias}.session"
-
     def login(self) -> "BskyClient":
         """
         Authenticate with Bluesky. Returns self for chaining.
@@ -140,12 +153,10 @@ class BskyClient:
         Reuses a cached session when one exists and is still valid;
         otherwise logs in with the app password and caches the new session.
         """
-        session_file = self._session_file
-        if session_file is not None and session_file.exists():
+        cached = self.session_store.get(self.alias) if self.session_store else None
+        if cached:
             try:
-                self._profile = self._client.login(
-                    session_string=session_file.read_text().strip()
-                )
+                self._profile = self._client.login(session_string=cached)
                 self._after_login()
                 return self
             except Exception:
@@ -162,25 +173,24 @@ class BskyClient:
         self._logged_in = True
         self._save_session()
         on_change = getattr(self._client, "on_session_change", None)
-        if on_change is not None and self._session_file is not None:
+        if on_change is not None and self.session_store is not None:
             on_change(lambda *_: self._save_session())
 
     def _save_session(self):
-        session_file = self._session_file
-        if session_file is None:
+        if self.session_store is None:
             return
         try:
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            session_file.write_text(self._client.export_session_string())
-            os.chmod(session_file, 0o600)
+            self.session_store.set(self.alias, self._client.export_session_string())
         except Exception:
             pass  # Session caching is best-effort.
 
     def logout(self) -> None:
         """Forget the cached session for this account."""
-        session_file = self._session_file
-        if session_file is not None and session_file.exists():
-            session_file.unlink()
+        if self.session_store is not None:
+            try:
+                self.session_store.clear(self.alias)
+            except Exception:
+                pass
         self._logged_in = False
 
     def _ensure_logged_in(self):
@@ -371,6 +381,18 @@ class BskyClient:
         )
         return [self._flatten_post_record(p) for p in resp.posts]
 
+    def get_post(self, uri: str) -> dict:
+        """Fetch one post by AT URI or bsky.app URL."""
+        self._ensure_logged_in()
+        uri = self._normalize_uri(uri)
+        post = self._fetch_post(uri)
+        data = self._flatten_post_record(post)
+        reply = getattr(post.record, "reply", None)
+        data["reply_root"] = reply.root.uri if reply is not None else None
+        data["reply_parent"] = reply.parent.uri if reply is not None else None
+        data["replies"] = getattr(post, "reply_count", None)
+        return data
+
     def list_posts(self, actor: Optional[str] = None, limit: int = 30) -> list[dict]:
         """
         List an account's recent posts (newest first) straight from its
@@ -464,8 +486,7 @@ class BskyClient:
         except Exception as e:
             return self._error(str(e))
 
-    @staticmethod
-    def _check_media_args(image_paths, image_alts, link_card):
+    def _check_media_args(self, image_paths, image_alts, link_card):
         image_paths = image_paths or []
         image_alts = image_alts or []
         if len(image_paths) > MAX_IMAGES:
@@ -475,8 +496,20 @@ class BskyClient:
         if image_paths and link_card:
             raise ValueError("A post cannot have both images and a link card.")
         for path in image_paths:
-            if not Path(path).is_file():
+            if not self._image_exists(path):
                 raise ValueError(f"Image not found: {path}")
+
+    def _image_exists(self, path: str) -> bool:
+        if Path(path).is_file():
+            return True
+        return bool(self.media_store is not None and self.media_store.exists(path))
+
+    def _read_image(self, path: str) -> bytes:
+        if Path(path).is_file():
+            return Path(path).read_bytes()
+        if self.media_store is None:
+            raise FileNotFoundError(path)
+        return self.media_store.read(path)
 
     def _normalize_uri(self, uri: str) -> str:
         """Accept an AT URI or a bsky.app post URL; return an AT URI."""
@@ -573,8 +606,7 @@ class BskyClient:
         images = []
         for i, path_str in enumerate(image_paths[:MAX_IMAGES]):
             path = Path(path_str)
-            with open(path, "rb") as f:
-                data = f.read()
+            data = self._read_image(path_str)
             blob = self._client.upload_blob(data)
             alt = image_alts[i] if i < len(image_alts) else path.stem
             images.append(
@@ -614,14 +646,16 @@ class BskyClient:
         }
 
     def _flatten_post_record(self, post) -> dict:
+        author = getattr(post, "author", None)
+        record = getattr(post, "record", None)
         return {
             "uri": post.uri,
             "cid": post.cid,
-            "author": post.author.handle,
-            "text": post.record.text,
-            "created_at": post.record.created_at,
-            "likes": post.like_count,
-            "reposts": post.repost_count,
+            "author": getattr(author, "handle", None),
+            "text": getattr(record, "text", ""),
+            "created_at": getattr(record, "created_at", None),
+            "likes": getattr(post, "like_count", None),
+            "reposts": getattr(post, "repost_count", None),
             "url": _uri_to_url(post.uri),
         }
 

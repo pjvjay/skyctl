@@ -3,12 +3,26 @@ Shared fixtures. Every test runs against FakeAtProto, so the suite needs
 no network access and no real credentials.
 """
 
+import importlib
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
 
 import skyctl.client as client_mod
 from skyctl import AccountConfig, BskyClient, BskyManager
+
+
+def require(module: str):
+    """
+    Skip when an optional dependency is *not installed*; import it otherwise.
+
+    Unlike pytest.importorskip, a dependency that is installed but broken
+    (an incompatible version) fails the test instead of silently skipping it.
+    """
+    if importlib.util.find_spec(module) is None:
+        pytest.skip(f"{module} is not installed", allow_module_level=True)
+    return importlib.import_module(module)
 
 
 class FakeAtProto:
