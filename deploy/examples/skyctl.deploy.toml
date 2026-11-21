@@ -1,0 +1,92 @@
+# One deployment, five targets. Render with:
+#   skyctl deploy check  deploy/examples/skyctl.deploy.toml
+#   skyctl deploy render deploy/examples/skyctl.deploy.toml --target gcp --out build/gcp
+#
+# Everything above [targets] is cloud-neutral intent. Secrets are never
+# written here: Terraform targets take them as sensitive variables
+# (TF_VAR_secrets_json), Kubernetes and Compose reference existing secrets.
+
+[app]
+name = "skyctl"
+image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/skyctl:1.2.0"
+
+[runtime]
+model = "anthropic:claude-opus-5-5"
+log_format = "json"
+delayed_delivery = true
+
+[policy]                      # ceilings for every agent run, identical on every target
+allow_writes = true
+allow_delete = false
+max_writes = 5
+max_turns = 25
+max_run_seconds = 540
+accounts = ["work"]
+
+[service]                     # /mcp, /runs, /invoke
+enabled = true
+public = false
+min_instances = 0
+max_instances = 2
+auth = ["bearer"]
+
+[worker]
+enabled = true
+max_concurrency = 2
+visibility_seconds = 900
+max_attempts = 5
+
+[state]
+versioning = true
+retention_days = 90
+
+[[schedules]]
+name = "tick"
+cron = "*/5 * * * *"
+invoke = { kind = "tick" }
+timeout_s = 300
+
+[[schedules]]
+name = "daily-engagement"
+cron = "0 9 * * mon-fri"
+timezone = "UTC"              # Azure Container Apps Jobs are UTC-only; validate() enforces it
+invoke = { kind = "task.run", task = "daily-engagement" }
+timeout_s = 900
+
+[tasks.daily-engagement]
+goal = "Read the work account's notifications and draft replies to genuine product questions."
+accounts = ["work"]
+allow_writes = true
+max_writes = 5
+approval = "writes"
+
+[targets.aws]
+region = "us-east-1"
+compute = "ecs"
+model = "bedrock:anthropic.claude-opus-5-5"
+vpc_id = "vpc-0123456789abcdef0"
+subnet_ids = ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"]
+security_group_ids = []
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+
+[targets.azure]
+location = "westeurope"
+model = "azure-openai:gpt-4.1"
+openai_endpoint = "https://skyctl-openai.openai.azure.com"
+
+[targets.gcp]
+project = "my-skyctl-project"
+region = "europe-west1"
+model = "vertex:claude-opus-5-5"
+
+[targets.kubernetes]
+namespace = "skyctl"
+cloud = "aws"
+identity = "arn:aws:iam::123456789012:role/skyctl-eks"
+state_url = "s3://my-skyctl-state/skyctl"
+queue_url = "sqs://sqs.us-east-1.amazonaws.com/123456789012/skyctl-work"
+keda = true
+extra_env = { AWS_REGION = "us-east-1" }
+
+[targets.compose]
+port = 8080

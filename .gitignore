@@ -20,3 +20,9 @@ logs/
 .skyctl_agents/
 agents.toml
 *~
+
+.skyctl/
+tasks.toml
+deploy/terraform/**/.terraform/
+deploy/terraform/**/*.tfstate*
+deploy/terraform/**/*.tfvars

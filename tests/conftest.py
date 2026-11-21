@@ -80,6 +80,16 @@ class FakeAtProto:
         return True
 
     # -- reads ---------------------------------------------------------
+    def get_timeline(self, limit=20):
+        post = SimpleNamespace(
+            uri="at://did:plc:friend/app.bsky.feed.post/tl1",
+            cid="cid-tl1",
+            author=SimpleNamespace(handle="friend.test"),
+            record=SimpleNamespace(text="timeline post", created_at="2026-01-01T00:00:00Z"),
+            like_count=3, repost_count=0, reply_count=1,
+        )
+        return SimpleNamespace(feed=[SimpleNamespace(post=post)][:limit])
+
     def get_posts(self, uris):
         return SimpleNamespace(posts=[self.posts[u] for u in uris if u in self.posts])
 
@@ -101,13 +111,45 @@ class FakeAtProto:
             )
             return SimpleNamespace(posts=[post])
 
+        def list_notifications(params):
+            n = SimpleNamespace(model_dump=lambda: {
+                "reason": "mention",
+                "author": {"handle": "fan.test"},
+                "record": {"text": "hey @me.test, is there a student discount?"},
+                "uri": "at://did:plc:fan/app.bsky.feed.post/n1",
+                "cid": "cid-n1",
+                "reason_subject": None,
+                "indexed_at": "2026-01-01T00:00:00Z",
+                "is_read": False,
+            })
+            return SimpleNamespace(notifications=[n][: params.get("limit", 20)])
+
         feed = SimpleNamespace(search_posts=search_posts)
-        return SimpleNamespace(bsky=SimpleNamespace(feed=feed))
+        notification = SimpleNamespace(list_notifications=list_notifications)
+        return SimpleNamespace(bsky=SimpleNamespace(feed=feed, notification=notification))
 
 
 def make_post_view(uri, cid, reply=None):
     """A minimal post view, as get_posts would return it."""
     return SimpleNamespace(uri=uri, cid=cid, record=SimpleNamespace(reply=reply))
+
+
+@pytest.fixture(autouse=True)
+def hermetic_env(monkeypatch):
+    """Tests must not see the developer's deployment settings or a cached runtime."""
+    import os
+
+    import skyctl.platform.runtime as runtime_mod
+    import skyctl.settings as settings_mod
+
+    for key in list(os.environ):
+        if key.startswith("SKYCTL_") or key in (
+            "K_SERVICE", "CLOUD_RUN_JOB", "CONTAINER_APP_NAME", "CONTAINER_APP_JOB_NAME",
+            "AWS_LAMBDA_FUNCTION_NAME", "ECS_CONTAINER_METADATA_URI_V4", "KUBERNETES_SERVICE_HOST",
+        ):
+            monkeypatch.delenv(key)
+    monkeypatch.setattr(runtime_mod, "_runtime", None)
+    monkeypatch.setattr(settings_mod, "_loaded", None)
 
 
 @pytest.fixture(autouse=True)

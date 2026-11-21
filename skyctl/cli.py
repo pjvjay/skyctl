@@ -24,12 +24,27 @@ Commands:
     skyctl agents list               List agent groups (private PDS only)
     skyctl agents research <group>   Agents search the web and post their take
     skyctl agents feed <group>       Show what each agent has posted
+    skyctl task run "<goal>"         Task agent: plan and act with the skyctl tools
+    skyctl task approve <run-id>     Send the writes a run queued for approval
+    skyctl mcp                       MCP server on stdio (Claude Desktop, Claude Code, Cursor)
+    skyctl serve                     HTTP: /mcp, /runs, /tick, /healthz (cloud service)
+    skyctl tick                      One scheduler pass (cloud cron job)
+    skyctl invoke '<json>'           Run one Invocation (how every platform trigger enters)
+    skyctl worker                    Drain the work queue (event jobs, KEDA, ECS worker)
+    skyctl daemon                    Schedules + worker in one process (Compose / VM)
+    skyctl platform info|list        What platform this is and what it can do
+    skyctl deploy render|check       Render one deployment spec for every target
 
 Most commands accept --json for machine-readable output.
+
+Deployment settings (SKYCTL_SECRETS, SKYCTL_STATE_URL, ...) are read from
+the environment; see docs/DESIGN.md §4. When none are set, the CLI keeps
+its local defaults (.env, .skyctl_sessions/, .skyctl_queue.json).
 """
 
 import contextlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -80,12 +95,28 @@ def status(message: str, as_json: bool):
     return contextlib.nullcontext() if as_json else console.status(message)
 
 
+def deployment_configured() -> bool:
+    """True when cloud settings are in play; else the CLI keeps its local file layout."""
+    return any(os.getenv(k, "").strip() for k in ("SKYCTL_SECRETS", "SKYCTL_STATE_URL", "SKYCTL_CLOUD"))
+
+
 def get_manager() -> BskyManager:
     try:
+        if deployment_configured():
+            return BskyManager.from_settings()
         return BskyManager.from_env()
     except ValueError as e:
         console.print(f"[red]Configuration error:[/red] {e}")
         sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Could not load configuration:[/red] {escape(str(e))}")
+        sys.exit(1)
+
+
+def get_scheduler(manager: BskyManager, **kwargs) -> BskyScheduler:
+    if deployment_configured():
+        return BskyScheduler.from_settings(manager, **kwargs)
+    return BskyScheduler(manager, **kwargs)
 
 
 def get_client(manager: BskyManager, alias: str, as_json: bool = False):
@@ -493,7 +524,7 @@ def schedule(alias, text, run_at, cron, reply_to, as_json):
 
     manager = get_manager()
     get_client(manager, alias, as_json)
-    scheduler = BskyScheduler(manager)
+    scheduler = get_scheduler(manager)
 
     try:
         if cron:
@@ -525,7 +556,7 @@ def schedule(alias, text, run_at, cron, reply_to, as_json):
 def jobs(as_json):
     """List all scheduled jobs."""
     manager = get_manager()
-    scheduler = BskyScheduler(manager)
+    scheduler = get_scheduler(manager)
     job_list = scheduler.list_jobs()
 
     if as_json:
@@ -557,7 +588,7 @@ def jobs(as_json):
 def cancel(job_id):
     """Cancel a scheduled job by ID."""
     manager = get_manager()
-    scheduler = BskyScheduler(manager)
+    scheduler = get_scheduler(manager)
     removed = scheduler.cancel(job_id)
     if removed:
         console.print(f"[green]✓[/green] Cancelled job [cyan]{job_id}[/cyan]")
@@ -571,7 +602,7 @@ def cancel(job_id):
 def run_scheduler(max_retries, retry_delay):
     """Start the scheduler and process all queued jobs (blocking)."""
     manager = get_manager()
-    scheduler = BskyScheduler(manager, max_retries=max_retries, retry_delay=retry_delay)
+    scheduler = get_scheduler(manager, max_retries=max_retries, retry_delay=retry_delay)
     jobs_list = scheduler.list_jobs()
     console.print(f"Starting scheduler with [cyan]{len(jobs_list)}[/cyan] job(s)...")
     scheduler.start(blocking=True)
@@ -847,6 +878,543 @@ def agents_research(group, agent, topic, urls, max_posts, dry_run, config_file, 
     )
     report_actions(actions, as_json)
 
+
+# ------------------------------------------------------------------
+# Cloud entry points: tick, serve, mcp
+# ------------------------------------------------------------------
+
+@cli.command()
+@click.option("--max-retries", default=3, show_default=True, help="Retries for a failed send.")
+@click.option("--retry-delay", default=60.0, show_default=True, help="Seconds before the first retry (doubles each time).")
+@json_option
+def tick(max_retries, retry_delay, as_json):
+    """Run one scheduler pass and exit: send every due job, record retries.
+
+    This is the entry point for cloud cron (EventBridge Scheduler, Container
+    Apps Jobs, Cloud Scheduler). Run it every 1-5 minutes.
+    """
+    manager = get_manager()
+    scheduler = get_scheduler(manager, max_retries=max_retries, retry_delay=retry_delay)
+    result = scheduler.tick()
+    if as_json:
+        emit_json(result.to_dict())
+    else:
+        if result.skipped:
+            console.print(f"[yellow]~[/yellow] Tick skipped: {result.skipped}")
+        console.print(f"[green]✓[/green] sent {len(result.sent)}, failed {len(result.failed)}")
+        for job_id in result.failed:
+            console.print(f"  [red]✗[/red] {job_id}")
+    if result.failed:
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--port", default=None, type=int, help="Defaults to $PORT or 8080.")
+def serve(host, port):
+    """Start the HTTP service: /mcp, /runs, /tick, /healthz, /readyz.
+
+    Requires SKYCTL_HTTP_TOKEN (or SKYCTL_HTTP_ALLOW_ANON=true behind platform auth).
+    """
+    from .server import serve as _serve
+
+    _serve(host=host, port=port)
+
+
+@cli.command()
+@click.option("--read-only", is_flag=True, help="Expose only non-mutating tools.")
+@click.option("--dry-run", is_flag=True, help="Expose write tools but only preview them.")
+@click.option("--account", "accounts", multiple=True, help="Restrict to these aliases. Repeatable.")
+def mcp(read_only, dry_run, accounts):
+    """Serve skyctl as an MCP server over stdio.
+
+    \b
+    Claude Desktop / Claude Code config:
+        {"mcpServers": {"skyctl": {"command": "skyctl", "args": ["mcp"]}}}
+    """
+    from .mcp_server import run_stdio
+    from .tools import ToolPolicy
+
+    policy = ToolPolicy(
+        accounts=list(accounts) or None,
+        allow_writes=not read_only,
+        allow_delete=not read_only,
+        max_writes=10_000,
+    )
+    run_stdio(policy=policy, dry_run=dry_run)
+
+
+# ------------------------------------------------------------------
+# Task agent
+# ------------------------------------------------------------------
+
+@cli.group()
+def task():
+    """The task agent: give it a goal, it works through the skyctl tools.
+
+    Writes are off unless you pass --allow-writes; the policy is enforced
+    in code, not in the prompt. Every run is written to <state>/runs/.
+    Not to be confused with `skyctl agents`, the persona research agents.
+    """
+
+
+def get_runner():
+    from .agent import AgentRunner
+
+    manager = get_manager()
+    if deployment_configured():
+        return AgentRunner.from_settings(manager)
+    from .adapters import object_store_for
+
+    return AgentRunner(manager, state=object_store_for("file://./.skyctl"))
+
+
+def print_run(result, as_json):
+    if as_json:
+        emit_json(result.to_dict())
+    else:
+        mark = "[green]✓[/green]" if result.ok else "[red]✗[/red]"
+        console.print(
+            f"{mark} run [cyan]{result.run_id}[/cyan] {result.status} "
+            f"[dim]({result.turns} turns, {result.tool_calls} tool calls, {result.writes} writes, "
+            f"{result.pending_writes} pending approval, model {escape(result.model)})[/dim]"
+        )
+        if result.summary:
+            console.print(escape(result.summary))
+        if result.error:
+            console.print(f"[red]{escape(result.error)}[/red]")
+    if not result.ok:
+        sys.exit(1)
+
+
+@task.command("run")
+@click.argument("goal", required=False)
+@click.option("--task", "task_name", default=None, help="Run a named task from tasks.toml instead of GOAL.")
+@click.option("--tasks-file", default=None, help="Path to tasks.toml.")
+@click.option("--account", "accounts", multiple=True, help="Account alias the agent may use. Repeatable.")
+@click.option("--allow-writes", is_flag=True, help="Let the agent post, reply, like, repost and schedule.")
+@click.option("--allow-delete", is_flag=True, help="Also allow delete_post and cancel_job.")
+@click.option("--max-writes", default=None, type=int, help="Cap on executed writes.")
+@click.option("--max-turns", default=None, type=int, help="Cap on model turns.")
+@click.option("--approval", type=click.Choice(["none", "writes"]), default=None,
+              help="writes: queue every write for `skyctl task approve` instead of sending.")
+@click.option("--model", default=None, help="provider:model, e.g. bedrock:anthropic.claude-opus-5-5")
+@click.option("--context", "context_items", multiple=True, metavar="KEY=VALUE", help="Extra facts for the prompt. Repeatable.")
+@click.option("--dry-run", is_flag=True, help="Plan only; writes are previewed, not sent.")
+@click.option("--verbose", "-v", is_flag=True, help="Show each tool call as it happens.")
+@json_option
+def task_run(goal, task_name, tasks_file, accounts, allow_writes, allow_delete, max_writes, max_turns,
+             approval, model, context_items, dry_run, verbose, as_json):
+    """Run the task agent on GOAL (or a named task from tasks.toml).
+
+    \b
+    Examples:
+        skyctl task run "Summarise today's mentions on the work account"
+        skyctl task run "Reply to questions about pricing; point to example.com/pricing" \\
+            --account work --allow-writes --max-writes 5
+        skyctl task run --task daily-engagement --approval writes
+    """
+    from .agent import TaskConfigError, TaskSpec, load_tasks
+    from .settings import Settings
+
+    defaults = Settings.from_env().agent
+    if bool(goal) == bool(task_name):
+        fail("Give either GOAL or --task (one of them).", as_json)
+    try:
+        if task_name:
+            spec = load_tasks(tasks_file).get(task_name.lower())
+            if spec is None:
+                fail(f"Task '{task_name}' not found in tasks.toml.", as_json)
+        else:
+            spec = TaskSpec(
+                goal=goal,
+                accounts=defaults.accounts,
+                allow_writes=defaults.allow_writes,
+                allow_delete=defaults.allow_delete,
+                max_writes=defaults.max_writes,
+                max_turns=defaults.max_turns,
+            )
+        # Flags override whatever the task or the environment said.
+        if accounts:
+            spec.accounts = [a.lower() for a in accounts]
+        if allow_writes:
+            spec.allow_writes = True
+        if allow_delete:
+            spec.allow_delete = True
+        if max_writes is not None:
+            spec.max_writes = max_writes
+        if max_turns is not None:
+            spec.max_turns = max_turns
+        if approval:
+            spec.approval = approval
+        if model:
+            spec.model = model
+        if dry_run:
+            spec.dry_run = True
+        for item in context_items:
+            key, sep, value = item.partition("=")
+            if not sep:
+                fail(f"--context expects KEY=VALUE, got {item!r}", as_json)
+            spec.context[key.strip()] = value.strip()
+    except TaskConfigError as e:
+        fail(str(e), as_json)
+
+    runner = get_runner()
+    show = None
+    if verbose and not as_json:
+        def show(entry):
+            if entry["type"] == "tool_call":
+                mark = "[red]✗[/red]" if not entry["ok"] else ("[yellow]~[/yellow]" if entry.get("dry_run") or entry.get("pending_approval") else "[green]✓[/green]")
+                console.print(f"  {mark} {entry['name']} {escape(json.dumps(entry['args'])[:100])}")
+            elif entry["type"] == "turn" and entry.get("text"):
+                console.print(f"  [dim]{escape(entry['text'][:200])}[/dim]")
+    with status("Agent is working...", as_json or verbose):
+        result = runner.run(spec, on_event=show)
+    print_run(result, as_json)
+
+
+@task.command("approve")
+@click.argument("run_id")
+@click.option("--call-id", "call_ids", multiple=True, help="Approve only these call ids (default: all pending).")
+@json_option
+def task_approve(run_id, call_ids, as_json):
+    """Execute the writes a previous run queued for approval."""
+    runner = get_runner()
+    try:
+        pending = runner.pending_calls(run_id)
+    except FileNotFoundError as e:
+        fail(str(e), as_json)
+    if not pending:
+        fail(f"Run {run_id} has no writes pending approval.", as_json)
+    if not as_json:
+        for p in pending:
+            console.print(f"  [yellow]~[/yellow] {p.get('call_id')} {p['name']} {escape(json.dumps(p['args'])[:120])}")
+        if not click.confirm("Send these?", default=False):
+            console.print("Nothing sent.")
+            return
+    records = runner.approve(run_id, list(call_ids) or None)
+    if as_json:
+        emit_json(records)
+        return
+    for r in records:
+        mark = "[green]✓[/green]" if r["ok"] else "[red]✗[/red]"
+        console.print(f"{mark} {r['name']} {escape(str(r.get('error') or ''))}")
+    if any(not r["ok"] for r in records):
+        sys.exit(1)
+
+
+@task.command("show")
+@click.argument("run_id")
+@json_option
+def task_show(run_id, as_json):
+    """Show a run's transcript."""
+    from .agent import RunLog
+
+    runner = get_runner()
+    try:
+        events = RunLog.load(runner.state, run_id)
+    except FileNotFoundError as e:
+        fail(str(e), as_json)
+    if as_json:
+        emit_json(events)
+        return
+    for e in events:
+        kind = e["type"]
+        if kind == "turn":
+            calls = ", ".join(c["name"] for c in e.get("tool_calls", []))
+            console.print(f"[bold]turn {e['n']}[/bold] [dim]{e['stop_reason']}[/dim] {escape(calls)}")
+            if e.get("text"):
+                console.print(f"  {escape(e['text'])}")
+        elif kind in ("tool_call", "approved_call"):
+            mark = "[green]✓[/green]" if e["ok"] else "[red]✗[/red]"
+            console.print(f"  {mark} {e['name']} {escape(json.dumps(e['args'])[:120])}")
+            if e.get("error"):
+                console.print(f"    [red]{escape(e['error'])}[/red]")
+        elif kind == "result":
+            console.print(f"[bold]{e['status']}[/bold] {escape(e.get('summary') or '')}")
+
+
+@task.command("list")
+@click.option("--tasks-file", default=None, help="Path to tasks.toml.")
+@json_option
+def task_list(tasks_file, as_json):
+    """List the named tasks in tasks.toml."""
+    from .agent import TaskConfigError, load_tasks
+
+    try:
+        tasks = load_tasks(tasks_file)
+    except TaskConfigError as e:
+        fail(str(e), as_json)
+    if as_json:
+        emit_json({name: t.to_dict() for name, t in tasks.items()})
+        return
+    table = Table(title="Tasks")
+    table.add_column("Name", style="cyan")
+    table.add_column("Accounts")
+    table.add_column("Writes")
+    table.add_column("Approval")
+    table.add_column("Goal")
+    for name, t in tasks.items():
+        table.add_row(
+            name, ", ".join(t.accounts or ["*"]),
+            f"max {t.max_writes}" if t.allow_writes else "off", t.approval, escape(t.goal[:70]),
+        )
+    console.print(table)
+
+
+
+# ------------------------------------------------------------------
+# Invocation plane: invoke, worker, daemon, platform
+# ------------------------------------------------------------------
+
+def _runtime_and_dispatcher():
+    from .platform.invocation import default_dispatcher
+    from .platform.logging import configure_logging
+    from .platform.runtime import get_runtime
+
+    runtime = get_runtime()
+    configure_logging(runtime.platform, os.getenv("SKYCTL_LOG_FORMAT", "auto"))
+    return runtime, default_dispatcher(runtime)
+
+
+@cli.command()
+@click.argument("payload", required=False)
+@click.option("--file", "-f", "event_file", type=click.File("r"), default=None,
+              help="Read the event from a file ('-' for stdin): a raw payload or any platform envelope.")
+def invoke(payload, event_file):
+    """Run one Invocation, e.g. skyctl invoke '{"kind": "tick"}'.
+
+    Container jobs on every platform (ECS RunTask, Container Apps Jobs,
+    Cloud Run Jobs, Kubernetes CronJobs) start the image with this command,
+    so a schedule means the same thing everywhere. With --file, any
+    supported envelope (CloudEvents, Pub/Sub push, SQS, EventBridge) is
+    accepted, which makes it the tool for replaying a platform event locally.
+    """
+    from .platform.invocation import InvocationError, decode_http, decode_json
+
+    if bool(payload) == bool(event_file):
+        fail("Give a JSON PAYLOAD or --file (one of them).")
+    runtime, dispatcher = _runtime_and_dispatcher()
+    try:
+        if payload:
+            invocations = [decode_json(payload, source="cli")]
+        else:
+            invocations = decode_http({"content-type": "application/json"}, event_file.read().encode("utf-8"), runtime.platform)
+    except InvocationError as e:
+        fail(str(e), True)
+    failed = False
+    for inv in invocations:
+        outcome = dispatcher.dispatch(inv)
+        emit_json(outcome.to_dict())
+        failed = failed or not outcome.ok
+    if failed:
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--once", is_flag=True, help="Exit as soon as the queue is empty (event-driven jobs).")
+@click.option("--idle-exit", default=None, type=float, help="Exit after this many idle seconds (default: never, or 0 with --once).")
+@click.option("--max-messages", default=1, show_default=True)
+@click.option("--visibility", default=900, show_default=True, help="Seconds a message stays hidden while being handled.")
+def worker(once, idle_exit, max_messages, visibility):
+    """Consume SKYCTL_QUEUE_URL: queued agent runs and delayed deliveries."""
+    import signal
+    import threading
+
+    from .platform.invocation import run_worker
+
+    runtime, dispatcher = _runtime_and_dispatcher()
+    queue = runtime.queue()
+    if queue is None:
+        fail("SKYCTL_QUEUE_URL is not set; there is no queue to consume.")
+    if idle_exit is None:
+        idle_exit = 0 if once else None
+    # ECS scale-in, Kubernetes and Container Apps send SIGTERM: stop taking new
+    # messages and let the current one finish (unfinished work is redelivered).
+    stopping = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stopping.set())
+    stats = run_worker(queue, dispatcher, max_messages=max_messages, visibility_seconds=visibility,
+                       idle_exit_seconds=idle_exit, wait_seconds=1 if once else 10, stop=stopping.is_set)
+    emit_json({"event": "worker.exit", **stats.to_dict()})
+
+
+@cli.command()
+def daemon():
+    """Run every schedule and the queue worker in one long-lived process.
+
+    The substitute for platforms without scheduled jobs (Docker Compose, a
+    VM). Schedules come from SKYCTL_SCHEDULES_JSON (rendered by `skyctl
+    deploy render --target compose`); without it, a tick runs every minute.
+    """
+    from .platform.daemon import run_daemon
+
+    runtime, dispatcher = _runtime_and_dispatcher()
+    run_daemon(dispatcher, queue=runtime.queue())
+
+
+@cli.group()
+def platform():
+    """Inspect the platform abstraction: detection, capabilities, limits, toolsets."""
+
+
+@platform.command("info")
+@json_option
+def platform_info(as_json):
+    """Describe the runtime this process would use."""
+    from .platform.runtime import Runtime
+    from .settings import Settings
+
+    rt = Runtime(Settings.from_env())
+    info = rt.describe()
+    info["toolset"] = {k: v for k, v in vars(rt.platform.toolset).items() if v}
+    if as_json:
+        emit_json(info)
+        return
+    console.print(f"[bold]{rt.platform.display_name}[/bold] / compute [cyan]{rt.compute.name}[/cyan] ({rt.compute.kind})")
+    for key in ("state", "queue", "delayed", "run_strategy"):
+        console.print(f"  {key:<13}: {escape(str(info.get(key)))}")
+    console.print(f"  capabilities : {', '.join(info['capabilities'])}")
+    for k, v in info["limits"].items():
+        console.print(f"  {k:<13}: {escape(str(v))}")
+
+
+@platform.command("list")
+@json_option
+def platform_list(as_json):
+    """Every registered platform, its compute profiles and their capabilities."""
+    from .platform import platforms
+
+    rows = []
+    for p in platforms().values():
+        for prof in p.compute_profiles.values():
+            rows.append({"platform": p.name, "compute": prof.name, "kind": prof.kind,
+                         "capabilities": sorted(p.capabilities(prof.name)),
+                         "job_timeout_s": prof.limits.job_timeout_s, "request_timeout_s": prof.limits.request_timeout_s})
+    if as_json:
+        emit_json(rows)
+        return
+    table = Table(title="Platforms")
+    for col in ("Platform", "Compute", "Kind", "Job limit", "Request limit", "Capabilities"):
+        table.add_column(col)
+    for r in rows:
+        table.add_row(r["platform"], r["compute"], r["kind"], str(r["job_timeout_s"] or "-"),
+                      str(r["request_timeout_s"] or "-"),
+                      ", ".join(c.split(".", 1)[1] for c in r["capabilities"]))
+    console.print(table)
+
+
+# ------------------------------------------------------------------
+# Provisioning plane: deploy
+# ------------------------------------------------------------------
+
+@cli.group()
+def deploy():
+    """Render one cloud-neutral deployment spec for AWS, Azure, GCP, Kubernetes and Compose."""
+
+
+def _load_deploy_spec(path, as_json=False):
+    from pydantic import ValidationError
+
+    from .deploy import load_spec
+
+    try:
+        return load_spec(path)
+    except (ValidationError, ValueError, OSError) as e:
+        fail(f"Invalid deployment spec {path}: {e}", as_json)
+
+
+def _print_findings(findings):
+    colours = {"error": "red", "warning": "yellow", "info": "dim"}
+    for f in findings:
+        c = colours[f.level]
+        console.print(f"[{c}]{f.level:<7}[/{c}] [cyan]{f.target:<10}[/cyan] {escape(f.message)}")
+        if f.remedy:
+            console.print(f"{'':19}[dim]→ {escape(f.remedy)}[/dim]")
+
+
+@deploy.command("validate")
+@click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--target", "-t", "targets", multiple=True, help="Only these targets (default: all configured).")
+@json_option
+def deploy_validate(spec_file, targets, as_json):
+    """Check the spec against each target's capabilities and limits."""
+    from .deploy import validate
+
+    spec = _load_deploy_spec(spec_file, as_json)
+    findings = [f for t in (targets or spec.targets.names()) for f in validate(spec, t)]
+    if as_json:
+        emit_json([vars(f) for f in findings])
+    else:
+        _print_findings(findings) if findings else console.print("[green]✓[/green] no findings")
+    if any(f.level == "error" for f in findings):
+        sys.exit(1)
+
+
+@deploy.command("render")
+@click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--target", "-t", "targets", multiple=True, help="Target(s) to render.")
+@click.option("--all", "all_targets", is_flag=True, help="Render every configured target.")
+@click.option("--out", "out_dir", required=True, type=click.Path(file_okay=False), help="Output directory (one subdirectory per target).")
+@click.option("--force", is_flag=True, help="Render even if validation reports errors.")
+def deploy_render(spec_file, targets, all_targets, out_dir, force):
+    """Write Terraform JSON / manifests / compose files for the chosen targets."""
+    from pathlib import Path
+
+    from .deploy import render, validate
+
+    spec = _load_deploy_spec(spec_file)
+    chosen = spec.targets.names() if all_targets else list(targets)
+    if not chosen:
+        fail("Give --target or --all.")
+    for target in chosen:
+        findings = validate(spec, target)
+        errors = [f for f in findings if f.level == "error"]
+        if errors and not force:
+            _print_findings(errors)
+            fail(f"{target}: validation failed (use --force to render anyway).")
+        art = render(spec, target)
+        dest = Path(out_dir) / target
+        dest.mkdir(parents=True, exist_ok=True)
+        for name, content in art.files.items():
+            (dest / name).write_text(content)
+        console.print(f"[green]✓[/green] {target}: {', '.join(str(dest / n) for n in art.files)}")
+        for note in art.notes:
+            console.print(f"  [dim]{escape(note)}[/dim]")
+
+
+@deploy.command("check")
+@click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
+@json_option
+def deploy_check(spec_file, as_json):
+    """Validate, render every target, and run the cross-target conformance checks."""
+    from .deploy import check, render, validate_all
+
+    spec = _load_deploy_spec(spec_file, as_json)
+    findings = validate_all(spec)
+    errors = [f for f in findings if f.level == "error"]
+    results = [] if errors else check(spec, {t: render(spec, t) for t in spec.targets.names()})
+    if as_json:
+        emit_json({"findings": [vars(f) for f in findings], "checks": [vars(c) for c in results]})
+    else:
+        _print_findings(findings)
+        if results:
+            table = Table(title="Conformance")
+            table.add_column("Check")
+            for t in spec.targets.names():
+                table.add_column(t)
+            for name in dict.fromkeys(c.name for c in results):
+                row = [name]
+                for t in spec.targets.names():
+                    cs = [c for c in results if c.name == name and c.target == t]
+                    row.append("-" if not cs else ("[green]pass[/green]" if all(c.ok for c in cs) else "[red]FAIL[/red]"))
+                table.add_row(*row)
+            console.print(table)
+            for c in results:
+                if not c.ok:
+                    console.print(f"[red]✗[/red] {c.name} {c.target}: {escape(c.detail)}")
+    if errors or any(not c.ok for c in results):
+        sys.exit(1)
 
 if __name__ == "__main__":
     cli()

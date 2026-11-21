@@ -1,0 +1,44 @@
+# Named tasks for `skyctl task run --task <name>`. Copy to tasks.toml.
+#
+# A task is a goal plus the policy the agent runs under. The policy is
+# enforced in code: nothing in the goal text can widen it. Scheduled tasks
+# on public accounts should use approval = "writes" so a human sends them
+# with `skyctl task approve <run-id>`.
+
+[tasks.daily-engagement]
+goal = """
+Read the work account's notifications. For each mention or reply that asks a
+genuine question about our product, draft a short, friendly, accurate reply.
+Do not reply to the same person twice, ignore spam, and never promise dates
+or prices that are not in the context below.
+"""
+accounts = ["work"]
+allow_writes = true
+max_writes = 5
+approval = "writes"
+# model = "bedrock:anthropic.claude-opus-5-5"   # else SKYCTL_AGENT_MODEL
+[tasks.daily-engagement.context]
+product = "skyctl, an open-source Bluesky automation toolkit"
+pricing = "free and open source; there is nothing to buy"
+
+[tasks.morning-digest]
+goal = """
+Summarise what the accounts I follow posted in the last 12 hours on the
+personal account: the three most interesting posts with links, and one
+sentence on the overall mood. Do not post anything.
+"""
+accounts = ["personal"]
+allow_writes = false
+
+[tasks.queue-week]
+goal = """
+Using preview_post to check length, schedule one post per weekday at 09:00 UTC
+for the coming week on the work account, each highlighting a different item
+from the context. Do not post immediately; only schedule.
+"""
+accounts = ["work"]
+allow_writes = true
+max_writes = 5
+tools = ["list_accounts", "preview_post", "list_jobs", "schedule_post"]
+[tasks.queue-week.context]
+items = "1) new MCP server 2) cloud deploy guides 3) task agent 4) scheduler tick mode 5) community call Friday"

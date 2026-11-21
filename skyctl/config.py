@@ -28,8 +28,11 @@ def load_accounts(env_file: str = ".env") -> dict[str, AccountConfig]:
     """
     Parse all BSKY_* env vars and return a dict of {alias: AccountConfig}.
     Raises ValueError if BSKY_ACCOUNTS is missing or any account is incomplete.
+    Pass env_file="" to read the process environment only (cloud deployments
+    load secrets into the environment first; see skyctl.settings).
     """
-    load_dotenv(env_file, override=False)
+    if env_file:
+        load_dotenv(env_file, override=False)
 
     raw = os.getenv("BSKY_ACCOUNTS", "")
     if not raw.strip():

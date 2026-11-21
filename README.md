@@ -340,6 +340,141 @@ register_provider("mine", lambda model, **options: MyModel(model))
 
 ---
 
+## Cloud, MCP and the task agent
+
+skyctl runs as **one container image on AWS, Azure and Google Cloud**, exposes
+its capabilities as **MCP tools**, and ships a **task agent** that uses those
+tools to carry out a goal you give it. The full design, with the reasoning
+behind each choice, is in [docs/DESIGN.md](docs/DESIGN.md).
+
+### MCP server
+
+```bash
+pip install -e ".[mcp]"
+skyctl mcp                              # stdio; everything allowed (you are driving)
+skyctl mcp --read-only                  # no write tools at all
+skyctl mcp --dry-run --account work     # write tools preview only, one account
+```
+
+Claude Desktop / Claude Code / Cursor:
+
+```json
+{"mcpServers": {"skyctl": {"command": "skyctl", "args": ["mcp"], "cwd": "/path/to/your/skyctl/.env dir"}}}
+```
+
+Tools: `list_accounts`, `get_profile`, `get_timeline`, `get_notifications`,
+`search_posts`, `list_posts`, `get_post`, `preview_post`, `fetch_link_metadata`,
+`post`, `reply`, `thread`, `repost`, `like`, `delete_post`, `schedule_post`,
+`schedule_cron`, `list_jobs`, `cancel_job`. Resources: `skyctl://accounts`,
+`skyctl://jobs`. The same registry produces Anthropic and OpenAI tool schemas
+for the task agent (`skyctl.tool_registry.to_anthropic()` / `.to_openai()`).
+
+### Task agent
+
+```bash
+pip install -e ".[agents]"
+export ANTHROPIC_API_KEY=...            # or SKYCTL_AGENT_MODEL=bedrock:... / vertex:... / azure-openai:...
+
+# Dry run by default: the agent reads, plans, and previews writes without sending.
+skyctl task run "Summarise the last day of mentions on the work account" --account work
+
+# Let it act, with a hard cap, and show each tool call.
+skyctl task run "Reply to genuine questions about pricing; point to example.com/pricing" \
+    --account work --allow-writes --max-writes 5 -v
+
+# Queue writes for a human instead of sending (the right mode for unattended runs).
+skyctl task run --task daily-engagement --approval writes
+skyctl task approve <run-id>
+
+skyctl task list                        # named tasks from tasks.toml (see tasks.example.toml)
+skyctl task show <run-id>               # full transcript
+```
+
+What keeps it safe (enforced in code, not in the prompt — see DESIGN.md §7.3):
+accounts are scoped, writes are off unless `--allow-writes`, `delete` is off
+unless `--allow-delete`, `--max-writes` caps executed writes, `--approval
+writes` queues them for a human, every run is written to `<state>/runs/`, and
+a retried run skips writes it already made. Timelines and notifications are
+fed to the model as untrusted data.
+
+From Python:
+
+```python
+from skyctl import BskyManager
+from skyctl.agent import AgentRunner, TaskSpec
+
+runner = AgentRunner(BskyManager.from_env())
+result = runner.run(TaskSpec(goal="...", accounts=["work"], allow_writes=True, max_writes=3))
+print(result.status, result.summary)
+```
+
+`skyctl task` (the task agent) and `skyctl agents` (the persona research
+agents on a private PDS) are different features; the latter is unchanged.
+
+### Deploying
+
+The same env-var contract on every cloud (DESIGN.md §4):
+
+```env
+SKYCTL_SECRETS=aws-sm://skyctl/config          # or azure-kv://<vault>/<secret>, gcp-sm://<project>/<secret>
+SKYCTL_STATE_URL=s3://bucket/skyctl            # or az://container/skyctl, gs://bucket/skyctl
+SKYCTL_AGENT_MODEL=bedrock:anthropic.claude-opus-5-5   # or vertex:..., azure-openai:<deployment>, foundry:<deployment>
+SKYCTL_HTTP_TOKEN=...                          # only if you run `skyctl serve`
+SKYCTL_AGENT_ALLOW_WRITES=false                # deployment-wide ceiling for runs
+```
+
+The secret holds your whole `.env` (JSON or dotenv text). Sessions, the job
+queue, run transcripts and media live in the state bucket.
+
+Entry points, all from one image (`Dockerfile`):
+
+| Command | Runs as |
+|---|---|
+| `skyctl tick` | cron job every 1–5 min: sends due scheduled posts |
+| `skyctl task run --task <name>` | cron job or on demand |
+| `skyctl serve` | optional HTTP service: `/mcp` (streamable HTTP), `POST /runs`, `POST /tick`, `/healthz` |
+| `skyctl run-scheduler` | long-lived daemon (VM, `docker compose up`) |
+
+Infrastructure is generated from one cloud-neutral spec, rather than
+maintained by hand per cloud (next section).
+
+```bash
+pip install -e ".[all]"     # agents + mcp + aws + azure + gcp adapters
+docker build -t skyctl .
+docker run --rm --env-file .env -e SKYCTL_SECRETS=env skyctl accounts
+```
+
+### The cross-cloud framework
+
+The full design, per-cloud toolsets and implementation notes are in
+[docs/CLOUD_FRAMEWORK.md](docs/CLOUD_FRAMEWORK.md). In short:
+
+```bash
+# One spec → AWS, Azure, GCP, Kubernetes and Compose
+skyctl deploy validate deploy/examples/skyctl.deploy.toml     # capability/limit checks per target
+skyctl deploy check    deploy/examples/skyctl.deploy.toml     # + render all + cross-target conformance
+skyctl deploy render   deploy/examples/skyctl.deploy.toml --target gcp --out build
+cd build/gcp && terraform init && TF_VAR_secrets_json="$(cat ../../.env)" terraform apply
+
+# What the runtime sees
+skyctl platform list                  # platforms × compute profiles × capabilities
+skyctl platform info                  # this process: platform, services, run strategy, identity
+
+# Every trigger on every platform is an Invocation
+skyctl invoke '{"kind": "tick"}'
+skyctl invoke --file pubsub-push.json # replay any platform envelope locally
+skyctl worker --once                  # drain SKYCTL_QUEUE_URL (event jobs, KEDA, ECS worker)
+skyctl daemon                         # schedules + worker in one process (Compose / VM)
+```
+
+| Plane | Generalised by |
+|---|---|
+| Runtime (what the code calls) | ports with stated semantics (CAS state, at-least-once queues, delayed delivery), native adapters per cloud chosen by URL scheme, a contract test kit |
+| Invocation (how platforms call the code) | one `Invocation` vocabulary, decoders for CloudEvents, Pub/Sub push, Event Grid, SQS/Lambda, EventBridge; one dispatcher; one worker |
+| Provisioning (how it comes to exist) | `skyctl.deploy.toml` → validated against each target's capabilities → rendered → 11 cross-target conformance checks |
+
+---
+
 ## Project Structure
 
 ```
@@ -353,11 +488,23 @@ skyctl/
 │   ├── richtext.py      # Length check, facets, thread splitting
 │   ├── models.py        # Dataclasses
 │   ├── agents.py        # Persona agents: web research (private PDS only)
-│   ├── llm.py           # Model backends for agents
-│   └── cli.py           # Click CLI
-├── tests/               # Offline pytest suite
-├── .env.example
-├── agents.example.toml
+│   ├── llm.py           # Model backends (anthropic, openai, bedrock, vertex, azure-openai, ...)
+│   ├── cli.py           # Click CLI
+│   ├── ports.py         # Ports with stated semantics (CAS state, queues, delayed delivery, chat…)
+│   ├── settings.py      # The env-var contract shared by every cloud
+│   ├── adapters/        # local, s3, azure_blob, gcs, queues, delayed, secrets (aws/azure/gcp), fsspec fallback
+│   ├── platform/        # Platforms & capabilities, Runtime, invocation, auth, logging, cron, daemon, Lambda handler
+│   ├── deploy/          # Deployment spec, validation, renderers (aws/azure/gcp/kubernetes/compose), conformance
+│   ├── testing/         # Port contract kit and SDK-faithful fakes
+│   ├── tools/           # Tool registry, catalogue and policy
+│   ├── agent/           # Task agent: chat providers, runner, TaskSpec
+│   ├── mcp_server.py    # MCP server built from the registry
+│   └── server.py        # HTTP service: /mcp, /runs, /invoke, /tick
+├── tests/               # Offline pytest suite (+ emulator-backed integration tests)
+├── docs/                # DESIGN.md (agent/tools), CLOUD_FRAMEWORK.md (cross-cloud framework)
+├── deploy/              # examples/skyctl.deploy.toml and generated/<target>/ (golden files)
+├── Dockerfile, docker-compose.yml
+├── .env.example, agents.example.toml, tasks.example.toml
 ├── pyproject.toml
 └── README.md
 ```

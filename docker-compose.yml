@@ -1,0 +1,36 @@
+# Local / single-VM deployment. The same image the clouds run.
+#
+#   docker compose up -d              # HTTP service + scheduler daemon
+#   docker compose run --rm skyctl task run "Summarise today's mentions" --account work
+#
+# Secrets come from .env (SKYCTL_SECRETS=env); state lives in the `state` volume.
+services:
+  skyctl:
+    build: .
+    image: skyctl:local
+    env_file: .env
+    environment:
+      SKYCTL_SECRETS: env
+      SKYCTL_STATE_URL: file:///data
+      SKYCTL_HTTP_TOKEN: ${SKYCTL_HTTP_TOKEN:?set SKYCTL_HTTP_TOKEN in .env}
+      SKYCTL_AGENT_ALLOW_WRITES: ${SKYCTL_AGENT_ALLOW_WRITES:-false}
+    volumes:
+      - state:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    command: ["serve"]
+    restart: unless-stopped
+
+  scheduler:
+    image: skyctl:local
+    env_file: .env
+    environment:
+      SKYCTL_SECRETS: env
+      SKYCTL_STATE_URL: file:///data
+    volumes:
+      - state:/data
+    command: ["run-scheduler"]
+    restart: unless-stopped
+
+volumes:
+  state:

@@ -8,11 +8,14 @@ Handles login pooling and fan-out operations.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from .client import BskyClient
 from .config import load_accounts
 from .models import AccountConfig, PostResult
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .ports import ObjectStore, SessionStore
 
 
 DEFAULT_SESSION_DIR = Path(".skyctl_sessions")
@@ -33,9 +36,17 @@ class BskyManager:
         self,
         accounts: dict[str, AccountConfig],
         session_dir: Optional[Union[str, Path]] = None,
+        session_store: Optional["SessionStore"] = None,
+        media_store: Optional["ObjectStore"] = None,
     ):
+        self.accounts = dict(accounts)
         self._clients: dict[str, BskyClient] = {
-            alias: BskyClient(config, session_dir=session_dir)
+            alias: BskyClient(
+                config,
+                session_dir=session_dir,
+                session_store=session_store,
+                media_store=media_store,
+            )
             for alias, config in accounts.items()
         }
 
@@ -48,6 +59,7 @@ class BskyManager:
         cls,
         env_file: str = ".env",
         session_dir: Optional[Union[str, Path]] = DEFAULT_SESSION_DIR,
+        **kwargs,
     ) -> "BskyManager":
         """
         Load all accounts from environment variables and return a manager.
@@ -57,7 +69,25 @@ class BskyManager:
         pass session_dir=None to log in with the app password every time.
         """
         accounts = load_accounts(env_file)
-        return cls(accounts, session_dir=session_dir)
+        return cls(accounts, session_dir=session_dir, **kwargs)
+
+    @classmethod
+    def from_settings(cls, settings=None) -> "BskyManager":
+        """
+        Build a manager for the current deployment: secrets are pulled from
+        SKYCTL_SECRETS, sessions and media live in SKYCTL_STATE_URL. This is
+        what the cloud entry points (serve, tick, mcp, agent) use.
+        """
+        from .platform.runtime import get_runtime
+
+        runtime = get_runtime(settings)
+        settings = runtime.settings
+        accounts = load_accounts(settings.env_file if not settings.secrets_are_remote else "")
+        return cls(
+            accounts,
+            session_store=runtime.session_store(),
+            media_store=runtime.object_store(),
+        )
 
     @classmethod
     def from_dict(

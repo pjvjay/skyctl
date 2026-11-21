@@ -1,0 +1,85 @@
+{
+  "name": "skyctl",
+  "services": {
+    "daemon": {
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/skyctl:1.2.0",
+      "env_file": [
+        ".env"
+      ],
+      "environment": {
+        "SKYCTL_PLATFORM": "compose",
+        "SKYCTL_COMPUTE": "compose",
+        "SKYCTL_SECRETS": "env",
+        "SKYCTL_STATE_URL": "file:///data",
+        "SKYCTL_QUEUE_URL": "none",
+        "SKYCTL_DELAYED_URL": "none",
+        "SKYCTL_AGENT_MODEL": "anthropic:claude-opus-5-5",
+        "SKYCTL_AGENT_ALLOW_WRITES": "true",
+        "SKYCTL_AGENT_ALLOW_DELETE": "false",
+        "SKYCTL_AGENT_MAX_WRITES": "5",
+        "SKYCTL_AGENT_MAX_TURNS": "25",
+        "SKYCTL_AGENT_MAX_SECONDS": "540",
+        "SKYCTL_AGENT_ACCOUNTS": "work",
+        "SKYCTL_LOG_FORMAT": "json",
+        "SKYCTL_AUTH": "bearer",
+        "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SCHEDULES_JSON": "[{\"name\":\"tick\",\"cron\":\"*/5 * * * *\",\"timezone\":\"UTC\",\"invoke\":{\"kind\":\"tick\"}},{\"name\":\"daily-engagement\",\"cron\":\"0 9 * * mon-fri\",\"timezone\":\"UTC\",\"invoke\":{\"kind\":\"task.run\",\"task\":\"daily-engagement\"}}]"
+      },
+      "volumes": [
+        "state:/data"
+      ],
+      "read_only": true,
+      "tmpfs": [
+        "/tmp"
+      ],
+      "user": "10001",
+      "restart": "unless-stopped",
+      "command": [
+        "daemon"
+      ]
+    },
+    "http": {
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/skyctl:1.2.0",
+      "env_file": [
+        ".env"
+      ],
+      "environment": {
+        "SKYCTL_PLATFORM": "compose",
+        "SKYCTL_COMPUTE": "compose",
+        "SKYCTL_SECRETS": "env",
+        "SKYCTL_STATE_URL": "file:///data",
+        "SKYCTL_QUEUE_URL": "none",
+        "SKYCTL_DELAYED_URL": "none",
+        "SKYCTL_AGENT_MODEL": "anthropic:claude-opus-5-5",
+        "SKYCTL_AGENT_ALLOW_WRITES": "true",
+        "SKYCTL_AGENT_ALLOW_DELETE": "false",
+        "SKYCTL_AGENT_MAX_WRITES": "5",
+        "SKYCTL_AGENT_MAX_TURNS": "25",
+        "SKYCTL_AGENT_MAX_SECONDS": "540",
+        "SKYCTL_AGENT_ACCOUNTS": "work",
+        "SKYCTL_LOG_FORMAT": "json",
+        "SKYCTL_AUTH": "bearer",
+        "SKYCTL_HTTP_MCP": "true",
+        "PORT": "8080"
+      },
+      "volumes": [
+        "state:/data"
+      ],
+      "read_only": true,
+      "tmpfs": [
+        "/tmp"
+      ],
+      "user": "10001",
+      "restart": "unless-stopped",
+      "command": [
+        "serve"
+      ],
+      "ports": [
+        "127.0.0.1:8080:8080"
+      ]
+    }
+  },
+  "volumes": {
+    "state": {}
+  }
+}

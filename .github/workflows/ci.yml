@@ -1,0 +1,145 @@
+# Test → conformance → build one image → render → apply per cloud.
+# Cloud credentials come from OIDC federation (no long-lived keys in GitHub).
+#
+# The infrastructure is *generated* from deploy/skyctl.deploy.toml, so the
+# pipeline renders it, gates on `skyctl deploy check` (validation + the
+# cross-target conformance suite), and applies exactly what it rendered.
+name: ci
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  DEPLOY_SPEC: deploy/skyctl.deploy.toml   # your spec; deploy/examples/ holds a worked example
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { python: ["3.10", "3.12"] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install -e ".[test,agents]"
+      - run: pytest -q
+
+  # Contract tests against real emulators for the semantics in-process fakes cannot
+  # prove (moto does not evaluate S3 preconditions atomically; see CLOUD_FRAMEWORK.md §9).
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
+      azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000"] }
+      gcs: { image: "fsouza/fake-gcs-server", ports: ["4443:4443"], options: "--entrypoint /bin/fake-gcs-server -- -scheme http" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[test,all]"
+      - run: pytest -q -m integration -rs
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+          SKYCTL_IT_S3_ENDPOINT: http://localhost:4566
+          SKYCTL_IT_S3_BUCKET: skyctl-it
+          SKYCTL_IT_AZURE_CONN: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;"
+          SKYCTL_IT_GCS_ENDPOINT: http://localhost:4443
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - run: skyctl deploy check deploy/examples/skyctl.deploy.toml
+      - run: if [ -f "$DEPLOY_SPEC" ]; then skyctl deploy check "$DEPLOY_SPEC"; fi
+
+  build:
+    needs: [test, conformance]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+
+  # One job per cloud; each runs only if its environment is configured, so a
+  # repo can target one, two or all three clouds without editing this file.
+  deploy:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aws, azure, gcp]
+    environment: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - name: Render
+        run: skyctl deploy render "$DEPLOY_SPEC" --target ${{ matrix.target }} --out build
+      - if: matrix.target == 'aws' && vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - if: matrix.target == 'azure' && vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - if: matrix.target == 'gcp' && vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Apply
+        working-directory: build/${{ matrix.target }}
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_image: ${{ needs.build.outputs.image }}
+          TF_VAR_secrets_json: ${{ secrets.SKYCTL_SECRETS_JSON }}
+          TF_VAR_http_token: ${{ secrets.SKYCTL_HTTP_TOKEN }}
+        run: |
+          terraform init -input=false
+          terraform validate
+          terraform apply -auto-approve -input=false

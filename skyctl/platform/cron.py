@@ -1,0 +1,94 @@
+"""
+skyctl.platform.cron
+====================
+One schedule syntax in the deployment spec (5-field Unix cron + an IANA
+time zone), translated per target. The dialects really differ:
+
+    target                         syntax                       time zone
+    ----------------------------   --------------------------   --------------------------
+    EventBridge Scheduler          cron(m h dom mon dow year)   ScheduleExpressionTimezone
+                                   one of dom/dow must be '?';
+                                   dow is 1-7 with 1 = SUN
+    Cloud Scheduler                unix cron                    time_zone
+    Container Apps Jobs            unix cron                    UTC only
+    Kubernetes CronJob             unix cron                    spec.timeZone (GA in 1.27)
+    APScheduler daemon (compose)   unix cron                    any
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+_DOW_NAMES = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+
+
+class CronError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class CronSpec:
+    expr: str
+    timezone: str = "UTC"
+
+    def fields(self) -> list[str]:
+        parts = self.expr.split()
+        if len(parts) != 5:
+            raise CronError(f"Expected 5 cron fields (m h dom mon dow), got {len(parts)}: {self.expr!r}")
+        return parts
+
+    @property
+    def is_utc(self) -> bool:
+        return self.timezone.upper() in ("UTC", "ETC/UTC", "Z", "GMT", "ETC/GMT")
+
+    def min_interval_seconds(self) -> int:
+        minute = self.fields()[0]
+        if minute == "*":
+            return 60
+        m = re.fullmatch(r"(?:\*|0)/(\d+)", minute)
+        return int(m.group(1)) * 60 if m else 3600
+
+
+def _dow_to_eventbridge(token: str) -> str:
+    """Unix 0-7 (0/7 = SUN) → EventBridge 1-7 (1 = SUN); names pass through."""
+    def one(v: str) -> str:
+        if v.isdigit():
+            n = int(v) % 7
+            return str(n + 1)
+        if v.upper()[:3] in _DOW_NAMES:
+            return v.upper()
+        raise CronError(f"Bad day-of-week value {v!r}")
+
+    out = []
+    for part in token.split(","):
+        step = ""
+        if "/" in part:
+            part, step = part.split("/", 1)
+            step = "/" + step
+        if part == "*":
+            out.append("*" + step)
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            out.append(f"{one(a)}-{one(b)}{step}")
+        else:
+            out.append(one(part) + step)
+    return ",".join(out)
+
+
+def _step_base(token: str, base: str) -> str:
+    return re.sub(r"^\*/", f"{base}/", token)
+
+
+def to_eventbridge(spec: CronSpec) -> str:
+    m, h, dom, mon, dow = spec.fields()
+    if dom != "*" and dow != "*":
+        raise CronError(
+            f"{spec.expr!r} restricts both day-of-month and day-of-week (Unix ORs them); "
+            "EventBridge cannot express that. Split it into two schedules."
+        )
+    if dow != "*":
+        dom, dow = "?", _dow_to_eventbridge(dow)
+    else:
+        dow = "?"
+    return f"cron({_step_base(m, '0')} {_step_base(h, '0')} {_step_base(dom, '1')} {mon.upper()} {dow} *)"

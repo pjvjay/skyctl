@@ -1,0 +1,802 @@
+{
+  "terraform": {
+    "required_version": ">= 1.6",
+    "required_providers": {
+      "azurerm": {
+        "source": "hashicorp/azurerm",
+        "version": "~> 3.110"
+      },
+      "random": {
+        "source": "hashicorp/random",
+        "version": ">= 3.5"
+      }
+    }
+  },
+  "provider": {
+    "azurerm": {
+      "features": {},
+      "storage_use_azuread": true
+    }
+  },
+  "variable": {
+    "image": {
+      "type": "string",
+      "default": "123456789012.dkr.ecr.us-east-1.amazonaws.com/skyctl:1.2.0"
+    },
+    "secrets_json": {
+      "type": "string",
+      "description": "The BSKY_* / API-key map as JSON or dotenv text.",
+      "sensitive": true
+    },
+    "http_token": {
+      "type": "string",
+      "sensitive": true
+    }
+  },
+  "data": {
+    "azurerm_client_config": {
+      "current": {}
+    }
+  },
+  "resource": {
+    "random_string": {
+      "suffix": {
+        "length": 6,
+        "upper": false,
+        "special": false,
+        "numeric": true
+      }
+    },
+    "azurerm_resource_group": {
+      "main": {
+        "name": "skyctl-rg",
+        "location": "westeurope"
+      }
+    },
+    "azurerm_user_assigned_identity": {
+      "app": {
+        "name": "skyctl-id",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}"
+      }
+    },
+    "azurerm_key_vault": {
+      "main": {
+        "name": "skyctl-kv-${random_string.suffix.result}",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "tenant_id": "${data.azurerm_client_config.current.tenant_id}",
+        "sku_name": "standard",
+        "enable_rbac_authorization": true,
+        "purge_protection_enabled": false,
+        "soft_delete_retention_days": 7
+      }
+    },
+    "azurerm_role_assignment": {
+      "kv_deployer": {
+        "scope": "${azurerm_key_vault.main.id}",
+        "role_definition_name": "Key Vault Secrets Officer",
+        "principal_id": "${data.azurerm_client_config.current.object_id}"
+      },
+      "kv_app": {
+        "scope": "${azurerm_key_vault.main.id}",
+        "role_definition_name": "Key Vault Secrets User",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "blob_app": {
+        "scope": "${azurerm_storage_account.state.id}",
+        "role_definition_name": "Storage Blob Data Contributor",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "blob_deployer": {
+        "scope": "${azurerm_storage_account.state.id}",
+        "role_definition_name": "Storage Blob Data Contributor",
+        "principal_id": "${data.azurerm_client_config.current.object_id}"
+      },
+      "sb_send": {
+        "scope": "${azurerm_servicebus_queue.work.id}",
+        "role_definition_name": "Azure Service Bus Data Sender",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "sb_receive": {
+        "scope": "${azurerm_servicebus_queue.work.id}",
+        "role_definition_name": "Azure Service Bus Data Receiver",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      }
+    },
+    "azurerm_key_vault_secret": {
+      "config": {
+        "name": "skyctl-config",
+        "value": "${var.secrets_json}",
+        "key_vault_id": "${azurerm_key_vault.main.id}",
+        "depends_on": [
+          "azurerm_role_assignment.kv_deployer"
+        ]
+      },
+      "http_token": {
+        "name": "skyctl-http-token",
+        "value": "${var.http_token}",
+        "key_vault_id": "${azurerm_key_vault.main.id}",
+        "depends_on": [
+          "azurerm_role_assignment.kv_deployer"
+        ]
+      }
+    },
+    "azurerm_storage_account": {
+      "state": {
+        "name": "skyctl${random_string.suffix.result}",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "account_tier": "Standard",
+        "account_replication_type": "LRS",
+        "min_tls_version": "TLS1_2",
+        "allow_nested_items_to_be_public": false,
+        "shared_access_key_enabled": false,
+        "blob_properties": {
+          "versioning_enabled": true
+        }
+      }
+    },
+    "azurerm_storage_container": {
+      "state": {
+        "name": "skyctl",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "container_access_type": "private",
+        "depends_on": [
+          "azurerm_role_assignment.blob_deployer"
+        ]
+      }
+    },
+    "azurerm_storage_management_policy": {
+      "state": {
+        "storage_account_id": "${azurerm_storage_account.state.id}",
+        "rule": [
+          {
+            "name": "expire-run-transcripts",
+            "enabled": true,
+            "filters": {
+              "prefix_match": [
+                "skyctl/skyctl/runs/"
+              ],
+              "blob_types": [
+                "blockBlob"
+              ]
+            },
+            "actions": {
+              "base_blob": {
+                "delete_after_days_since_modification_greater_than": 90
+              },
+              "version": {
+                "delete_after_days_since_creation": 30
+              }
+            }
+          }
+        ]
+      }
+    },
+    "azurerm_storage_blob": {
+      "tasks": {
+        "name": "skyctl/config/tasks.toml",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "storage_container_name": "${azurerm_storage_container.state.name}",
+        "type": "Block",
+        "source_content": "# Rendered by skyctl deploy from the deployment spec. Do not edit by hand.\n\n[tasks.daily-engagement]\ngoal = \"Read the work account's notifications and draft replies to genuine product questions.\"\naccounts = [\"work\"]\nallow_writes = true\nmax_writes = 5\napproval = \"writes\"\n",
+        "content_type": "application/toml"
+      }
+    },
+    "azurerm_servicebus_namespace": {
+      "main": {
+        "name": "skyctl-sb-${random_string.suffix.result}",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "sku": "Standard"
+      }
+    },
+    "azurerm_servicebus_queue": {
+      "work": {
+        "name": "skyctl-work",
+        "namespace_id": "${azurerm_servicebus_namespace.main.id}",
+        "lock_duration": "PT5M",
+        "max_delivery_count": 5,
+        "dead_lettering_on_message_expiration": true
+      }
+    },
+    "azurerm_servicebus_queue_authorization_rule": {
+      "keda": {
+        "name": "keda-listen",
+        "queue_id": "${azurerm_servicebus_queue.work.id}",
+        "listen": true,
+        "send": false,
+        "manage": false
+      }
+    },
+    "azurerm_log_analytics_workspace": {
+      "main": {
+        "name": "skyctl-logs",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "sku": "PerGB2018",
+        "retention_in_days": 30
+      }
+    },
+    "azurerm_container_app_environment": {
+      "main": {
+        "name": "skyctl-env",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "log_analytics_workspace_id": "${azurerm_log_analytics_workspace.main.id}"
+      }
+    },
+    "azurerm_container_app": {
+      "http": {
+        "name": "skyctl-http",
+        "container_app_environment_id": "${azurerm_container_app_environment.main.id}",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "revision_mode": "Single",
+        "identity": {
+          "type": "UserAssigned",
+          "identity_ids": [
+            "${azurerm_user_assigned_identity.app.id}"
+          ]
+        },
+        "ingress": {
+          "external_enabled": false,
+          "target_port": 8080,
+          "transport": "auto",
+          "traffic_weight": [
+            {
+              "percentage": 100,
+              "latest_revision": true
+            }
+          ]
+        },
+        "template": {
+          "min_replicas": 0,
+          "max_replicas": 2,
+          "container": [
+            {
+              "name": "skyctl",
+              "image": "${var.image}",
+              "cpu": 0.5,
+              "memory": "1Gi",
+              "args": [
+                "serve"
+              ],
+              "env": [
+                {
+                  "name": "SKYCTL_PLATFORM",
+                  "value": "azure"
+                },
+                {
+                  "name": "SKYCTL_COMPUTE",
+                  "value": "container-apps"
+                },
+                {
+                  "name": "SKYCTL_SECRETS",
+                  "value": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config"
+                },
+                {
+                  "name": "SKYCTL_STATE_URL",
+                  "value": "az://skyctl/skyctl"
+                },
+                {
+                  "name": "SKYCTL_QUEUE_URL",
+                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                },
+                {
+                  "name": "SKYCTL_DELAYED_URL",
+                  "value": "queue"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MODEL",
+                  "value": "azure-openai:gpt-4.1"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_WRITES",
+                  "value": "true"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_DELETE",
+                  "value": "false"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_WRITES",
+                  "value": "5"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_TURNS",
+                  "value": "25"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_SECONDS",
+                  "value": "540"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ACCOUNTS",
+                  "value": "work"
+                },
+                {
+                  "name": "SKYCTL_LOG_FORMAT",
+                  "value": "json"
+                },
+                {
+                  "name": "SKYCTL_AUTH",
+                  "value": "bearer"
+                },
+                {
+                  "name": "SKYCTL_HTTP_MCP",
+                  "value": "true"
+                },
+                {
+                  "name": "AZURE_CLIENT_ID",
+                  "value": "${azurerm_user_assigned_identity.app.client_id}"
+                },
+                {
+                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                  "value": "${azurerm_storage_account.state.name}"
+                },
+                {
+                  "name": "AZURE_TENANT_ID",
+                  "value": "${data.azurerm_client_config.current.tenant_id}"
+                },
+                {
+                  "name": "AZURE_OPENAI_ENDPOINT",
+                  "value": "https://skyctl-openai.openai.azure.com"
+                },
+                {
+                  "name": "SKYCTL_HTTP_TOKEN",
+                  "secret_name": "http-token"
+                }
+              ],
+              "liveness_probe": {
+                "transport": "HTTP",
+                "port": 8080,
+                "path": "/healthz"
+              }
+            }
+          ]
+        },
+        "depends_on": [
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.kv_app",
+          "azurerm_role_assignment.sb_send",
+          "azurerm_role_assignment.sb_receive"
+        ],
+        "secret": [
+          {
+            "name": "http-token",
+            "key_vault_secret_id": "${azurerm_key_vault_secret.http_token.versionless_id}",
+            "identity": "${azurerm_user_assigned_identity.app.id}"
+          }
+        ]
+      }
+    },
+    "azurerm_container_app_job": {
+      "worker": {
+        "name": "skyctl-worker",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "container_app_environment_id": "${azurerm_container_app_environment.main.id}",
+        "replica_timeout_in_seconds": 1440,
+        "replica_retry_limit": 0,
+        "identity": {
+          "type": "UserAssigned",
+          "identity_ids": [
+            "${azurerm_user_assigned_identity.app.id}"
+          ]
+        },
+        "secret": [
+          {
+            "name": "sb-listen",
+            "value": "${azurerm_servicebus_queue_authorization_rule.keda.primary_connection_string}"
+          }
+        ],
+        "event_trigger_config": {
+          "parallelism": 1,
+          "replica_completion_count": 1,
+          "scale": {
+            "min_executions": 0,
+            "max_executions": 2,
+            "polling_interval_in_seconds": 30,
+            "rules": [
+              {
+                "name": "servicebus",
+                "custom_rule_type": "azure-servicebus",
+                "metadata": {
+                  "queueName": "skyctl-work",
+                  "namespace": "${azurerm_servicebus_namespace.main.name}",
+                  "messageCount": "1"
+                },
+                "authentication": [
+                  {
+                    "secret_name": "sb-listen",
+                    "trigger_parameter": "connection"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "template": {
+          "container": [
+            {
+              "name": "skyctl",
+              "image": "${var.image}",
+              "cpu": 0.5,
+              "memory": "1Gi",
+              "args": [
+                "worker",
+                "--once"
+              ],
+              "env": [
+                {
+                  "name": "SKYCTL_PLATFORM",
+                  "value": "azure"
+                },
+                {
+                  "name": "SKYCTL_COMPUTE",
+                  "value": "container-apps-job"
+                },
+                {
+                  "name": "SKYCTL_SECRETS",
+                  "value": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config"
+                },
+                {
+                  "name": "SKYCTL_STATE_URL",
+                  "value": "az://skyctl/skyctl"
+                },
+                {
+                  "name": "SKYCTL_QUEUE_URL",
+                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                },
+                {
+                  "name": "SKYCTL_DELAYED_URL",
+                  "value": "queue"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MODEL",
+                  "value": "azure-openai:gpt-4.1"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_WRITES",
+                  "value": "true"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_DELETE",
+                  "value": "false"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_WRITES",
+                  "value": "5"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_TURNS",
+                  "value": "25"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_SECONDS",
+                  "value": "540"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ACCOUNTS",
+                  "value": "work"
+                },
+                {
+                  "name": "SKYCTL_LOG_FORMAT",
+                  "value": "json"
+                },
+                {
+                  "name": "SKYCTL_AUTH",
+                  "value": "bearer"
+                },
+                {
+                  "name": "SKYCTL_HTTP_MCP",
+                  "value": "true"
+                },
+                {
+                  "name": "AZURE_CLIENT_ID",
+                  "value": "${azurerm_user_assigned_identity.app.client_id}"
+                },
+                {
+                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                  "value": "${azurerm_storage_account.state.name}"
+                },
+                {
+                  "name": "AZURE_TENANT_ID",
+                  "value": "${data.azurerm_client_config.current.tenant_id}"
+                },
+                {
+                  "name": "AZURE_OPENAI_ENDPOINT",
+                  "value": "https://skyctl-openai.openai.azure.com"
+                }
+              ]
+            }
+          ]
+        },
+        "depends_on": [
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.kv_app",
+          "azurerm_role_assignment.sb_send",
+          "azurerm_role_assignment.sb_receive"
+        ]
+      },
+      "schedule_tick": {
+        "name": "skyctl-tick",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "container_app_environment_id": "${azurerm_container_app_environment.main.id}",
+        "replica_timeout_in_seconds": 300,
+        "replica_retry_limit": 0,
+        "identity": {
+          "type": "UserAssigned",
+          "identity_ids": [
+            "${azurerm_user_assigned_identity.app.id}"
+          ]
+        },
+        "schedule_trigger_config": {
+          "cron_expression": "*/5 * * * *",
+          "parallelism": 1,
+          "replica_completion_count": 1
+        },
+        "template": {
+          "container": [
+            {
+              "name": "skyctl",
+              "image": "${var.image}",
+              "cpu": 0.5,
+              "memory": "1Gi",
+              "args": [
+                "invoke",
+                "{\"kind\":\"tick\"}"
+              ],
+              "env": [
+                {
+                  "name": "SKYCTL_PLATFORM",
+                  "value": "azure"
+                },
+                {
+                  "name": "SKYCTL_COMPUTE",
+                  "value": "container-apps-job"
+                },
+                {
+                  "name": "SKYCTL_SECRETS",
+                  "value": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config"
+                },
+                {
+                  "name": "SKYCTL_STATE_URL",
+                  "value": "az://skyctl/skyctl"
+                },
+                {
+                  "name": "SKYCTL_QUEUE_URL",
+                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                },
+                {
+                  "name": "SKYCTL_DELAYED_URL",
+                  "value": "queue"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MODEL",
+                  "value": "azure-openai:gpt-4.1"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_WRITES",
+                  "value": "true"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_DELETE",
+                  "value": "false"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_WRITES",
+                  "value": "5"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_TURNS",
+                  "value": "25"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_SECONDS",
+                  "value": "540"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ACCOUNTS",
+                  "value": "work"
+                },
+                {
+                  "name": "SKYCTL_LOG_FORMAT",
+                  "value": "json"
+                },
+                {
+                  "name": "SKYCTL_AUTH",
+                  "value": "bearer"
+                },
+                {
+                  "name": "SKYCTL_HTTP_MCP",
+                  "value": "true"
+                },
+                {
+                  "name": "AZURE_CLIENT_ID",
+                  "value": "${azurerm_user_assigned_identity.app.client_id}"
+                },
+                {
+                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                  "value": "${azurerm_storage_account.state.name}"
+                },
+                {
+                  "name": "AZURE_TENANT_ID",
+                  "value": "${data.azurerm_client_config.current.tenant_id}"
+                },
+                {
+                  "name": "AZURE_OPENAI_ENDPOINT",
+                  "value": "https://skyctl-openai.openai.azure.com"
+                }
+              ]
+            }
+          ]
+        },
+        "depends_on": [
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.kv_app",
+          "azurerm_role_assignment.sb_send",
+          "azurerm_role_assignment.sb_receive"
+        ]
+      },
+      "schedule_daily_engagement": {
+        "name": "skyctl-daily-engagement",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "container_app_environment_id": "${azurerm_container_app_environment.main.id}",
+        "replica_timeout_in_seconds": 900,
+        "replica_retry_limit": 0,
+        "identity": {
+          "type": "UserAssigned",
+          "identity_ids": [
+            "${azurerm_user_assigned_identity.app.id}"
+          ]
+        },
+        "schedule_trigger_config": {
+          "cron_expression": "0 9 * * mon-fri",
+          "parallelism": 1,
+          "replica_completion_count": 1
+        },
+        "template": {
+          "container": [
+            {
+              "name": "skyctl",
+              "image": "${var.image}",
+              "cpu": 0.5,
+              "memory": "1Gi",
+              "args": [
+                "invoke",
+                "{\"kind\":\"task.run\",\"task\":\"daily-engagement\"}"
+              ],
+              "env": [
+                {
+                  "name": "SKYCTL_PLATFORM",
+                  "value": "azure"
+                },
+                {
+                  "name": "SKYCTL_COMPUTE",
+                  "value": "container-apps-job"
+                },
+                {
+                  "name": "SKYCTL_SECRETS",
+                  "value": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config"
+                },
+                {
+                  "name": "SKYCTL_STATE_URL",
+                  "value": "az://skyctl/skyctl"
+                },
+                {
+                  "name": "SKYCTL_QUEUE_URL",
+                  "value": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work"
+                },
+                {
+                  "name": "SKYCTL_DELAYED_URL",
+                  "value": "queue"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MODEL",
+                  "value": "azure-openai:gpt-4.1"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_WRITES",
+                  "value": "true"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ALLOW_DELETE",
+                  "value": "false"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_WRITES",
+                  "value": "5"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_TURNS",
+                  "value": "25"
+                },
+                {
+                  "name": "SKYCTL_AGENT_MAX_SECONDS",
+                  "value": "540"
+                },
+                {
+                  "name": "SKYCTL_AGENT_ACCOUNTS",
+                  "value": "work"
+                },
+                {
+                  "name": "SKYCTL_LOG_FORMAT",
+                  "value": "json"
+                },
+                {
+                  "name": "SKYCTL_AUTH",
+                  "value": "bearer"
+                },
+                {
+                  "name": "SKYCTL_HTTP_MCP",
+                  "value": "true"
+                },
+                {
+                  "name": "AZURE_CLIENT_ID",
+                  "value": "${azurerm_user_assigned_identity.app.client_id}"
+                },
+                {
+                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                  "value": "${azurerm_storage_account.state.name}"
+                },
+                {
+                  "name": "AZURE_TENANT_ID",
+                  "value": "${data.azurerm_client_config.current.tenant_id}"
+                },
+                {
+                  "name": "AZURE_OPENAI_ENDPOINT",
+                  "value": "https://skyctl-openai.openai.azure.com"
+                }
+              ]
+            }
+          ]
+        },
+        "depends_on": [
+          "azurerm_role_assignment.blob_app",
+          "azurerm_role_assignment.kv_app",
+          "azurerm_role_assignment.sb_send",
+          "azurerm_role_assignment.sb_receive"
+        ]
+      }
+    }
+  },
+  "output": {
+    "service_url": {
+      "value": "https://${azurerm_container_app.http.latest_revision_fqdn}"
+    },
+    "env": {
+      "value": {
+        "SKYCTL_PLATFORM": "azure",
+        "SKYCTL_COMPUTE": "container-apps-job",
+        "SKYCTL_SECRETS": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config",
+        "SKYCTL_STATE_URL": "az://skyctl/skyctl",
+        "SKYCTL_QUEUE_URL": "servicebus://${azurerm_servicebus_namespace.main.name}.servicebus.windows.net/skyctl-work",
+        "SKYCTL_DELAYED_URL": "queue",
+        "SKYCTL_AGENT_MODEL": "azure-openai:gpt-4.1",
+        "SKYCTL_AGENT_ALLOW_WRITES": "true",
+        "SKYCTL_AGENT_ALLOW_DELETE": "false",
+        "SKYCTL_AGENT_MAX_WRITES": "5",
+        "SKYCTL_AGENT_MAX_TURNS": "25",
+        "SKYCTL_AGENT_MAX_SECONDS": "540",
+        "SKYCTL_AGENT_ACCOUNTS": "work",
+        "SKYCTL_LOG_FORMAT": "json",
+        "SKYCTL_AUTH": "bearer",
+        "SKYCTL_HTTP_MCP": "true",
+        "AZURE_CLIENT_ID": "${azurerm_user_assigned_identity.app.client_id}",
+        "AZURE_STORAGE_ACCOUNT_NAME": "${azurerm_storage_account.state.name}",
+        "AZURE_TENANT_ID": "${data.azurerm_client_config.current.tenant_id}",
+        "AZURE_OPENAI_ENDPOINT": "https://skyctl-openai.openai.azure.com"
+      }
+    },
+    "key_vault": {
+      "value": "${azurerm_key_vault.main.name}"
+    },
+    "storage_account": {
+      "value": "${azurerm_storage_account.state.name}"
+    }
+  }
+}
