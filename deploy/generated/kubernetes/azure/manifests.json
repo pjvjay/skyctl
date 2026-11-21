@@ -1,0 +1,346 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "skyctl-http",
+        "namespace": "skyctl",
+        "labels": {
+          "app.kubernetes.io/name": "skyctl",
+          "app.kubernetes.io/managed-by": "skyctl-deploy",
+          "app.kubernetes.io/component": "http"
+        }
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app.kubernetes.io/name": "skyctl",
+            "app.kubernetes.io/managed-by": "skyctl-deploy",
+            "app.kubernetes.io/component": "http"
+          }
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/name": "skyctl",
+              "app.kubernetes.io/managed-by": "skyctl-deploy",
+              "azure.workload.identity/use": "true",
+              "app.kubernetes.io/component": "http"
+            }
+          },
+          "spec": {
+            "serviceAccountName": "skyctl",
+            "restartPolicy": "Always",
+            "securityContext": {
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "containers": [
+              {
+                "name": "skyctl",
+                "image": "ghcr.io/example/skyctl:1.2.0",
+                "args": [
+                  "serve"
+                ],
+                "envFrom": [
+                  {
+                    "configMapRef": {
+                      "name": "skyctl-env"
+                    }
+                  }
+                ],
+                "env": [
+                  {
+                    "name": "SKYCTL_COMPUTE",
+                    "value": "deployment"
+                  }
+                ],
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "readOnlyRootFilesystem": true,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  }
+                },
+                "resources": {
+                  "requests": {
+                    "cpu": "500m",
+                    "memory": "1024Mi"
+                  },
+                  "limits": {
+                    "memory": "1024Mi"
+                  }
+                },
+                "volumeMounts": [
+                  {
+                    "name": "tmp",
+                    "mountPath": "/tmp"
+                  }
+                ],
+                "ports": [
+                  {
+                    "containerPort": 8080,
+                    "name": "http"
+                  }
+                ],
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": "http"
+                  },
+                  "periodSeconds": 10
+                },
+                "livenessProbe": {
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": "http"
+                  },
+                  "periodSeconds": 30
+                }
+              }
+            ],
+            "volumes": [
+              {
+                "name": "tmp",
+                "emptyDir": {}
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "skyctl-http",
+        "namespace": "skyctl",
+        "labels": {
+          "app.kubernetes.io/name": "skyctl",
+          "app.kubernetes.io/managed-by": "skyctl-deploy"
+        }
+      },
+      "spec": {
+        "selector": {
+          "app.kubernetes.io/name": "skyctl",
+          "app.kubernetes.io/managed-by": "skyctl-deploy",
+          "app.kubernetes.io/component": "http"
+        },
+        "ports": [
+          {
+            "port": 80,
+            "targetPort": "http",
+            "name": "http"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "CronJob",
+      "metadata": {
+        "name": "skyctl-tick",
+        "namespace": "skyctl",
+        "labels": {
+          "app.kubernetes.io/name": "skyctl",
+          "app.kubernetes.io/managed-by": "skyctl-deploy"
+        }
+      },
+      "spec": {
+        "schedule": "*/5 * * * *",
+        "timeZone": "UTC",
+        "concurrencyPolicy": "Forbid",
+        "startingDeadlineSeconds": 300,
+        "successfulJobsHistoryLimit": 1,
+        "failedJobsHistoryLimit": 3,
+        "jobTemplate": {
+          "spec": {
+            "backoffLimit": 0,
+            "activeDeadlineSeconds": 300,
+            "template": {
+              "metadata": {
+                "labels": {
+                  "app.kubernetes.io/name": "skyctl",
+                  "app.kubernetes.io/managed-by": "skyctl-deploy",
+                  "azure.workload.identity/use": "true"
+                }
+              },
+              "spec": {
+                "serviceAccountName": "skyctl",
+                "restartPolicy": "Never",
+                "securityContext": {
+                  "runAsNonRoot": true,
+                  "runAsUser": 10001,
+                  "seccompProfile": {
+                    "type": "RuntimeDefault"
+                  }
+                },
+                "containers": [
+                  {
+                    "name": "skyctl",
+                    "image": "ghcr.io/example/skyctl:1.2.0",
+                    "args": [
+                      "invoke",
+                      "{\"kind\":\"tick\"}"
+                    ],
+                    "envFrom": [
+                      {
+                        "configMapRef": {
+                          "name": "skyctl-env"
+                        }
+                      }
+                    ],
+                    "env": [
+                      {
+                        "name": "SKYCTL_COMPUTE",
+                        "value": "cronjob"
+                      }
+                    ],
+                    "securityContext": {
+                      "allowPrivilegeEscalation": false,
+                      "readOnlyRootFilesystem": true,
+                      "capabilities": {
+                        "drop": [
+                          "ALL"
+                        ]
+                      }
+                    },
+                    "resources": {
+                      "requests": {
+                        "cpu": "250m",
+                        "memory": "512Mi"
+                      },
+                      "limits": {
+                        "memory": "512Mi"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "name": "tmp",
+                        "mountPath": "/tmp"
+                      }
+                    ]
+                  }
+                ],
+                "volumes": [
+                  {
+                    "name": "tmp",
+                    "emptyDir": {}
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "batch/v1",
+      "kind": "CronJob",
+      "metadata": {
+        "name": "skyctl-daily-engagement",
+        "namespace": "skyctl",
+        "labels": {
+          "app.kubernetes.io/name": "skyctl",
+          "app.kubernetes.io/managed-by": "skyctl-deploy"
+        }
+      },
+      "spec": {
+        "schedule": "0 9 * * mon-fri",
+        "timeZone": "UTC",
+        "concurrencyPolicy": "Forbid",
+        "startingDeadlineSeconds": 300,
+        "successfulJobsHistoryLimit": 1,
+        "failedJobsHistoryLimit": 3,
+        "jobTemplate": {
+          "spec": {
+            "backoffLimit": 0,
+            "activeDeadlineSeconds": 900,
+            "template": {
+              "metadata": {
+                "labels": {
+                  "app.kubernetes.io/name": "skyctl",
+                  "app.kubernetes.io/managed-by": "skyctl-deploy",
+                  "azure.workload.identity/use": "true"
+                }
+              },
+              "spec": {
+                "serviceAccountName": "skyctl",
+                "restartPolicy": "Never",
+                "securityContext": {
+                  "runAsNonRoot": true,
+                  "runAsUser": 10001,
+                  "seccompProfile": {
+                    "type": "RuntimeDefault"
+                  }
+                },
+                "containers": [
+                  {
+                    "name": "skyctl",
+                    "image": "ghcr.io/example/skyctl:1.2.0",
+                    "args": [
+                      "invoke",
+                      "{\"kind\":\"task.run\",\"slot\":{\"cron\":\"0 9 * * mon-fri\",\"timezone\":\"UTC\"},\"task\":\"daily-engagement\"}"
+                    ],
+                    "envFrom": [
+                      {
+                        "configMapRef": {
+                          "name": "skyctl-env"
+                        }
+                      }
+                    ],
+                    "env": [
+                      {
+                        "name": "SKYCTL_COMPUTE",
+                        "value": "cronjob"
+                      }
+                    ],
+                    "securityContext": {
+                      "allowPrivilegeEscalation": false,
+                      "readOnlyRootFilesystem": true,
+                      "capabilities": {
+                        "drop": [
+                          "ALL"
+                        ]
+                      }
+                    },
+                    "resources": {
+                      "requests": {
+                        "cpu": "250m",
+                        "memory": "512Mi"
+                      },
+                      "limits": {
+                        "memory": "512Mi"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "name": "tmp",
+                        "mountPath": "/tmp"
+                      }
+                    ]
+                  }
+                ],
+                "volumes": [
+                  {
+                    "name": "tmp",
+                    "emptyDir": {}
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

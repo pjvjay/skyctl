@@ -1,0 +1,303 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# lint → test (3.10–3.13) → package (build, verify in a clean venv) → conformance
+#   → image → deploy per cloud (tags)   → release to PyPI (tags)
+#
+# Cloud credentials come from OIDC federation (no long-lived keys in GitHub);
+# PyPI uses trusted publishing (no API tokens).
+#
+# The infrastructure is *generated* from deploy/skyctl.deploy.toml, so the
+# pipeline renders it, gates on `skyctl deploy check` (validation + the
+# cross-target conformance suite), and applies exactly what it rendered.
+name: ci
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Your spec. deploy/examples/ has the same intent two ways:
+  #   managed.deploy.toml     ECS/Lambda · Container Apps · Cloud Run
+  #   kubernetes.deploy.toml  EKS · AKS · GKE (existing clusters)
+  DEPLOY_SPEC: deploy/skyctl.deploy.toml
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[dev]"
+      - name: ruff
+        run: |
+          ruff check skyctl tests scripts
+          ruff format --check skyctl tests scripts
+      - name: mypy (as Python 3.10)
+        run: mypy
+      - name: Licence headers (what Apache RAT checks)
+        run: python scripts/license_headers.py
+      - name: Dependency licences (no ASF Category X)
+        run: python scripts/check_dependency_licenses.py --extras all
+
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        experimental: [false]
+        include:
+          - { os: macos-latest, python: "3.12", experimental: false }
+          - { os: windows-latest, python: "3.12", experimental: true }   # not yet a supported platform
+          - { os: ubuntu-latest, python: "3.14", experimental: true }    # passes locally; not yet declared
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}", cache: pip }
+      - run: pip install -e ".[test,all]" pytest-cov
+      - run: pytest -q --cov --cov-report=term --cov-report=xml
+      - if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with: { name: coverage, path: coverage.xml }
+
+  # The minimum supported versions of every dependency, so the lower bounds in pyproject.toml stay honest.
+  test-lowest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv --python 3.10 && uv pip install --resolution lowest-direct -e ".[test,all]"
+      - run: .venv/bin/python -m pytest -q
+
+  # Build the sdist and wheel, then install each in a fresh venv and run the
+  # suite against the installed package (scripts/verify_install.py).
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - run: python scripts/verify_install.py dist/*.whl dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist/ }
+
+  # Contract tests against real emulators for the semantics in-process fakes cannot
+  # prove (moto does not evaluate S3 preconditions atomically; see CLOUD_FRAMEWORK.md §9).
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
+      azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000", "10001:10001"] }
+    steps:
+      - uses: actions/checkout@v4
+      # fake-gcs-server needs "-scheme http". A service container cannot be given
+      # arguments (they would have to go through `options`, which docker reads
+      # before the image name), so it is started as a step instead.
+      - name: Start fake-gcs-server
+        run: docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[test,all]"
+      - name: Wait for fake-gcs-server
+        run: |
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:4443/storage/v1/b > /dev/null && exit 0
+            sleep 1
+          done
+          docker logs gcs
+          exit 1
+      - run: pytest -q -m integration -rs
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+          SKYCTL_IT_S3_ENDPOINT: http://localhost:4566
+          SKYCTL_IT_S3_BUCKET: skyctl-it
+          SKYCTL_IT_AZURE_CONN: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;"
+          SKYCTL_IT_GCS_ENDPOINT: http://localhost:4443
+
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e .
+      - run: skyctl deploy check deploy/examples/managed.deploy.toml
+      - run: skyctl deploy check deploy/examples/kubernetes.deploy.toml
+      - run: if [ -f "$DEPLOY_SPEC" ]; then skyctl deploy check "$DEPLOY_SPEC"; fi
+      - name: Golden files are up to date
+        run: |
+          for ex in managed kubernetes; do
+            skyctl deploy render "deploy/examples/$ex.deploy.toml" --all --out "/tmp/golden/$ex"
+            diff -ru "deploy/generated/$ex" "/tmp/golden/$ex"
+          done
+      - uses: hashicorp/setup-terraform@v3
+      - name: terraform validate (every rendered target)
+        run: |
+          for dir in /tmp/golden/*/aws /tmp/golden/*/azure /tmp/golden/*/gcp; do
+            [ -f "$dir/main.tf.json" ] || continue
+            (cd "$dir" && terraform init -backend=false -input=false >/dev/null && terraform validate)
+          done
+
+  image:
+    needs: [test, conformance, package]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # provenance attestation
+      attestations: write
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+
+  # One job per cloud; each runs only if its environment is configured, so a
+  # repo can target one, two or all three clouds without editing this file.
+  deploy:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # OIDC federation to AWS / Azure / Google Cloud
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aws, azure, gcp]
+    environment: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - name: Render
+        run: skyctl deploy render "$DEPLOY_SPEC" --target ${{ matrix.target }} --out build
+      - if: matrix.target == 'aws' && vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_ROLE_ARN }}", aws-region: "${{ vars.AWS_REGION }}" }
+      - if: matrix.target == 'azure' && vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - if: matrix.target == 'gcp' && vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Apply
+        working-directory: build/${{ matrix.target }}
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_image: ${{ needs.image.outputs.image }}
+          TF_VAR_secrets_json: ${{ secrets.SKYCTL_SECRETS_JSON }}
+          TF_VAR_http_token: ${{ secrets.SKYCTL_HTTP_TOKEN }}
+        run: |
+          terraform init -input=false
+          terraform validate
+          terraform apply -auto-approve -input=false
+      # Kubernetes compute (eks/aks/gke): Terraform wrote bind.json; apply it, then the workloads.
+      - name: Cluster credentials
+        if: hashFiles(format('build/{0}/manifests.json', matrix.target)) != ''
+        run: |
+          case "${{ matrix.target }}" in
+            aws)   aws eks update-kubeconfig --name "${{ vars.K8S_CLUSTER }}" ;;
+            azure) az aks get-credentials --name "${{ vars.K8S_CLUSTER }}" --resource-group "${{ vars.K8S_RESOURCE_GROUP }}" ;;
+            gcp)   gcloud container clusters get-credentials "${{ vars.K8S_CLUSTER }}" --region "${{ vars.K8S_LOCATION }}" ;;
+          esac
+      - name: Apply manifests
+        if: hashFiles(format('build/{0}/manifests.json', matrix.target)) != ''
+        working-directory: build/${{ matrix.target }}
+        run: kubectl apply -f bind.json && kubectl apply -f manifests.json
+
+  # Tags only: publish the exact artefacts the package job built and verified.
+  release:
+    needs: [lint, test, package, integration, conformance]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write      # create the GitHub release
+      id-token: write      # PyPI trusted publishing + Sigstore signing
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - name: Tag matches the package version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ls dist/skyctl-"$version"-py3-none-any.whl dist/skyctl-"$version".tar.gz
+      - uses: pypa/gh-action-pypi-publish@release/v1   # uploads the wheel and sdist only
+        with: { packages-dir: dist, attestations: true }
+      - uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with: { inputs: "./dist/*.whl ./dist/*.tar.gz" }
+      - name: Checksums
+        run: cd dist && for f in *.whl *.tar.gz; do sha512sum "$f" > "$f.sha512"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

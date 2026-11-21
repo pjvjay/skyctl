@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.richtext
 ===============
@@ -30,9 +45,9 @@ def _extends_cluster(ch: str) -> bool:
     cp = ord(ch)
     return (
         unicodedata.category(ch) in ("Mn", "Me", "Mc")
-        or 0xFE00 <= cp <= 0xFE0F          # variation selectors
-        or 0x1F3FB <= cp <= 0x1F3FF        # emoji skin tones
-        or 0xE0020 <= cp <= 0xE007F        # tag characters (flag sequences)
+        or 0xFE00 <= cp <= 0xFE0F  # variation selectors
+        or 0x1F3FB <= cp <= 0x1F3FF  # emoji skin tones
+        or 0xE0020 <= cp <= 0xE007F  # tag characters (flag sequences)
         or ch == _ZWJ
     )
 
@@ -73,22 +88,21 @@ def validate_length(text: str, limit: int = MAX_GRAPHEMES) -> None:
     """Raise PostTooLongError if text is over the limit."""
     n = grapheme_len(text)
     if n > limit:
-        raise PostTooLongError(
-            f"Post is {n} graphemes; the limit is {limit}. "
-            f"Shorten it or send it as a thread."
-        )
+        raise PostTooLongError(f"Post is {n} graphemes; the limit is {limit}. Shorten it or send it as a thread.")
 
 
 # ----------------------------------------------------------------------
 # Facets
 # ----------------------------------------------------------------------
 
+
 @dataclass
 class Facet:
     """A detected link, mention or hashtag with UTF-8 byte offsets."""
-    kind: str          # "link" | "mention" | "tag"
-    value: str         # URL, handle (no @) or tag (no #)
-    text: str          # The matched text as written
+
+    kind: str  # "link" | "mention" | "tag"
+    value: str  # URL, handle (no @) or tag (no #)
+    text: str  # The matched text as written
     byte_start: int
     byte_end: int
 
@@ -96,8 +110,7 @@ class Facet:
 _BOUNDARY = r"(?:^|(?<=[\s(]))"
 _URL_RE = re.compile(_BOUNDARY + r"https?://[^\s]+")
 _MENTION_RE = re.compile(
-    _BOUNDARY
-    + r"@((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+    _BOUNDARY + r"@((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
     r"[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
 )
 _TAG_RE = re.compile(r"(?:^|(?<=\s))#(\S+)")
@@ -110,9 +123,7 @@ def _byte_offset(text: str, index: int) -> int:
 
 def _trim_url(url: str) -> str:
     while url:
-        if url[-1] in _TRAILING_PUNCT:
-            url = url[:-1]
-        elif url[-1] == ")" and url.count("(") < url.count(")"):
+        if url[-1] in _TRAILING_PUNCT or (url[-1] == ")" and url.count("(") < url.count(")")):
             url = url[:-1]
         else:
             break
@@ -141,7 +152,7 @@ def detect_facets(text: str) -> list[Facet]:
     facets: list[Facet] = []
     last_end = -1
     for start, end, kind, value in found:
-        if start < last_end:      # overlaps an earlier facet (e.g. # inside a URL)
+        if start < last_end:  # overlaps an earlier facet (e.g. # inside a URL)
             continue
         facets.append(
             Facet(
@@ -159,6 +170,7 @@ def detect_facets(text: str) -> list[Facet]:
 # ----------------------------------------------------------------------
 # Threads
 # ----------------------------------------------------------------------
+
 
 def split_thread(text: str, limit: int = MAX_GRAPHEMES) -> list[str]:
     """

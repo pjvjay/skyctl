@@ -1,0 +1,247 @@
+{
+  "terraform": {
+    "required_version": ">= 1.6",
+    "required_providers": {
+      "aws": {
+        "source": "hashicorp/aws",
+        "version": ">= 5.60"
+      },
+      "local": {
+        "source": "hashicorp/local",
+        "version": ">= 2.4"
+      }
+    }
+  },
+  "provider": {
+    "aws": {
+      "region": "us-east-1"
+    }
+  },
+  "variable": {
+    "image": {
+      "type": "string",
+      "description": "Container image (ECR for Lambda).",
+      "default": "ghcr.io/example/skyctl:1.2.0"
+    },
+    "secrets_json": {
+      "type": "string",
+      "description": "The BSKY_* / API-key map as JSON or dotenv text.",
+      "sensitive": true
+    },
+    "http_token": {
+      "type": "string",
+      "description": "Bearer token for the HTTP service.",
+      "sensitive": true
+    }
+  },
+  "data": {
+    "aws_caller_identity": {
+      "current": {}
+    }
+  },
+  "resource": {
+    "aws_secretsmanager_secret": {
+      "config": {
+        "name": "skyctl/config",
+        "recovery_window_in_days": 7
+      },
+      "http_token": {
+        "name": "skyctl/http-token",
+        "recovery_window_in_days": 7
+      }
+    },
+    "aws_secretsmanager_secret_version": {
+      "config": {
+        "secret_id": "${aws_secretsmanager_secret.config.id}",
+        "secret_string": "${var.secrets_json}"
+      },
+      "http_token": {
+        "secret_id": "${aws_secretsmanager_secret.http_token.id}",
+        "secret_string": "${var.http_token}"
+      }
+    },
+    "aws_s3_bucket": {
+      "state": {
+        "bucket_prefix": "skyctl-state-",
+        "lifecycle": {
+          "prevent_destroy": true
+        }
+      }
+    },
+    "aws_s3_bucket_public_access_block": {
+      "state": {
+        "bucket": "${aws_s3_bucket.state.id}",
+        "block_public_acls": true,
+        "block_public_policy": true,
+        "ignore_public_acls": true,
+        "restrict_public_buckets": true
+      }
+    },
+    "aws_s3_bucket_server_side_encryption_configuration": {
+      "state": {
+        "bucket": "${aws_s3_bucket.state.id}",
+        "rule": {
+          "apply_server_side_encryption_by_default": {
+            "sse_algorithm": "aws:kms"
+          }
+        }
+      }
+    },
+    "aws_s3_bucket_versioning": {
+      "state": {
+        "bucket": "${aws_s3_bucket.state.id}",
+        "versioning_configuration": {
+          "status": "Enabled"
+        }
+      }
+    },
+    "aws_s3_bucket_lifecycle_configuration": {
+      "state": {
+        "bucket": "${aws_s3_bucket.state.id}",
+        "rule": [
+          {
+            "id": "expire-run-transcripts",
+            "status": "Enabled",
+            "filter": {
+              "prefix": "skyctl/runs/"
+            },
+            "expiration": {
+              "days": 90
+            }
+          },
+          {
+            "id": "expire-write-ledger",
+            "status": "Enabled",
+            "filter": {
+              "prefix": "skyctl/ledger/"
+            },
+            "expiration": {
+              "days": 90
+            }
+          },
+          {
+            "id": "expire-old-versions",
+            "status": "Enabled",
+            "filter": {},
+            "noncurrent_version_expiration": {
+              "noncurrent_days": 30
+            }
+          }
+        ]
+      }
+    },
+    "aws_s3_object": {
+      "tasks": {
+        "bucket": "${aws_s3_bucket.state.id}",
+        "key": "skyctl/config/tasks.toml",
+        "content": "# Rendered by skyctl deploy from the deployment spec. Do not edit by hand.\n\n[tasks.daily-engagement]\ngoal = \"Read the work account's notifications and draft replies to genuine product questions.\"\naccounts = [\"work\"]\nallow_writes = true\nmax_writes = 5\napproval = \"writes\"\n",
+        "content_type": "application/toml"
+      }
+    },
+    "aws_sqs_queue": {
+      "dlq": {
+        "name": "skyctl-work-dlq",
+        "message_retention_seconds": 1209600,
+        "sqs_managed_sse_enabled": true
+      },
+      "work": {
+        "name": "skyctl-work",
+        "visibility_timeout_seconds": 900,
+        "sqs_managed_sse_enabled": true,
+        "redrive_policy": "{\"deadLetterTargetArn\": \"${aws_sqs_queue.dlq.arn}\", \"maxReceiveCount\": 5}"
+      }
+    },
+    "aws_scheduler_schedule_group": {
+      "delayed": {
+        "name": "skyctl-delayed"
+      }
+    },
+    "aws_iam_role": {
+      "delivery": {
+        "name": "skyctl-delivery",
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"scheduler.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      },
+      "app": {
+        "name": "skyctl-eks",
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"pods.eks.amazonaws.com\"},\"Action\":[\"sts:AssumeRole\",\"sts:TagSession\"]},{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::123456789012:role/keda-operator\"},\"Action\":\"sts:AssumeRole\"}]}"
+      }
+    },
+    "aws_iam_role_policy": {
+      "delivery": {
+        "name": "send-to-work-queue",
+        "role": "${aws_iam_role.delivery.id}",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sqs:SendMessage\",\"Resource\":\"${aws_sqs_queue.work.arn}\"}]}"
+      },
+      "app": {
+        "name": "skyctl",
+        "role": "${aws_iam_role.app.id}",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":[\"${aws_secretsmanager_secret.config.arn}\",\"${aws_secretsmanager_secret.http_token.arn}\"]},{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":\"${aws_s3_bucket.state.arn}/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"${aws_s3_bucket.state.arn}\"},{\"Effect\":\"Allow\",\"Action\":[\"sqs:SendMessage\",\"sqs:ReceiveMessage\",\"sqs:DeleteMessage\",\"sqs:ChangeMessageVisibility\",\"sqs:GetQueueAttributes\"],\"Resource\":\"${aws_sqs_queue.work.arn}\"},{\"Effect\":\"Allow\",\"Action\":[\"scheduler:CreateSchedule\",\"scheduler:UpdateSchedule\",\"scheduler:DeleteSchedule\"],\"Resource\":\"arn:aws:scheduler:us-east-1:${data.aws_caller_identity.current.account_id}:schedule/skyctl-delayed/*\"},{\"Effect\":\"Allow\",\"Action\":\"iam:PassRole\",\"Resource\":\"${aws_iam_role.delivery.arn}\"},{\"Effect\":\"Allow\",\"Action\":[\"bedrock:InvokeModel\",\"bedrock:InvokeModelWithResponseStream\"],\"Resource\":\"*\"}]}"
+      }
+    },
+    "aws_eks_pod_identity_association": {
+      "app": {
+        "cluster_name": "platform-prod",
+        "namespace": "skyctl",
+        "service_account": "skyctl",
+        "role_arn": "${aws_iam_role.app.arn}"
+      }
+    },
+    "local_file": {
+      "k8s_bind": {
+        "filename": "bind.json",
+        "file_permission": "0644",
+        "content": "{\n  \"apiVersion\": \"v1\",\n  \"kind\": \"List\",\n  \"items\": [\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"Namespace\",\n      \"metadata\": {\n        \"name\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"ServiceAccount\",\n      \"metadata\": {\n        \"name\": \"skyctl\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"ConfigMap\",\n      \"metadata\": {\n        \"name\": \"skyctl-env\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      },\n      \"data\": {\n        \"SKYCTL_PLATFORM\": \"kubernetes\",\n        \"SKYCTL_COMPUTE\": \"deployment\",\n        \"SKYCTL_SECRETS\": \"aws-sm://skyctl/config,aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN\",\n        \"SKYCTL_STATE_URL\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\",\n        \"SKYCTL_QUEUE_URL\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\",\n        \"SKYCTL_DELAYED_URL\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\",\n        \"SKYCTL_AGENT_MODEL\": \"bedrock:anthropic.claude-opus-5-5\",\n        \"SKYCTL_AGENT_ALLOW_WRITES\": \"true\",\n        \"SKYCTL_AGENT_ALLOW_DELETE\": \"false\",\n        \"SKYCTL_AGENT_MAX_WRITES\": \"5\",\n        \"SKYCTL_AGENT_MAX_TURNS\": \"25\",\n        \"SKYCTL_AGENT_MAX_SECONDS\": \"540\",\n        \"SKYCTL_AGENT_ACCOUNTS\": \"work\",\n        \"SKYCTL_LOG_FORMAT\": \"json\",\n        \"SKYCTL_AUTH\": \"bearer\",\n        \"SKYCTL_HTTP_MCP\": \"true\",\n        \"SKYCTL_SEARCH_URL\": \"gdelt://\",\n        \"AWS_REGION\": \"us-east-1\"\n      }\n    },\n    {\n      \"apiVersion\": \"keda.sh/v1alpha1\",\n      \"kind\": \"TriggerAuthentication\",\n      \"metadata\": {\n        \"name\": \"skyctl-keda\",\n        \"namespace\": \"skyctl\"\n      },\n      \"spec\": {\n        \"podIdentity\": {\n          \"provider\": \"aws\",\n          \"roleArn\": \"${aws_iam_role.app.arn}\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"keda.sh/v1alpha1\",\n      \"kind\": \"ScaledJob\",\n      \"metadata\": {\n        \"name\": \"skyctl-worker\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      },\n      \"spec\": {\n        \"jobTargetRef\": {\n          \"backoffLimit\": 0,\n          \"template\": {\n            \"metadata\": {\n              \"labels\": {\n                \"app.kubernetes.io/name\": \"skyctl\",\n                \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n              }\n            },\n            \"spec\": {\n              \"serviceAccountName\": \"skyctl\",\n              \"restartPolicy\": \"Never\",\n              \"securityContext\": {\n                \"runAsNonRoot\": true,\n                \"runAsUser\": 10001,\n                \"seccompProfile\": {\n                  \"type\": \"RuntimeDefault\"\n                }\n              },\n              \"containers\": [\n                {\n                  \"name\": \"skyctl\",\n                  \"image\": \"ghcr.io/example/skyctl:1.2.0\",\n                  \"args\": [\n                    \"worker\",\n                    \"--once\"\n                  ],\n                  \"envFrom\": [\n                    {\n                      \"configMapRef\": {\n                        \"name\": \"skyctl-env\"\n                      }\n                    }\n                  ],\n                  \"env\": [\n                    {\n                      \"name\": \"SKYCTL_COMPUTE\",\n                      \"value\": \"keda\"\n                    }\n                  ],\n                  \"securityContext\": {\n                    \"allowPrivilegeEscalation\": false,\n                    \"readOnlyRootFilesystem\": true,\n                    \"capabilities\": {\n                      \"drop\": [\n                        \"ALL\"\n                      ]\n                    }\n                  },\n                  \"resources\": {\n                    \"requests\": {\n                      \"cpu\": \"250m\",\n                      \"memory\": \"512Mi\"\n                    },\n                    \"limits\": {\n                      \"memory\": \"512Mi\"\n                    }\n                  },\n                  \"volumeMounts\": [\n                    {\n                      \"name\": \"tmp\",\n                      \"mountPath\": \"/tmp\"\n                    }\n                  ]\n                }\n              ],\n              \"volumes\": [\n                {\n                  \"name\": \"tmp\",\n                  \"emptyDir\": {}\n                }\n              ]\n            }\n          }\n        },\n        \"pollingInterval\": 30,\n        \"maxReplicaCount\": 2,\n        \"triggers\": [\n          {\n            \"type\": \"aws-sqs-queue\",\n            \"metadata\": {\n              \"queueURL\": \"${aws_sqs_queue.work.url}\",\n              \"queueLength\": \"1\",\n              \"awsRegion\": \"us-east-1\"\n            },\n            \"authenticationRef\": {\n              \"name\": \"skyctl-keda\"\n            }\n          }\n        ]\n      }\n    }\n  ]\n}\n"
+      }
+    },
+    "aws_iam_policy": {
+      "operator": {
+        "name": "skyctl-operator",
+        "description": "Submit skyctl tasks and approve plans (attach to operator users/roles)",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sqs:SendMessage\",\"Resource\":\"${aws_sqs_queue.work.arn}\"},{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\"],\"Resource\":\"${aws_s3_bucket.state.arn}/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"${aws_s3_bucket.state.arn}\"}]}"
+      }
+    }
+  },
+  "output": {
+    "env": {
+      "value": {
+        "SKYCTL_PLATFORM": "kubernetes",
+        "SKYCTL_COMPUTE": "deployment",
+        "SKYCTL_SECRETS": "aws-sm://skyctl/config,aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN",
+        "SKYCTL_STATE_URL": "s3://${aws_s3_bucket.state.bucket}/skyctl",
+        "SKYCTL_QUEUE_URL": "sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work",
+        "SKYCTL_DELAYED_URL": "eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}",
+        "SKYCTL_AGENT_MODEL": "bedrock:anthropic.claude-opus-5-5",
+        "SKYCTL_AGENT_ALLOW_WRITES": "true",
+        "SKYCTL_AGENT_ALLOW_DELETE": "false",
+        "SKYCTL_AGENT_MAX_WRITES": "5",
+        "SKYCTL_AGENT_MAX_TURNS": "25",
+        "SKYCTL_AGENT_MAX_SECONDS": "540",
+        "SKYCTL_AGENT_ACCOUNTS": "work",
+        "SKYCTL_LOG_FORMAT": "json",
+        "SKYCTL_AUTH": "bearer",
+        "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "state_url": {
+      "value": "s3://${aws_s3_bucket.state.bucket}/skyctl"
+    },
+    "queue_url": {
+      "value": "${aws_sqs_queue.work.url}"
+    },
+    "operator_policy_arn": {
+      "value": "${aws_iam_policy.operator.arn}"
+    },
+    "skyctl_connection": {
+      "value": {
+        "platform": "aws",
+        "state_url": "s3://${aws_s3_bucket.state.bucket}/skyctl",
+        "queue_url": "sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work",
+        "env": {
+          "AWS_REGION": "us-east-1"
+        }
+      }
+    }
+  }
+}

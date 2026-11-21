@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.client
 =============
@@ -8,11 +23,10 @@ All methods return typed result objects rather than raw API dicts.
 from __future__ import annotations
 
 import html as html_lib
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from atproto import Client as AtProtoClient
 from atproto import models as at_models
@@ -20,12 +34,13 @@ from atproto import models as at_models
 from .models import AccountConfig, PostResult
 from .richtext import detect_facets, split_thread, validate_length
 
+if TYPE_CHECKING:  # pragma: no cover
+    from .ports import ObjectStore, SessionStore
+
 MAX_IMAGES = 4
 MAX_THUMB_BYTES = 1_000_000
 
-_BSKY_URL_RE = re.compile(
-    r"^https?://bsky\.app/profile/([^/]+)/post/([^/?#]+)"
-)
+_BSKY_URL_RE = re.compile(r"^https?://bsky\.app/profile/([^/]+)/post/([^/?#]+)")
 
 
 def _now_utc() -> str:
@@ -61,24 +76,27 @@ def fetch_link_metadata(url: str) -> dict:
     Fetch title, description and preview image bytes for a link card.
     Never raises: on any failure the card falls back to the bare URL.
     """
-    meta = {"title": url, "description": "", "thumb": None}
+    meta: dict[str, Any] = {"title": url, "description": "", "thumb": None}
     try:
         import httpx
 
+        from .research import check_url
+
+        check_url(url)  # SSRF: never fetch internal / metadata addresses for a card
+
         headers = {"User-Agent": "skyctl-linkcard"}
-        resp = httpx.get(url, follow_redirects=True, timeout=10, headers=headers)
+        resp = httpx.get(url, follow_redirects=False, timeout=10, headers=headers)
         page = resp.text[:300_000]
         title = _meta_content(page, "og:title")
         if not title:
             m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
             title = html_lib.unescape(m.group(1)).strip() if m else ""
         meta["title"] = title or url
-        meta["description"] = _meta_content(page, "og:description") or _meta_content(
-            page, "description"
-        )
+        meta["description"] = _meta_content(page, "og:description") or _meta_content(page, "description")
         image_url = _meta_content(page, "og:image")
         if image_url:
             image_url = str(httpx.URL(str(resp.url)).join(image_url))
+            check_url(image_url)
             img = httpx.get(image_url, follow_redirects=True, timeout=10, headers=headers)
             if img.status_code == 200 and len(img.content) <= MAX_THUMB_BYTES:
                 meta["thumb"] = img.content
@@ -103,11 +121,33 @@ class BskyClient:
     def __init__(
         self,
         config: AccountConfig,
-        session_dir: Optional[Union[str, Path]] = None,
+        session_dir: str | Path | None = None,
+        session_store: SessionStore | None = None,
+        media_store: ObjectStore | None = None,
+        atproto_factory=None,
     ):
+        """
+        Args:
+            config: Account credentials.
+            session_dir: Directory for cached sessions (legacy; wraps a
+                FileSessionStore). Ignored when session_store is given.
+            session_store: Any SessionStore (see skyctl.ports). In the cloud
+                this is backed by the shared state bucket.
+            media_store: Where image keys are read from when an image path
+                is not a local file (e.g. "media/kite.jpg" in the state bucket).
+            atproto_factory: Builds the underlying atproto client from a base
+                URL (or None); defaults to atproto.Client. Evaluation harnesses
+                pass a simulated network here (skyctl.testing.world).
+        """
         self.config = config
         self.alias = config.alias
-        self.session_dir = Path(session_dir) if session_dir else None
+        if session_store is None and session_dir is not None:
+            from .adapters.local import FileSessionStore
+
+            session_store = FileSessionStore(session_dir)
+        self.session_store = session_store
+        self.media_store = media_store
+        self._atproto_factory = atproto_factory
         self._client = self._new_client()
         self._profile = None
         self._logged_in = False
@@ -117,9 +157,10 @@ class BskyClient:
     # ------------------------------------------------------------------
 
     def _new_client(self):
+        factory = self._atproto_factory or AtProtoClient
         if self.config.pds_url:
-            return AtProtoClient(self.config.pds_url)
-        return AtProtoClient()
+            return factory(self.config.pds_url)
+        return factory()
 
     @property
     def did(self) -> str:
@@ -127,34 +168,24 @@ class BskyClient:
         self._ensure_logged_in()
         return self._client.me.did
 
-    @property
-    def _session_file(self) -> Optional[Path]:
-        if self.session_dir is None:
-            return None
-        return self.session_dir / f"{self.alias}.session"
-
-    def login(self) -> "BskyClient":
+    def login(self) -> BskyClient:
         """
         Authenticate with Bluesky. Returns self for chaining.
 
         Reuses a cached session when one exists and is still valid;
         otherwise logs in with the app password and caches the new session.
         """
-        session_file = self._session_file
-        if session_file is not None and session_file.exists():
+        cached = self.session_store.get(self.alias) if self.session_store else None
+        if cached:
             try:
-                self._profile = self._client.login(
-                    session_string=session_file.read_text().strip()
-                )
+                self._profile = self._client.login(session_string=cached)
                 self._after_login()
                 return self
             except Exception:
                 # Expired or corrupt session: start clean and use the password.
                 self._client = self._new_client()
 
-        self._profile = self._client.login(
-            self.config.handle, self.config.password
-        )
+        self._profile = self._client.login(self.config.handle, self.config.password)
         self._after_login()
         return self
 
@@ -162,25 +193,24 @@ class BskyClient:
         self._logged_in = True
         self._save_session()
         on_change = getattr(self._client, "on_session_change", None)
-        if on_change is not None and self._session_file is not None:
+        if on_change is not None and self.session_store is not None:
             on_change(lambda *_: self._save_session())
 
     def _save_session(self):
-        session_file = self._session_file
-        if session_file is None:
+        if self.session_store is None:
             return
         try:
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            session_file.write_text(self._client.export_session_string())
-            os.chmod(session_file, 0o600)
+            self.session_store.set(self.alias, self._client.export_session_string())
         except Exception:
             pass  # Session caching is best-effort.
 
     def logout(self) -> None:
         """Forget the cached session for this account."""
-        session_file = self._session_file
-        if session_file is not None and session_file.exists():
-            session_file.unlink()
+        if self.session_store is not None:
+            try:
+                self.session_store.clear(self.alias)
+            except Exception:
+                pass
         self._logged_in = False
 
     def _ensure_logged_in(self):
@@ -194,11 +224,11 @@ class BskyClient:
     def post(
         self,
         text: str,
-        image_paths: Optional[list[str]] = None,
-        langs: Optional[list[str]] = None,
-        image_alts: Optional[list[str]] = None,
-        quote_uri: Optional[str] = None,
-        link_card: Optional[str] = None,
+        image_paths: list[str] | None = None,
+        langs: list[str] | None = None,
+        image_alts: list[str] | None = None,
+        quote_uri: str | None = None,
+        link_card: str | None = None,
     ) -> PostResult:
         """
         Create a new top-level post.
@@ -229,14 +259,14 @@ class BskyClient:
         self,
         text: str,
         parent_uri: str,
-        parent_cid: Optional[str] = None,
-        image_paths: Optional[list[str]] = None,
-        langs: Optional[list[str]] = None,
-        image_alts: Optional[list[str]] = None,
-        root_uri: Optional[str] = None,
-        root_cid: Optional[str] = None,
-        quote_uri: Optional[str] = None,
-        link_card: Optional[str] = None,
+        parent_cid: str | None = None,
+        image_paths: list[str] | None = None,
+        langs: list[str] | None = None,
+        image_alts: list[str] | None = None,
+        root_uri: str | None = None,
+        root_cid: str | None = None,
+        quote_uri: str | None = None,
+        link_card: str | None = None,
     ) -> PostResult:
         """
         Reply to an existing post.
@@ -263,10 +293,10 @@ class BskyClient:
 
     def thread(
         self,
-        text: Union[str, list[str]],
-        image_paths: Optional[list[str]] = None,
-        image_alts: Optional[list[str]] = None,
-        langs: Optional[list[str]] = None,
+        text: str | list[str],
+        image_paths: list[str] | None = None,
+        image_alts: list[str] | None = None,
+        langs: list[str] | None = None,
     ) -> list[PostResult]:
         """
         Post a thread. A string is split into parts of at most 300
@@ -283,11 +313,7 @@ class BskyClient:
             except ValueError as e:
                 return [self._error(str(e))]
 
-        results = [
-            self.post(
-                parts[0], image_paths=image_paths, image_alts=image_alts, langs=langs
-            )
-        ]
+        results = [self.post(parts[0], image_paths=image_paths, image_alts=image_alts, langs=langs)]
         root = results[0]
         for part in parts[1:]:
             prev = results[-1]
@@ -305,7 +331,7 @@ class BskyClient:
             )
         return results
 
-    def repost(self, uri: str, cid: Optional[str] = None) -> PostResult:
+    def repost(self, uri: str, cid: str | None = None) -> PostResult:
         """Repost (boost) an existing post."""
         self._ensure_logged_in()
         try:
@@ -317,7 +343,7 @@ class BskyClient:
         except Exception as e:
             return self._error(str(e))
 
-    def like(self, uri: str, cid: Optional[str] = None) -> PostResult:
+    def like(self, uri: str, cid: str | None = None) -> PostResult:
         """Like a post."""
         self._ensure_logged_in()
         try:
@@ -351,12 +377,10 @@ class BskyClient:
     def get_notifications(self, limit: int = 20) -> list[dict]:
         """Fetch unread notifications."""
         self._ensure_logged_in()
-        resp = self._client.app.bsky.notification.list_notifications(
-            {"limit": limit}
-        )
+        resp = self._client.app.bsky.notification.list_notifications({"limit": limit})
         return [n.model_dump() for n in resp.notifications]
 
-    def get_profile(self, handle: Optional[str] = None) -> dict:
+    def get_profile(self, handle: str | None = None) -> dict:
         """Get profile info. Defaults to the logged-in account."""
         self._ensure_logged_in()
         handle = handle or self.config.handle
@@ -366,12 +390,47 @@ class BskyClient:
     def search_posts(self, query: str, limit: int = 25) -> list[dict]:
         """Search posts by keyword."""
         self._ensure_logged_in()
-        resp = self._client.app.bsky.feed.search_posts(
-            {"q": query, "limit": limit}
-        )
+        resp = self._client.app.bsky.feed.search_posts({"q": query, "limit": limit})
         return [self._flatten_post_record(p) for p in resp.posts]
 
-    def list_posts(self, actor: Optional[str] = None, limit: int = 30) -> list[dict]:
+    def get_post(self, uri: str) -> dict:
+        """Fetch one post by AT URI or bsky.app URL."""
+        self._ensure_logged_in()
+        uri = self._normalize_uri(uri)
+        post = self._fetch_post(uri)
+        data = self._flatten_post_record(post)
+        reply = getattr(post.record, "reply", None)
+        data["reply_root"] = reply.root.uri if reply is not None else None
+        data["reply_parent"] = reply.parent.uri if reply is not None else None
+        data["replies"] = getattr(post, "reply_count", None)
+        return data
+
+    def get_post_thread(self, uri: str, depth: int = 6, max_replies: int = 100) -> dict:
+        """
+        A post and its replies ("the comments"), flattened breadth-first:
+        {"post": {...}, "replies": [{uri, cid, author, text, created_at, likes,
+        reply_to, depth}, ...]}. Deleted or blocked replies are skipped.
+        """
+        self._ensure_logged_in()
+        uri = self._normalize_uri(uri)
+        resp = self._client.get_post_thread(uri=uri, depth=depth, parent_height=0)
+        root = resp.thread
+        if getattr(root, "post", None) is None:
+            raise ValueError(f"Post not found or not visible: {uri}")
+        out: dict[str, Any] = {"post": self._flatten_post_record(root.post), "replies": []}
+        queue = [(r, root.post.uri, 1) for r in (getattr(root, "replies", None) or [])]
+        while queue and len(out["replies"]) < max_replies:
+            node, parent, level = queue.pop(0)
+            post = getattr(node, "post", None)
+            if post is None:  # NotFoundPost / BlockedPost
+                continue
+            item = self._flatten_post_record(post)
+            item.update(reply_to=parent, depth=level)
+            out["replies"].append(item)
+            queue += [(r, post.uri, level + 1) for r in (getattr(node, "replies", None) or [])]
+        return out
+
+    def list_posts(self, actor: str | None = None, limit: int = 30) -> list[dict]:
         """
         List an account's recent posts (newest first) straight from its
         repo on the PDS. `actor` is a handle or DID; defaults to this account.
@@ -394,9 +453,7 @@ class BskyClient:
     def _flatten_repo_record(record, author: str) -> dict:
         def field(obj, *names):
             for name in names:
-                value = (
-                    obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
-                )
+                value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
                 if value is not None:
                     return value
             return None
@@ -428,9 +485,7 @@ class BskyClient:
         )
 
     def _error(self, message: str) -> PostResult:
-        return PostResult(
-            account=self.alias, uri="", cid="", url="", error=message
-        )
+        return PostResult(account=self.alias, uri="", cid="", url="", error=message)
 
     def _send(
         self,
@@ -464,8 +519,7 @@ class BskyClient:
         except Exception as e:
             return self._error(str(e))
 
-    @staticmethod
-    def _check_media_args(image_paths, image_alts, link_card):
+    def _check_media_args(self, image_paths, image_alts, link_card):
         image_paths = image_paths or []
         image_alts = image_alts or []
         if len(image_paths) > MAX_IMAGES:
@@ -475,8 +529,20 @@ class BskyClient:
         if image_paths and link_card:
             raise ValueError("A post cannot have both images and a link card.")
         for path in image_paths:
-            if not Path(path).is_file():
+            if not self._image_exists(path):
                 raise ValueError(f"Image not found: {path}")
+
+    def _image_exists(self, path: str) -> bool:
+        if Path(path).is_file():
+            return True
+        return bool(self.media_store is not None and self.media_store.exists(path))
+
+    def _read_image(self, path: str) -> bytes:
+        if Path(path).is_file():
+            return Path(path).read_bytes()
+        if self.media_store is None:
+            raise FileNotFoundError(path)
+        return self.media_store.read(path)
 
     def _normalize_uri(self, uri: str) -> str:
         """Accept an AT URI or a bsky.app post URL; return an AT URI."""
@@ -515,9 +581,7 @@ class BskyClient:
             parent = StrongRef(uri=parent_uri, cid=parent_cid or parent_post.cid)
             parent_reply = getattr(parent_post.record, "reply", None)
             if parent_reply is not None:
-                root = StrongRef(
-                    uri=parent_reply.root.uri, cid=parent_reply.root.cid
-                )
+                root = StrongRef(uri=parent_reply.root.uri, cid=parent_reply.root.cid)
             else:
                 root = parent
         return at_models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
@@ -527,6 +591,13 @@ class BskyClient:
         F = at_models.AppBskyRichtextFacet
         facets = []
         for f in detect_facets(text):
+            # Spelled out through at_models, not the local alias F: atproto releases without
+            # py.typed (before 0.0.74) make F an untyped variable, which is not valid in an annotation.
+            feature: (
+                at_models.AppBskyRichtextFacet.Link
+                | at_models.AppBskyRichtextFacet.Tag
+                | at_models.AppBskyRichtextFacet.Mention
+            )
             if f.kind == "link":
                 feature = F.Link(uri=f.value)
             elif f.kind == "tag":
@@ -557,29 +628,22 @@ class BskyClient:
 
         quote_uri = self._normalize_uri(quote_uri)
         record = at_models.AppBskyEmbedRecord.Main(
-            record=at_models.ComAtprotoRepoStrongRef.Main(
-                uri=quote_uri, cid=self._fetch_cid(quote_uri)
-            )
+            record=at_models.ComAtprotoRepoStrongRef.Main(uri=quote_uri, cid=self._fetch_cid(quote_uri))
         )
         if media is None:
             return record
         return at_models.AppBskyEmbedRecordWithMedia.Main(record=record, media=media)
 
-    def _build_image_embed(
-        self, image_paths: list[str], image_alts: Optional[list[str]] = None
-    ):
+    def _build_image_embed(self, image_paths: list[str], image_alts: list[str] | None = None):
         """Upload images and return an embed object."""
         image_alts = image_alts or []
         images = []
         for i, path_str in enumerate(image_paths[:MAX_IMAGES]):
             path = Path(path_str)
-            with open(path, "rb") as f:
-                data = f.read()
+            data = self._read_image(path_str)
             blob = self._client.upload_blob(data)
             alt = image_alts[i] if i < len(image_alts) else path.stem
-            images.append(
-                at_models.AppBskyEmbedImages.Image(image=blob.blob, alt=alt)
-            )
+            images.append(at_models.AppBskyEmbedImages.Image(image=blob.blob, alt=alt))
         return at_models.AppBskyEmbedImages.Main(images=images)
 
     def _build_link_card(self, url: str):
@@ -614,14 +678,16 @@ class BskyClient:
         }
 
     def _flatten_post_record(self, post) -> dict:
+        author = getattr(post, "author", None)
+        record = getattr(post, "record", None)
         return {
             "uri": post.uri,
             "cid": post.cid,
-            "author": post.author.handle,
-            "text": post.record.text,
-            "created_at": post.record.created_at,
-            "likes": post.like_count,
-            "reposts": post.repost_count,
+            "author": getattr(author, "handle", None),
+            "text": getattr(record, "text", ""),
+            "created_at": getattr(record, "created_at", None),
+            "likes": getattr(post, "like_count", None),
+            "reposts": getattr(post, "repost_count", None),
             "url": _uri_to_url(post.uri),
         }
 

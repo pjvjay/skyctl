@@ -1,0 +1,313 @@
+{
+  "terraform": {
+    "required_version": ">= 1.6",
+    "required_providers": {
+      "google": {
+        "source": "hashicorp/google",
+        "version": ">= 5.40"
+      },
+      "local": {
+        "source": "hashicorp/local",
+        "version": ">= 2.4"
+      }
+    }
+  },
+  "provider": {
+    "google": {
+      "project": "my-skyctl-project",
+      "region": "europe-west1"
+    }
+  },
+  "variable": {
+    "image": {
+      "type": "string",
+      "default": "ghcr.io/example/skyctl:1.2.0"
+    },
+    "secrets_json": {
+      "type": "string",
+      "description": "The BSKY_* / API-key map as JSON or dotenv text.",
+      "sensitive": true
+    },
+    "http_token": {
+      "type": "string",
+      "sensitive": true
+    }
+  },
+  "data": {
+    "google_project": {
+      "this": {}
+    }
+  },
+  "resource": {
+    "google_project_service": {
+      "run": {
+        "service": "run.googleapis.com",
+        "disable_on_destroy": false
+      },
+      "cloudscheduler": {
+        "service": "cloudscheduler.googleapis.com",
+        "disable_on_destroy": false
+      },
+      "secretmanager": {
+        "service": "secretmanager.googleapis.com",
+        "disable_on_destroy": false
+      },
+      "pubsub": {
+        "service": "pubsub.googleapis.com",
+        "disable_on_destroy": false
+      },
+      "cloudtasks": {
+        "service": "cloudtasks.googleapis.com",
+        "disable_on_destroy": false
+      },
+      "aiplatform": {
+        "service": "aiplatform.googleapis.com",
+        "disable_on_destroy": false
+      },
+      "iam": {
+        "service": "iam.googleapis.com",
+        "disable_on_destroy": false
+      }
+    },
+    "google_service_account": {
+      "runtime": {
+        "account_id": "skyctl-run",
+        "display_name": "skyctl runtime"
+      }
+    },
+    "google_secret_manager_secret": {
+      "config": {
+        "secret_id": "skyctl-config",
+        "replication": {
+          "auto": {}
+        },
+        "depends_on": [
+          "google_project_service.run",
+          "google_project_service.cloudscheduler",
+          "google_project_service.secretmanager",
+          "google_project_service.pubsub",
+          "google_project_service.cloudtasks",
+          "google_project_service.aiplatform",
+          "google_project_service.iam"
+        ]
+      },
+      "http_token": {
+        "secret_id": "skyctl-http-token",
+        "replication": {
+          "auto": {}
+        },
+        "depends_on": [
+          "google_project_service.run",
+          "google_project_service.cloudscheduler",
+          "google_project_service.secretmanager",
+          "google_project_service.pubsub",
+          "google_project_service.cloudtasks",
+          "google_project_service.aiplatform",
+          "google_project_service.iam"
+        ]
+      }
+    },
+    "google_secret_manager_secret_version": {
+      "config": {
+        "secret": "${google_secret_manager_secret.config.id}",
+        "secret_data": "${var.secrets_json}"
+      },
+      "http_token": {
+        "secret": "${google_secret_manager_secret.http_token.id}",
+        "secret_data": "${var.http_token}"
+      }
+    },
+    "google_secret_manager_secret_iam_member": {
+      "config": {
+        "secret_id": "${google_secret_manager_secret.config.id}",
+        "role": "roles/secretmanager.secretAccessor",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      },
+      "http_token": {
+        "secret_id": "${google_secret_manager_secret.http_token.id}",
+        "role": "roles/secretmanager.secretAccessor",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      }
+    },
+    "google_storage_bucket": {
+      "state": {
+        "name": "my-skyctl-project-skyctl-state",
+        "location": "europe-west1",
+        "uniform_bucket_level_access": true,
+        "public_access_prevention": "enforced",
+        "versioning": {
+          "enabled": true
+        },
+        "lifecycle_rule": [
+          {
+            "condition": {
+              "age": 90,
+              "matches_prefix": [
+                "skyctl/runs/",
+                "skyctl/ledger/"
+              ]
+            },
+            "action": {
+              "type": "Delete"
+            }
+          },
+          {
+            "condition": {
+              "days_since_noncurrent_time": 30
+            },
+            "action": {
+              "type": "Delete"
+            }
+          }
+        ],
+        "lifecycle": {
+          "prevent_destroy": true
+        }
+      }
+    },
+    "google_storage_bucket_iam_member": {
+      "runtime": {
+        "bucket": "${google_storage_bucket.state.name}",
+        "role": "roles/storage.objectAdmin",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      }
+    },
+    "google_storage_bucket_object": {
+      "tasks": {
+        "name": "skyctl/config/tasks.toml",
+        "bucket": "${google_storage_bucket.state.name}",
+        "content": "# Rendered by skyctl deploy from the deployment spec. Do not edit by hand.\n\n[tasks.daily-engagement]\ngoal = \"Read the work account's notifications and draft replies to genuine product questions.\"\naccounts = [\"work\"]\nallow_writes = true\nmax_writes = 5\napproval = \"writes\"\n",
+        "content_type": "application/toml"
+      }
+    },
+    "google_pubsub_topic": {
+      "work": {
+        "name": "skyctl-work",
+        "depends_on": [
+          "google_project_service.run",
+          "google_project_service.cloudscheduler",
+          "google_project_service.secretmanager",
+          "google_project_service.pubsub",
+          "google_project_service.cloudtasks",
+          "google_project_service.aiplatform",
+          "google_project_service.iam"
+        ]
+      },
+      "dlq": {
+        "name": "skyctl-work-dlq",
+        "depends_on": [
+          "google_project_service.run",
+          "google_project_service.cloudscheduler",
+          "google_project_service.secretmanager",
+          "google_project_service.pubsub",
+          "google_project_service.cloudtasks",
+          "google_project_service.aiplatform",
+          "google_project_service.iam"
+        ]
+      }
+    },
+    "google_pubsub_topic_iam_member": {
+      "runtime_publish": {
+        "topic": "${google_pubsub_topic.work.name}",
+        "role": "roles/pubsub.publisher",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      },
+      "agent_dlq": {
+        "topic": "${google_pubsub_topic.dlq.name}",
+        "role": "roles/pubsub.publisher",
+        "member": "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+      }
+    },
+    "google_project_iam_member": {
+      "vertex": {
+        "project": "my-skyctl-project",
+        "role": "roles/aiplatform.user",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      },
+      "keda_metrics": {
+        "project": "my-skyctl-project",
+        "role": "roles/monitoring.viewer",
+        "member": "principal://iam.googleapis.com/projects/${data.google_project.this.number}/locations/global/workloadIdentityPools/my-skyctl-project.svc.id.goog/subject/ns/keda/sa/keda-operator"
+      }
+    },
+    "google_pubsub_subscription": {
+      "work": {
+        "name": "skyctl-work-pull",
+        "topic": "${google_pubsub_topic.work.id}",
+        "ack_deadline_seconds": 600,
+        "dead_letter_policy": {
+          "dead_letter_topic": "${google_pubsub_topic.dlq.id}",
+          "max_delivery_attempts": 5
+        },
+        "retry_policy": {
+          "minimum_backoff": "10s",
+          "maximum_backoff": "600s"
+        }
+      }
+    },
+    "google_pubsub_subscription_iam_member": {
+      "agent_ack": {
+        "subscription": "${google_pubsub_subscription.work.name}",
+        "role": "roles/pubsub.subscriber",
+        "member": "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+      },
+      "runtime_pull": {
+        "subscription": "${google_pubsub_subscription.work.name}",
+        "role": "roles/pubsub.subscriber",
+        "member": "serviceAccount:${google_service_account.runtime.email}"
+      }
+    },
+    "google_service_account_iam_member": {
+      "workload_identity": {
+        "service_account_id": "${google_service_account.runtime.name}",
+        "role": "roles/iam.workloadIdentityUser",
+        "member": "serviceAccount:my-skyctl-project.svc.id.goog[skyctl/skyctl]"
+      }
+    },
+    "local_file": {
+      "k8s_bind": {
+        "filename": "bind.json",
+        "file_permission": "0644",
+        "content": "{\n  \"apiVersion\": \"v1\",\n  \"kind\": \"List\",\n  \"items\": [\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"Namespace\",\n      \"metadata\": {\n        \"name\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"ServiceAccount\",\n      \"metadata\": {\n        \"name\": \"skyctl\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        },\n        \"annotations\": {\n          \"iam.gke.io/gcp-service-account\": \"${google_service_account.runtime.email}\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"ConfigMap\",\n      \"metadata\": {\n        \"name\": \"skyctl-env\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      },\n      \"data\": {\n        \"SKYCTL_PLATFORM\": \"kubernetes\",\n        \"SKYCTL_COMPUTE\": \"deployment\",\n        \"SKYCTL_SECRETS\": \"gcp-sm://my-skyctl-project/skyctl-config,gcp-sm://my-skyctl-project/skyctl-http-token#SKYCTL_HTTP_TOKEN\",\n        \"SKYCTL_STATE_URL\": \"gs://${google_storage_bucket.state.name}/skyctl\",\n        \"SKYCTL_QUEUE_URL\": \"pubsub://my-skyctl-project/skyctl-work?subscription=skyctl-work-pull\",\n        \"SKYCTL_DELAYED_URL\": \"none\",\n        \"SKYCTL_AGENT_MODEL\": \"vertex:claude-opus-5-5\",\n        \"SKYCTL_AGENT_ALLOW_WRITES\": \"true\",\n        \"SKYCTL_AGENT_ALLOW_DELETE\": \"false\",\n        \"SKYCTL_AGENT_MAX_WRITES\": \"5\",\n        \"SKYCTL_AGENT_MAX_TURNS\": \"25\",\n        \"SKYCTL_AGENT_MAX_SECONDS\": \"540\",\n        \"SKYCTL_AGENT_ACCOUNTS\": \"work\",\n        \"SKYCTL_LOG_FORMAT\": \"json\",\n        \"SKYCTL_AUTH\": \"bearer\",\n        \"SKYCTL_HTTP_MCP\": \"true\",\n        \"SKYCTL_SEARCH_URL\": \"gdelt://\",\n        \"GOOGLE_CLOUD_PROJECT\": \"my-skyctl-project\",\n        \"CLOUD_ML_REGION\": \"europe-west1\"\n      }\n    },\n    {\n      \"apiVersion\": \"keda.sh/v1alpha1\",\n      \"kind\": \"TriggerAuthentication\",\n      \"metadata\": {\n        \"name\": \"skyctl-keda\",\n        \"namespace\": \"skyctl\"\n      },\n      \"spec\": {\n        \"podIdentity\": {\n          \"provider\": \"gcp\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"keda.sh/v1alpha1\",\n      \"kind\": \"ScaledJob\",\n      \"metadata\": {\n        \"name\": \"skyctl-worker\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      },\n      \"spec\": {\n        \"jobTargetRef\": {\n          \"backoffLimit\": 0,\n          \"template\": {\n            \"metadata\": {\n              \"labels\": {\n                \"app.kubernetes.io/name\": \"skyctl\",\n                \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n              }\n            },\n            \"spec\": {\n              \"serviceAccountName\": \"skyctl\",\n              \"restartPolicy\": \"Never\",\n              \"securityContext\": {\n                \"runAsNonRoot\": true,\n                \"runAsUser\": 10001,\n                \"seccompProfile\": {\n                  \"type\": \"RuntimeDefault\"\n                }\n              },\n              \"containers\": [\n                {\n                  \"name\": \"skyctl\",\n                  \"image\": \"ghcr.io/example/skyctl:1.2.0\",\n                  \"args\": [\n                    \"worker\",\n                    \"--once\"\n                  ],\n                  \"envFrom\": [\n                    {\n                      \"configMapRef\": {\n                        \"name\": \"skyctl-env\"\n                      }\n                    }\n                  ],\n                  \"env\": [\n                    {\n                      \"name\": \"SKYCTL_COMPUTE\",\n                      \"value\": \"keda\"\n                    }\n                  ],\n                  \"securityContext\": {\n                    \"allowPrivilegeEscalation\": false,\n                    \"readOnlyRootFilesystem\": true,\n                    \"capabilities\": {\n                      \"drop\": [\n                        \"ALL\"\n                      ]\n                    }\n                  },\n                  \"resources\": {\n                    \"requests\": {\n                      \"cpu\": \"250m\",\n                      \"memory\": \"512Mi\"\n                    },\n                    \"limits\": {\n                      \"memory\": \"512Mi\"\n                    }\n                  },\n                  \"volumeMounts\": [\n                    {\n                      \"name\": \"tmp\",\n                      \"mountPath\": \"/tmp\"\n                    }\n                  ]\n                }\n              ],\n              \"volumes\": [\n                {\n                  \"name\": \"tmp\",\n                  \"emptyDir\": {}\n                }\n              ]\n            }\n          }\n        },\n        \"pollingInterval\": 30,\n        \"maxReplicaCount\": 2,\n        \"triggers\": [\n          {\n            \"type\": \"gcp-pubsub\",\n            \"metadata\": {\n              \"subscriptionName\": \"projects/my-skyctl-project/subscriptions/skyctl-work-pull\",\n              \"mode\": \"SubscriptionSize\",\n              \"value\": \"1\"\n            },\n            \"authenticationRef\": {\n              \"name\": \"skyctl-keda\"\n            }\n          }\n        ]\n      }\n    }\n  ]\n}\n"
+      }
+    }
+  },
+  "output": {
+    "env": {
+      "value": {
+        "SKYCTL_PLATFORM": "kubernetes",
+        "SKYCTL_COMPUTE": "deployment",
+        "SKYCTL_SECRETS": "gcp-sm://my-skyctl-project/skyctl-config,gcp-sm://my-skyctl-project/skyctl-http-token#SKYCTL_HTTP_TOKEN",
+        "SKYCTL_STATE_URL": "gs://${google_storage_bucket.state.name}/skyctl",
+        "SKYCTL_QUEUE_URL": "pubsub://my-skyctl-project/skyctl-work?subscription=skyctl-work-pull",
+        "SKYCTL_DELAYED_URL": "none",
+        "SKYCTL_AGENT_MODEL": "vertex:claude-opus-5-5",
+        "SKYCTL_AGENT_ALLOW_WRITES": "true",
+        "SKYCTL_AGENT_ALLOW_DELETE": "false",
+        "SKYCTL_AGENT_MAX_WRITES": "5",
+        "SKYCTL_AGENT_MAX_TURNS": "25",
+        "SKYCTL_AGENT_MAX_SECONDS": "540",
+        "SKYCTL_AGENT_ACCOUNTS": "work",
+        "SKYCTL_LOG_FORMAT": "json",
+        "SKYCTL_AUTH": "bearer",
+        "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
+        "GOOGLE_CLOUD_PROJECT": "my-skyctl-project",
+        "CLOUD_ML_REGION": "europe-west1"
+      }
+    },
+    "state_url": {
+      "value": "gs://${google_storage_bucket.state.name}/skyctl"
+    },
+    "skyctl_connection": {
+      "value": {
+        "platform": "gcp",
+        "state_url": "gs://${google_storage_bucket.state.name}/skyctl",
+        "queue_url": "pubsub://my-skyctl-project/skyctl-work?subscription=skyctl-work-pull",
+        "env": {
+          "GOOGLE_CLOUD_PROJECT": "my-skyctl-project"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,115 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Managed serverless on every cloud: ECS/Lambda, Container Apps, Cloud Run
+# (+ a bring-your-own Kubernetes cluster and Compose).
+# kubernetes.deploy.toml has the SAME intent on EKS, AKS and GKE.
+#
+#   skyctl deploy check  deploy/examples/managed.deploy.toml
+#   skyctl deploy render deploy/examples/managed.deploy.toml --target gcp --out build
+#
+# Everything above [targets] is cloud-neutral intent. Secrets are never
+# written here: Terraform targets take them as sensitive variables
+# (TF_VAR_secrets_json), Kubernetes and Compose reference existing secrets.
+
+[app]
+name = "skyctl"
+image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/skyctl:1.2.0"
+
+[runtime]
+model = "anthropic:claude-opus-5-5"
+log_format = "json"
+delayed_delivery = true
+search = "gdelt://"           # web/news search for agents (brave:// / tavily:// need a key in the secrets map)
+
+[policy]                      # ceilings for every agent run, identical on every target
+allow_writes = true
+allow_delete = false
+max_writes = 5
+max_turns = 25
+max_run_seconds = 540
+accounts = ["work"]
+
+[service]                     # /mcp, /runs, /invoke
+enabled = true
+public = false
+min_instances = 0
+max_instances = 2
+auth = ["bearer"]
+
+[worker]
+enabled = true
+max_concurrency = 2
+visibility_seconds = 900
+max_attempts = 5
+poll_minutes = 1              # Azure Container Apps drains the Storage Queue on this schedule
+
+[state]                       # the bucket holding the JSON job document; created on every cloud target
+versioning = true
+retention_days = 90           # runs/ and ledger/ expire after this
+protect = true                # prevent_destroy: `terraform destroy` keeps the scheduled posts
+
+[[schedules]]
+name = "tick"
+cron = "*/5 * * * *"
+invoke = { kind = "tick" }
+timeout_s = 300
+
+[[schedules]]
+name = "daily-engagement"
+cron = "0 9 * * mon-fri"
+timezone = "UTC"              # Azure Container Apps Jobs are UTC-only; validate() enforces it
+invoke = { kind = "task.run", task = "daily-engagement" }
+timeout_s = 900
+
+[tasks.daily-engagement]
+goal = "Read the work account's notifications and draft replies to genuine product questions."
+accounts = ["work"]
+allow_writes = true
+max_writes = 5
+approval = "writes"
+
+[targets.aws]
+region = "us-east-1"
+compute = "ecs"               # or "lambda"; "eks" → see kubernetes.deploy.toml
+model = "bedrock:anthropic.claude-opus-5-5"
+vpc_id = "vpc-0123456789abcdef0"
+subnet_ids = ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"]
+security_group_ids = []
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+
+[targets.azure]
+location = "westeurope"
+compute = "container-apps"    # Storage Queues; worker drains every poll_minutes
+model = "azure-openai:gpt-4.1"
+openai_endpoint = "https://skyctl-openai.openai.azure.com"
+
+[targets.gcp]
+project = "my-skyctl-project"
+region = "europe-west1"
+compute = "cloud-run"
+model = "vertex:claude-opus-5-5"
+
+[targets.kubernetes]
+namespace = "skyctl"
+cloud = "aws"
+identity = "arn:aws:iam::123456789012:role/skyctl-eks"
+state_url = "s3://my-skyctl-state/skyctl"
+queue_url = "sqs://sqs.us-east-1.amazonaws.com/123456789012/skyctl-work"
+keda = true
+extra_env = { AWS_REGION = "us-east-1" }
+
+[targets.compose]
+port = 8080

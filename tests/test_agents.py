@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Agents, tested against an in-memory PDS and scripted models."""
 
 import json
@@ -7,6 +22,7 @@ import pytest
 from click.testing import CliRunner
 
 import skyctl.client as client_mod
+from conftest import FakeAtProto, require
 from skyctl import AccountConfig, BskyManager
 from skyctl.agents import (
     AgentConfigError,
@@ -29,8 +45,6 @@ from skyctl.llm import (
     register_provider,
 )
 from skyctl.richtext import grapheme_len
-
-from conftest import FakeAtProto
 
 PDS = "http://localhost:2583"
 
@@ -79,9 +93,7 @@ class FakePDS(FakeAtProto):
         record = SimpleNamespace(
             uri=f"at://{self.me.did}/app.bsky.feed.post/{n:04d}",
             cid=f"cid{n}",
-            value=SimpleNamespace(
-                text=text, created_at=f"2026-01-01T00:00:{n:02d}Z", reply=reply_to
-            ),
+            value=SimpleNamespace(text=text, created_at=f"2026-01-01T00:00:{n:02d}Z", reply=reply_to),
         )
         FakePDS.repos[self.me.did].insert(0, record)
         return SimpleNamespace(uri=record.uri, cid=record.cid)
@@ -118,16 +130,16 @@ def pds(monkeypatch):
     monkeypatch.setattr(client_mod, "AtProtoClient", FakePDS)
     # Link cards would otherwise fetch the source page.
     monkeypatch.setattr(
-        client_mod, "fetch_link_metadata",
+        client_mod,
+        "fetch_link_metadata",
         lambda url: {"title": url, "description": "", "thumb": None},
     )
 
 
 def make_manager(pds_url=PDS):
-    return BskyManager({
-        alias: AccountConfig(alias, f"{alias}.test", "pw", pds_url=pds_url)
-        for alias in ("olive", "sam")
-    })
+    return BskyManager(
+        {alias: AccountConfig(alias, f"{alias}.test", "pw", pds_url=pds_url) for alias in ("olive", "sam")}
+    )
 
 
 @pytest.fixture
@@ -142,8 +154,11 @@ def group(pds, tmp_path):
         return scripts["sam" if spec == "script:other" else "olive"]
 
     g = AgentGroup.from_config(
-        "newsroom", config_file, manager=make_manager(),
-        llm_factory=factory, transcript_dir=tmp_path / "log",
+        "newsroom",
+        config_file,
+        manager=make_manager(),
+        llm_factory=factory,
+        transcript_dir=tmp_path / "log",
     )
     g.scripts, g.made = scripts, made
     return g
@@ -151,16 +166,20 @@ def group(pds, tmp_path):
 
 # -- guard rails -------------------------------------------------------
 
-@pytest.mark.parametrize("url,public", [
-    (None, True),
-    ("", True),
-    ("https://bsky.social", True),
-    ("https://morel.us-east.host.bsky.network", True),
-    ("bsky.social", True),
-    ("http://localhost:2583", False),
-    ("https://pds.lab.example", False),
-    ("https://notbsky.social.example", False),
-])
+
+@pytest.mark.parametrize(
+    ("url", "public"),
+    [
+        (None, True),
+        ("", True),
+        ("https://bsky.social", True),
+        ("https://morel.us-east.host.bsky.network", True),
+        ("bsky.social", True),
+        ("http://localhost:2583", False),
+        ("https://pds.lab.example", False),
+        ("https://notbsky.social.example", False),
+    ],
+)
 def test_is_public_network(url, public):
     assert is_public_network(url) is public
 
@@ -190,6 +209,7 @@ def test_pds_url_is_loaded_and_used(pds, tmp_path, monkeypatch):
 
 # -- config ------------------------------------------------------------
 
+
 def test_load_config_with_personality(tmp_path):
     f = tmp_path / "agents.toml"
     f.write_text(CONFIG)
@@ -203,14 +223,17 @@ def test_load_config_with_personality(tmp_path):
     assert g.web_search is True and g.link_cards is True
 
 
-@pytest.mark.parametrize("bad", [
-    '[groups.g]\nmembers = []\n[agents.a]\npersona = "x"',
-    '[groups.g]\nmembers = ["a", "ghost"]\n[agents.a]\npersona = "x"',
-    '[groups.g]\nmembers = ["a"]\n[agents.a]\nname = "A"',
-    '[agents.a]\npersona = "x"',
-    '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"\n[agents.a.personality]\nmbti = "ABCD"',
-    '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"\npersonality = "INTJ"',
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        '[groups.g]\nmembers = []\n[agents.a]\npersona = "x"',
+        '[groups.g]\nmembers = ["a", "ghost"]\n[agents.a]\npersona = "x"',
+        '[groups.g]\nmembers = ["a"]\n[agents.a]\nname = "A"',
+        '[agents.a]\npersona = "x"',
+        '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"\n[agents.a.personality]\nmbti = "ABCD"',
+        '[groups.g]\nmembers = ["a"]\n[agents.a]\npersona = "x"\npersonality = "INTJ"',
+    ],
+)
 def test_bad_config(tmp_path, bad):
     f = tmp_path / "agents.toml"
     f.write_text(bad)
@@ -226,6 +249,7 @@ def test_account_must_exist(pds, tmp_path):
 
 
 # -- text helpers ------------------------------------------------------
+
 
 def test_parse_items():
     raw = (
@@ -246,6 +270,7 @@ def test_fit_to_post():
 
 
 # -- research ----------------------------------------------------------
+
 
 def test_research_searches_and_posts_with_link_card(group):
     group.scripts["olive"].answers = [ITEM.format("Paris cut traffic 40%. More of this!")]
@@ -269,10 +294,17 @@ def test_system_prompt_carries_the_whole_character(group):
     group.research(agent="olive", dry_run=True)
     system = group.scripts["olive"].calls[0]["system"]
     for expected in (
-        "You are Olive", "An urban planner.", "Myers-Briggs type ENFP",
-        "- E: energised", "- P: open-ended", "Traits: enthusiastic",
-        "Values: community", "Tone: warm", "People before cars.",
-        "urban design, air quality", "Upbeat, short sentences.",
+        "You are Olive",
+        "An urban planner.",
+        "Myers-Briggs type ENFP",
+        "- E: energised",
+        "- P: open-ended",
+        "Traits: enthusiastic",
+        "Values: community",
+        "Tone: warm",
+        "People before cars.",
+        "urban design, air quality",
+        "Upbeat, short sentences.",
     ):
         assert expected in system
 
@@ -299,9 +331,7 @@ def test_agent_is_told_what_it_already_posted(group):
 
 
 def test_max_posts_and_topic(group):
-    group.scripts["olive"].answers = [
-        "".join(ITEM.format(n) for n in ("one", "two", "three"))
-    ]
+    group.scripts["olive"].answers = ["".join(ITEM.format(n) for n in ("one", "two", "three"))]
     actions = group.research(agent="olive", topic="Tram lines", max_posts=2)
     assert [a.text for a in actions] == ["one", "two"]
     assert all(a.topic == "Tram lines" for a in actions)
@@ -352,6 +382,7 @@ def test_failures_are_reported(group):
 
 # -- model backends ----------------------------------------------------
 
+
 def test_parse_model_spec(monkeypatch):
     monkeypatch.delenv("SKYCTL_AGENT_MODEL", raising=False)
     assert parse_model_spec(None) == ("anthropic", "claude-opus-5-5")
@@ -387,26 +418,32 @@ class FakeAnthropic:
 
 
 def test_anthropic_provider_request_shape():
-    fake = FakeAnthropic(SimpleNamespace(
-        stop_reason="end_turn",
-        content=[SimpleNamespace(type="thinking"), _text("Hello "), _text("world")],
-    ))
+    require("anthropic")
+    fake = FakeAnthropic(
+        SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="thinking"), _text("Hello "), _text("world")],
+        )
+    )
     out = AnthropicProvider("claude-opus-5-5", effort="low", client=fake).complete("sys", "hi")
     assert out == "Hello world"
     call = fake.calls[0]
     assert call["model"] == "claude-opus-5-5" and call["system"] == "sys"
     assert call["messages"] == [{"role": "user", "content": "hi"}]
     assert call["output_config"] == {"effort": "low"}
-    assert call["fallbacks"] == "default" and "tools" not in call
+    # Sent in the JSON body (extra_body) so SDK versions without a typed `fallbacks` argument work too.
+    assert call["extra_body"] == {"fallbacks": "default"} and "tools" not in call
 
 
 def test_anthropic_provider_no_fallback_param_on_other_models():
+    require("anthropic")
     fake = FakeAnthropic(SimpleNamespace(stop_reason="end_turn", content=[_text("ok")]))
     AnthropicProvider("claude-haiku-5-5", client=fake).complete("s", "p")
-    assert "fallbacks" not in fake.calls[0] and "betas" not in fake.calls[0]
+    assert "extra_body" not in fake.calls[0] and "betas" not in fake.calls[0]
 
 
 def test_anthropic_provider_web_search_resumes_paused_turn():
+    require("anthropic")
     paused = SimpleNamespace(stop_reason="pause_turn", content=["partial"])
     done = SimpleNamespace(stop_reason="end_turn", content=[_text("found it")])
     fake = FakeAnthropic(paused, done)
@@ -417,6 +454,7 @@ def test_anthropic_provider_web_search_resumes_paused_turn():
 
 
 def test_anthropic_provider_refusal():
+    require("anthropic")
     fake = FakeAnthropic(SimpleNamespace(stop_reason="refusal", content=[]))
     with pytest.raises(LLMRefusal):
         AnthropicProvider("claude-opus-5-5", client=fake).complete("s", "p")
@@ -441,14 +479,13 @@ def test_openai_compat_provider(monkeypatch):
     assert seen["headers"] == {"Authorization": "Bearer k"}
     assert seen["json"]["messages"][0] == {"role": "system", "content": "sys"}
 
-    monkeypatch.setattr(
-        httpx, "post", lambda *a, **k: SimpleNamespace(status_code=500, text="down")
-    )
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: SimpleNamespace(status_code=500, text="down"))
     with pytest.raises(LLMError, match="500"):
         OpenAICompatProvider("m", "http://x/v1").complete("s", "p")
 
 
 # -- CLI ---------------------------------------------------------------
+
 
 @pytest.fixture
 def cli_env(pds, tmp_path, monkeypatch):

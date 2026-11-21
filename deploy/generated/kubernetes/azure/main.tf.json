@@ -1,0 +1,295 @@
+{
+  "terraform": {
+    "required_version": ">= 1.6",
+    "required_providers": {
+      "azurerm": {
+        "source": "hashicorp/azurerm",
+        "version": "~> 3.110"
+      },
+      "random": {
+        "source": "hashicorp/random",
+        "version": ">= 3.5"
+      },
+      "local": {
+        "source": "hashicorp/local",
+        "version": ">= 2.4"
+      }
+    }
+  },
+  "provider": {
+    "azurerm": {
+      "features": {},
+      "storage_use_azuread": true
+    }
+  },
+  "variable": {
+    "image": {
+      "type": "string",
+      "default": "ghcr.io/example/skyctl:1.2.0"
+    },
+    "secrets_json": {
+      "type": "string",
+      "description": "The BSKY_* / API-key map as JSON or dotenv text.",
+      "sensitive": true
+    },
+    "http_token": {
+      "type": "string",
+      "sensitive": true
+    }
+  },
+  "data": {
+    "azurerm_client_config": {
+      "current": {}
+    },
+    "azurerm_kubernetes_cluster": {
+      "aks": {
+        "name": "platform-prod",
+        "resource_group_name": "platform-rg"
+      }
+    }
+  },
+  "resource": {
+    "random_string": {
+      "suffix": {
+        "length": 6,
+        "upper": false,
+        "special": false,
+        "numeric": true
+      }
+    },
+    "azurerm_resource_group": {
+      "main": {
+        "name": "skyctl-rg",
+        "location": "westeurope"
+      }
+    },
+    "azurerm_user_assigned_identity": {
+      "app": {
+        "name": "skyctl-id",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}"
+      }
+    },
+    "azurerm_key_vault": {
+      "main": {
+        "name": "skyctl-kv-${random_string.suffix.result}",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "tenant_id": "${data.azurerm_client_config.current.tenant_id}",
+        "sku_name": "standard",
+        "enable_rbac_authorization": true,
+        "purge_protection_enabled": false,
+        "soft_delete_retention_days": 7
+      }
+    },
+    "azurerm_role_assignment": {
+      "kv_deployer": {
+        "scope": "${azurerm_key_vault.main.id}",
+        "role_definition_name": "Key Vault Secrets Officer",
+        "principal_id": "${data.azurerm_client_config.current.object_id}"
+      },
+      "kv_app": {
+        "scope": "${azurerm_key_vault.main.id}",
+        "role_definition_name": "Key Vault Secrets User",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "blob_deployer": {
+        "scope": "${azurerm_storage_account.state.id}",
+        "role_definition_name": "Storage Blob Data Contributor",
+        "principal_id": "${data.azurerm_client_config.current.object_id}"
+      },
+      "queue_deployer": {
+        "scope": "${azurerm_storage_account.state.id}",
+        "role_definition_name": "Storage Queue Data Contributor",
+        "principal_id": "${data.azurerm_client_config.current.object_id}"
+      },
+      "blob_app": {
+        "scope": "${azurerm_storage_container.state.resource_manager_id}",
+        "role_definition_name": "Storage Blob Data Contributor",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "queue_app": {
+        "scope": "${azurerm_storage_queue.work.resource_manager_id}",
+        "role_definition_name": "Storage Queue Data Contributor",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      },
+      "poison_app": {
+        "scope": "${azurerm_storage_queue.poison.resource_manager_id}",
+        "role_definition_name": "Storage Queue Data Contributor",
+        "principal_id": "${azurerm_user_assigned_identity.app.principal_id}"
+      }
+    },
+    "azurerm_key_vault_secret": {
+      "config": {
+        "name": "skyctl-config",
+        "value": "${var.secrets_json}",
+        "key_vault_id": "${azurerm_key_vault.main.id}",
+        "depends_on": [
+          "azurerm_role_assignment.kv_deployer"
+        ]
+      },
+      "http_token": {
+        "name": "skyctl-http-token",
+        "value": "${var.http_token}",
+        "key_vault_id": "${azurerm_key_vault.main.id}",
+        "depends_on": [
+          "azurerm_role_assignment.kv_deployer"
+        ]
+      }
+    },
+    "azurerm_storage_account": {
+      "state": {
+        "name": "skyctl${random_string.suffix.result}",
+        "location": "westeurope",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "account_tier": "Standard",
+        "account_replication_type": "LRS",
+        "min_tls_version": "TLS1_2",
+        "allow_nested_items_to_be_public": false,
+        "shared_access_key_enabled": false,
+        "blob_properties": {
+          "versioning_enabled": true
+        },
+        "lifecycle": {
+          "prevent_destroy": true
+        }
+      }
+    },
+    "azurerm_storage_container": {
+      "state": {
+        "name": "skyctl",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "container_access_type": "private",
+        "depends_on": [
+          "azurerm_role_assignment.blob_deployer"
+        ]
+      }
+    },
+    "azurerm_storage_queue": {
+      "work": {
+        "name": "skyctl-work",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "depends_on": [
+          "azurerm_role_assignment.queue_deployer"
+        ]
+      },
+      "poison": {
+        "name": "skyctl-work-poison",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "depends_on": [
+          "azurerm_role_assignment.queue_deployer"
+        ]
+      }
+    },
+    "azurerm_storage_management_policy": {
+      "state": {
+        "storage_account_id": "${azurerm_storage_account.state.id}",
+        "rule": [
+          {
+            "name": "expire-runs-and-ledger",
+            "enabled": true,
+            "filters": {
+              "prefix_match": [
+                "skyctl/skyctl/runs/",
+                "skyctl/skyctl/ledger/"
+              ],
+              "blob_types": [
+                "blockBlob"
+              ]
+            },
+            "actions": {
+              "base_blob": {
+                "delete_after_days_since_modification_greater_than": 90
+              },
+              "version": {
+                "delete_after_days_since_creation": 30
+              }
+            }
+          }
+        ]
+      }
+    },
+    "azurerm_storage_blob": {
+      "tasks": {
+        "name": "skyctl/config/tasks.toml",
+        "storage_account_name": "${azurerm_storage_account.state.name}",
+        "storage_container_name": "${azurerm_storage_container.state.name}",
+        "type": "Block",
+        "source_content": "# Rendered by skyctl deploy from the deployment spec. Do not edit by hand.\n\n[tasks.daily-engagement]\ngoal = \"Read the work account's notifications and draft replies to genuine product questions.\"\naccounts = [\"work\"]\nallow_writes = true\nmax_writes = 5\napproval = \"writes\"\n",
+        "content_type": "application/toml"
+      }
+    },
+    "azurerm_federated_identity_credential": {
+      "k8s_app": {
+        "name": "skyctl-k8s-app",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "parent_id": "${azurerm_user_assigned_identity.app.id}",
+        "audience": [
+          "api://AzureADTokenExchange"
+        ],
+        "issuer": "${data.azurerm_kubernetes_cluster.aks.oidc_issuer_url}",
+        "subject": "system:serviceaccount:skyctl:skyctl"
+      },
+      "k8s_keda": {
+        "name": "skyctl-k8s-keda",
+        "resource_group_name": "${azurerm_resource_group.main.name}",
+        "parent_id": "${azurerm_user_assigned_identity.app.id}",
+        "audience": [
+          "api://AzureADTokenExchange"
+        ],
+        "issuer": "${data.azurerm_kubernetes_cluster.aks.oidc_issuer_url}",
+        "subject": "system:serviceaccount:keda:keda-operator"
+      }
+    },
+    "local_file": {
+      "k8s_bind": {
+        "filename": "bind.json",
+        "file_permission": "0644",
+        "content": "{\n  \"apiVersion\": \"v1\",\n  \"kind\": \"List\",\n  \"items\": [\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"Namespace\",\n      \"metadata\": {\n        \"name\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"ServiceAccount\",\n      \"metadata\": {\n        \"name\": \"skyctl\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        },\n        \"annotations\": {\n          \"azure.workload.identity/client-id\": \"${azurerm_user_assigned_identity.app.client_id}\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"v1\",\n      \"kind\": \"ConfigMap\",\n      \"metadata\": {\n        \"name\": \"skyctl-env\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      },\n      \"data\": {\n        \"SKYCTL_PLATFORM\": \"kubernetes\",\n        \"SKYCTL_COMPUTE\": \"deployment\",\n        \"SKYCTL_SECRETS\": \"azure-kv://${azurerm_key_vault.main.name}/skyctl-config,azure-kv://${azurerm_key_vault.main.name}/skyctl-http-token#SKYCTL_HTTP_TOKEN\",\n        \"SKYCTL_STATE_URL\": \"az://skyctl/skyctl\",\n        \"SKYCTL_QUEUE_URL\": \"azqueue://${azurerm_storage_account.state.name}/skyctl-work\",\n        \"SKYCTL_DELAYED_URL\": \"queue\",\n        \"SKYCTL_AGENT_MODEL\": \"azure-openai:gpt-4.1\",\n        \"SKYCTL_AGENT_ALLOW_WRITES\": \"true\",\n        \"SKYCTL_AGENT_ALLOW_DELETE\": \"false\",\n        \"SKYCTL_AGENT_MAX_WRITES\": \"5\",\n        \"SKYCTL_AGENT_MAX_TURNS\": \"25\",\n        \"SKYCTL_AGENT_MAX_SECONDS\": \"540\",\n        \"SKYCTL_AGENT_ACCOUNTS\": \"work\",\n        \"SKYCTL_LOG_FORMAT\": \"json\",\n        \"SKYCTL_AUTH\": \"bearer\",\n        \"SKYCTL_HTTP_MCP\": \"true\",\n        \"SKYCTL_SEARCH_URL\": \"gdelt://\",\n        \"AZURE_CLIENT_ID\": \"${azurerm_user_assigned_identity.app.client_id}\",\n        \"AZURE_STORAGE_ACCOUNT_NAME\": \"${azurerm_storage_account.state.name}\",\n        \"AZURE_TENANT_ID\": \"${data.azurerm_client_config.current.tenant_id}\",\n        \"AZURE_OPENAI_ENDPOINT\": \"https://skyctl-openai.openai.azure.com\"\n      }\n    },\n    {\n      \"apiVersion\": \"keda.sh/v1alpha1\",\n      \"kind\": \"TriggerAuthentication\",\n      \"metadata\": {\n        \"name\": \"skyctl-keda\",\n        \"namespace\": \"skyctl\"\n      },\n      \"spec\": {\n        \"podIdentity\": {\n          \"provider\": \"azure-workload\",\n          \"identityId\": \"${azurerm_user_assigned_identity.app.client_id}\"\n        }\n      }\n    },\n    {\n      \"apiVersion\": \"keda.sh/v1alpha1\",\n      \"kind\": \"ScaledJob\",\n      \"metadata\": {\n        \"name\": \"skyctl-worker\",\n        \"namespace\": \"skyctl\",\n        \"labels\": {\n          \"app.kubernetes.io/name\": \"skyctl\",\n          \"app.kubernetes.io/managed-by\": \"skyctl-deploy\"\n        }\n      },\n      \"spec\": {\n        \"jobTargetRef\": {\n          \"backoffLimit\": 0,\n          \"template\": {\n            \"metadata\": {\n              \"labels\": {\n                \"app.kubernetes.io/name\": \"skyctl\",\n                \"app.kubernetes.io/managed-by\": \"skyctl-deploy\",\n                \"azure.workload.identity/use\": \"true\"\n              }\n            },\n            \"spec\": {\n              \"serviceAccountName\": \"skyctl\",\n              \"restartPolicy\": \"Never\",\n              \"securityContext\": {\n                \"runAsNonRoot\": true,\n                \"runAsUser\": 10001,\n                \"seccompProfile\": {\n                  \"type\": \"RuntimeDefault\"\n                }\n              },\n              \"containers\": [\n                {\n                  \"name\": \"skyctl\",\n                  \"image\": \"ghcr.io/example/skyctl:1.2.0\",\n                  \"args\": [\n                    \"worker\",\n                    \"--once\"\n                  ],\n                  \"envFrom\": [\n                    {\n                      \"configMapRef\": {\n                        \"name\": \"skyctl-env\"\n                      }\n                    }\n                  ],\n                  \"env\": [\n                    {\n                      \"name\": \"SKYCTL_COMPUTE\",\n                      \"value\": \"keda\"\n                    }\n                  ],\n                  \"securityContext\": {\n                    \"allowPrivilegeEscalation\": false,\n                    \"readOnlyRootFilesystem\": true,\n                    \"capabilities\": {\n                      \"drop\": [\n                        \"ALL\"\n                      ]\n                    }\n                  },\n                  \"resources\": {\n                    \"requests\": {\n                      \"cpu\": \"250m\",\n                      \"memory\": \"512Mi\"\n                    },\n                    \"limits\": {\n                      \"memory\": \"512Mi\"\n                    }\n                  },\n                  \"volumeMounts\": [\n                    {\n                      \"name\": \"tmp\",\n                      \"mountPath\": \"/tmp\"\n                    }\n                  ]\n                }\n              ],\n              \"volumes\": [\n                {\n                  \"name\": \"tmp\",\n                  \"emptyDir\": {}\n                }\n              ]\n            }\n          }\n        },\n        \"pollingInterval\": 30,\n        \"maxReplicaCount\": 2,\n        \"triggers\": [\n          {\n            \"type\": \"azure-queue\",\n            \"metadata\": {\n              \"queueName\": \"skyctl-work\",\n              \"accountName\": \"${azurerm_storage_account.state.name}\",\n              \"queueLength\": \"1\"\n            },\n            \"authenticationRef\": {\n              \"name\": \"skyctl-keda\"\n            }\n          }\n        ]\n      }\n    }\n  ]\n}\n"
+      }
+    }
+  },
+  "output": {
+    "env": {
+      "value": {
+        "SKYCTL_PLATFORM": "kubernetes",
+        "SKYCTL_COMPUTE": "deployment",
+        "SKYCTL_SECRETS": "azure-kv://${azurerm_key_vault.main.name}/skyctl-config,azure-kv://${azurerm_key_vault.main.name}/skyctl-http-token#SKYCTL_HTTP_TOKEN",
+        "SKYCTL_STATE_URL": "az://skyctl/skyctl",
+        "SKYCTL_QUEUE_URL": "azqueue://${azurerm_storage_account.state.name}/skyctl-work",
+        "SKYCTL_DELAYED_URL": "queue",
+        "SKYCTL_AGENT_MODEL": "azure-openai:gpt-4.1",
+        "SKYCTL_AGENT_ALLOW_WRITES": "true",
+        "SKYCTL_AGENT_ALLOW_DELETE": "false",
+        "SKYCTL_AGENT_MAX_WRITES": "5",
+        "SKYCTL_AGENT_MAX_TURNS": "25",
+        "SKYCTL_AGENT_MAX_SECONDS": "540",
+        "SKYCTL_AGENT_ACCOUNTS": "work",
+        "SKYCTL_LOG_FORMAT": "json",
+        "SKYCTL_AUTH": "bearer",
+        "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
+        "AZURE_CLIENT_ID": "${azurerm_user_assigned_identity.app.client_id}",
+        "AZURE_STORAGE_ACCOUNT_NAME": "${azurerm_storage_account.state.name}",
+        "AZURE_TENANT_ID": "${data.azurerm_client_config.current.tenant_id}",
+        "AZURE_OPENAI_ENDPOINT": "https://skyctl-openai.openai.azure.com"
+      }
+    },
+    "state_url": {
+      "value": "az://skyctl/skyctl (account ${azurerm_storage_account.state.name})"
+    },
+    "storage_account": {
+      "value": "${azurerm_storage_account.state.name}"
+    },
+    "skyctl_connection": {
+      "value": {
+        "platform": "azure",
+        "state_url": "az://skyctl/skyctl",
+        "queue_url": "azqueue://${azurerm_storage_account.state.name}/skyctl-work",
+        "env": {
+          "AZURE_STORAGE_ACCOUNT_NAME": "${azurerm_storage_account.state.name}"
+        }
+      }
+    }
+  }
+}
