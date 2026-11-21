@@ -46,6 +46,7 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,6 +65,7 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
@@ -88,6 +90,7 @@ jobs:
   # The minimum supported versions of every dependency, so the lower bounds in pyproject.toml stay honest.
   test-lowest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -98,6 +101,7 @@ jobs:
   # suite against the installed package (scripts/verify_install.py).
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -113,6 +117,7 @@ jobs:
   # prove (moto does not evaluate S3 preconditions atomically; see CLOUD_FRAMEWORK.md §9).
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
       azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000", "10001:10001"] }
@@ -146,6 +151,7 @@ jobs:
 
   conformance:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
