@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The type check failed with `atproto` 0.0.74 and later, which ship `py.typed`: `BskyClient._build_facets` bound one variable to three different facet types. The variable is now annotated; behaviour is unchanged.
+
 ## [0.2.0] - 2026-11-17
 
 ### Licensing

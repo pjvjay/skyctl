@@ -591,6 +591,13 @@ class BskyClient:
         F = at_models.AppBskyRichtextFacet
         facets = []
         for f in detect_facets(text):
+            # Spelled out through at_models, not the local alias F: atproto releases without
+            # py.typed (before 0.0.74) make F an untyped variable, which is not valid in an annotation.
+            feature: (
+                at_models.AppBskyRichtextFacet.Link
+                | at_models.AppBskyRichtextFacet.Tag
+                | at_models.AppBskyRichtextFacet.Mention
+            )
             if f.kind == "link":
                 feature = F.Link(uri=f.value)
             elif f.kind == "tag":
