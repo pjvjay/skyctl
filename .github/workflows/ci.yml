@@ -1,0 +1,86 @@
+# test (Python 3.10-3.13 on Linux, 3.12 on macOS) and integration (object
+# stores and the Storage Queue adapter against real emulators).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - { os: macos-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}", cache: pip }
+      - run: pip install -e ".[test]"
+      - run: pytest -q
+
+  # Contract tests against emulators, for what in-process fakes cannot prove
+  # (moto does not evaluate S3 preconditions atomically).
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      # Pinned on purpose. S3 "If-Match" on PutObject needs LocalStack 4.1 or
+      # later (3.x accepts a stale write), and releases from 2026.03.0 on need
+      # an account token. 4.14.0 is the last release before that.
+      localstack: { image: "localstack/localstack:4.14.0", ports: ["4566:4566"] }
+    steps:
+      - uses: actions/checkout@v4
+      # Azurite and fake-gcs-server need arguments. A service container cannot
+      # be given any, so both are started as steps instead.
+      # --skipApiVersionCheck: Azurite rejects any API version newer than the
+      # ones it knows, and the Azure SDKs move ahead of it.
+      - name: Start Azurite
+        run: >
+          docker run -d --name azurite -p 10000:10000 -p 10001:10001
+          mcr.microsoft.com/azure-storage/azurite
+          azurite -l /data --blobHost 0.0.0.0 --queueHost 0.0.0.0 --skipApiVersionCheck
+      - name: Start fake-gcs-server
+        run: docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[test]"
+      - name: Wait for Azurite and fake-gcs-server
+        run: |
+          # Any HTTP answer means the service is up (Azurite answers 400 to a bare GET).
+          wait_for() {
+            for _ in $(seq 1 30); do
+              curl -sS -o /dev/null "$2" 2> /dev/null && return 0
+              sleep 1
+            done
+            docker logs "$1"
+            return 1
+          }
+          wait_for azurite http://localhost:10000/
+          wait_for azurite http://localhost:10001/
+          wait_for gcs http://localhost:4443/storage/v1/b
+      - run: pytest -q -m integration -rs
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+          SKYCTL_IT_S3_ENDPOINT: http://localhost:4566
+          SKYCTL_IT_S3_BUCKET: skyctl-it
+          # Azurite's published development account, not a real key.
+          SKYCTL_IT_AZURE_CONN: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;"
+          SKYCTL_IT_GCS_ENDPOINT: http://localhost:4443

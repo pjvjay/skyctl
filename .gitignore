@@ -17,6 +17,4 @@ logs/
 
 .skyctl_sessions/
 .skyctl_queue.json
-.skyctl_agents/
-agents.toml
 *~

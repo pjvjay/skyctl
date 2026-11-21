@@ -14,12 +14,24 @@ dependencies = [
     "python-dotenv>=1.0",
     "rich>=13.0",
     "httpx>=0.24",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
-agents = ["anthropic>=1.0"]
-test = ["pytest>=7"]
+# Cloud object stores and queues: each extra installs only the SDKs its adapters need.
+# boto3 >= 1.35.69: S3 conditional writes (If-None-Match / If-Match on PutObject).
+aws = ["boto3>=1.35.69"]
+azure = ["azure-identity>=1.15", "azure-storage-blob>=12.19", "azure-storage-queue>=12.9"]
+# Only for Service Bus queues (servicebus://).
+servicebus = ["azure-identity>=1.15", "azure-servicebus>=7.11"]
+gcp = ["google-cloud-storage>=2.14", "google-cloud-pubsub>=2.19"]
+# Generic fallback for other fsspec schemes (no atomic compare-and-swap).
+fsspec = ["fsspec>=2024.0"]
+test = [
+    "pytest>=7", "fsspec>=2024.0",
+    "moto[s3,sqs]>=5.1.5", "boto3>=1.35.69",  # moto < 5.1.5 ignores S3 If-Match
+    "azure-storage-blob>=12.19", "azure-storage-queue>=12.9", "azure-servicebus>=7.11",
+    "google-cloud-storage>=2.14",
+]
 
 [project.scripts]
 skyctl = "skyctl.cli:cli"
@@ -30,3 +42,6 @@ include = ["skyctl*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: contract tests against emulators or real cloud accounts (skipped unless configured)"]
+# The whole suite runs in seconds; a test stuck for this long dumps every thread's stack.
+faulthandler_timeout = 60

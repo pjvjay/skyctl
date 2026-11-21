@@ -62,3 +62,8 @@ class ScheduledPost:
     cron: Optional[str] = None       # Crontab expression for recurring jobs
     attempts: int = 0                # Failed attempts so far
     last_error: Optional[str] = None
+    last_run: Optional[datetime] = None  # When a cron job last fired (tick mode)
+    retry_at: Optional[datetime] = None  # Next retry time after a failure (tick mode)
+    claimed_by: Optional[str] = None     # Worker currently sending this job ("sending" status)
+    claimed_at: Optional[datetime] = None
+    claimed_until: Optional[datetime] = None  # After this, the claim is stale and recoverable
