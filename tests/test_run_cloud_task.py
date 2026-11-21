@@ -112,10 +112,19 @@ def aws_deployment(monkeypatch, tmp_path):
         )  # a fresh "model" per run
         dispatcher = default_dispatcher(runtime, manager=manager, runner=runner)
         stop = threading.Event()
+        # The worker asks the queue not to wait (wait_seconds=0), so it pauses 20 ms on the stop
+        # check instead. With no pause at all it spins through moto and starves the test's own
+        # thread: the first test took 8 s instead of under 1 s on macOS, and on GitHub's Linux
+        # runners the suite did not finish.
         worker = threading.Thread(
             target=run_worker,
             args=(services.build("queue", sqs_url), dispatcher),
-            kwargs={"idle_exit_seconds": None, "stop": stop.is_set, "wait_seconds": 0, "heartbeat_seconds": None},
+            kwargs={
+                "idle_exit_seconds": None,
+                "stop": lambda: stop.wait(0.02),
+                "wait_seconds": 0,
+                "heartbeat_seconds": None,
+            },
             daemon=True,
         )
         worker.start()
