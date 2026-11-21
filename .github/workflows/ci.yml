@@ -40,25 +40,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
-      localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
-      azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000", "10001:10001"] }
+      # Pinned on purpose. S3 "If-Match" on PutObject needs LocalStack 4.1 or
+      # later (3.x accepts a stale write), and releases from 2026.03.0 on need
+      # an account token. 4.14.0 is the last release before that.
+      localstack: { image: "localstack/localstack:4.14.0", ports: ["4566:4566"] }
     steps:
       - uses: actions/checkout@v4
-      # fake-gcs-server needs "-scheme http". A service container cannot be given
-      # arguments, so it is started as a step instead.
+      # Azurite and fake-gcs-server need arguments. A service container cannot
+      # be given any, so both are started as steps instead.
+      # --skipApiVersionCheck: Azurite rejects any API version newer than the
+      # ones it knows, and the Azure SDKs move ahead of it.
+      - name: Start Azurite
+        run: >
+          docker run -d --name azurite -p 10000:10000 -p 10001:10001
+          mcr.microsoft.com/azure-storage/azurite
+          azurite -l /data --blobHost 0.0.0.0 --queueHost 0.0.0.0 --skipApiVersionCheck
       - name: Start fake-gcs-server
         run: docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -e ".[test]"
-      - name: Wait for fake-gcs-server
+      - name: Wait for Azurite and fake-gcs-server
         run: |
-          for _ in $(seq 1 30); do
-            curl -fsS http://localhost:4443/storage/v1/b > /dev/null && exit 0
-            sleep 1
-          done
-          docker logs gcs
-          exit 1
+          # Any HTTP answer means the service is up (Azurite answers 400 to a bare GET).
+          wait_for() {
+            for _ in $(seq 1 30); do
+              curl -sS -o /dev/null "$2" 2> /dev/null && return 0
+              sleep 1
+            done
+            docker logs "$1"
+            return 1
+          }
+          wait_for azurite http://localhost:10000/
+          wait_for azurite http://localhost:10001/
+          wait_for gcs http://localhost:4443/storage/v1/b
       - run: pytest -q -m integration -rs
         env:
           AWS_ACCESS_KEY_ID: test
