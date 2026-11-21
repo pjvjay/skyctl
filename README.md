@@ -189,6 +189,27 @@ scheduler.start(blocking=False)
 scheduler.start(blocking=True)
 ```
 
+### Running the scheduler from cron (tick mode)
+
+`start()` keeps a process alive. `tick()` does one pass and returns, which
+suits a cron job or a scheduled cloud job: it sends everything that is due,
+records retries, and exits.
+
+```python
+from skyctl import BskyManager, BskyScheduler
+from skyctl.adapters import job_store_for, object_store_for
+
+store = object_store_for("s3://my-bucket/skyctl")      # or file://, az://, gs://
+scheduler = BskyScheduler(BskyManager.from_env(), job_store=job_store_for(store))
+result = scheduler.tick()
+print(result.to_dict())
+```
+
+Several workers may tick the same queue. Each job is claimed before it is
+sent, so two workers never send the same post. If a worker dies mid-send, a
+later tick picks the job up once the claim expires and checks the account's
+recent posts first, so the post is not sent twice.
+
 ### Building from a dict (no .env needed)
 
 ```python
@@ -199,6 +220,37 @@ manager = BskyManager.from_dict({
 ```
 
 ---
+
+## Storage and queue adapters
+
+`skyctl.adapters` keeps scheduler state, cached sessions and images in a
+shared store instead of local files, so more than one machine can work on
+the same accounts.
+
+| URL | Store | Install |
+|---|---|---|
+| `file://./.skyctl`, `memory://x` | local files, in-memory | built in |
+| `s3://bucket/prefix` | Amazon S3 | `pip install "skyctl[aws]"` |
+| `az://container/prefix` | Azure Blob Storage (set `AZURE_STORAGE_ACCOUNT_NAME`) | `pip install "skyctl[azure]"` |
+| `gs://bucket/prefix` | Google Cloud Storage | `pip install "skyctl[gcp]"` |
+| any other fsspec URL | fsspec fallback, without atomic compare-and-swap | `pip install "skyctl[fsspec]"` |
+
+```python
+from skyctl import BskyManager
+from skyctl.adapters import object_store_for, session_store_for
+
+store = object_store_for("s3://my-bucket/skyctl")
+manager = BskyManager.from_env(session_store=session_store_for(store), media_store=store)
+manager.post("personal", "From the bucket", image_paths=["media/kite.jpg"])
+```
+
+`skyctl.adapters.queues` has work queues with one contract (at-least-once
+delivery, a visibility window, ack and nack) over SQS, Azure Storage Queues,
+Service Bus and Pub/Sub; `queue_for(url)` builds one from a URL.
+
+Every adapter passes the same checks in `skyctl.testing.contracts`. To add
+a store or queue of your own, implement the protocol in `skyctl.ports` and
+run those checks against it.
 
 ## PostResult
 
@@ -224,7 +276,10 @@ skyctl/
 │   ├── config.py        # Env var loader
 │   ├── client.py        # Single-account wrapper
 │   ├── manager.py       # Multi-account orchestrator
-│   ├── scheduler.py     # APScheduler integration
+│   ├── scheduler.py     # APScheduler integration and tick mode
+│   ├── ports.py         # Storage and queue interfaces
+│   ├── adapters/        # File, memory, S3, Azure Blob, GCS and fsspec stores; queues
+│   ├── testing/         # Contract checks and SDK fakes for adapters
 │   ├── richtext.py      # Length check, facets, thread splitting
 │   ├── models.py        # Dataclasses
 │   └── cli.py           # Click CLI

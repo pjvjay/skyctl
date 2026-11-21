@@ -10,7 +10,7 @@ from .richtext import (
     grapheme_len,
     split_thread,
 )
-from .scheduler import BskyScheduler
+from .scheduler import BskyScheduler, TickResult
 
 __all__ = [
     "AccountConfig",
@@ -21,6 +21,7 @@ __all__ = [
     "PostResult",
     "PostTooLongError",
     "ScheduledPost",
+    "TickResult",
     "detect_facets",
     "grapheme_len",
     "split_thread",
