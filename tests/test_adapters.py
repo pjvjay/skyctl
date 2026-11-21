@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Ports and adapters: secrets, object/session/job stores, settings resolution."""
 
 import json
@@ -5,6 +20,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from conftest import require
 from skyctl import AccountConfig, BskyClient
 from skyctl.adapters import (
     FileObjectStore,
@@ -21,10 +37,10 @@ from skyctl.models import ScheduledPost
 from skyctl.ports import JobStore, ObjectStore, SecretStore, SessionStore
 from skyctl.settings import Settings, detect_cloud, load_settings
 
-
 # ----------------------------------------------------------------------
 # Secrets
 # ----------------------------------------------------------------------
+
 
 def test_secret_payload_accepts_json_and_dotenv():
     as_json = parse_secret_payload(json.dumps({"BSKY_ACCOUNTS": "a", "BSKY_A_HANDLE": "a.test", "N": 1}))
@@ -82,10 +98,11 @@ def test_cloud_secret_stores_parse_payload_with_injected_clients():
 # Object stores (contract test over every local implementation)
 # ----------------------------------------------------------------------
 
+
 def _stores(tmp_path):
     yield "file", FileObjectStore(tmp_path / "state")
     yield "memory", MemoryObjectStore()
-    pytest.importorskip("fsspec")
+    require("fsspec")
     from skyctl.adapters.fsspec_store import FsspecObjectStore
 
     yield "fsspec-memory", FsspecObjectStore("memory://skyctl-test")
@@ -117,20 +134,21 @@ def test_object_store_factory(tmp_path):
     assert isinstance(object_store_for(f"file://{tmp_path}"), FileObjectStore)
     assert isinstance(object_store_for("file://./.skyctl"), FileObjectStore)
     assert isinstance(object_store_for("memory://x"), MemoryObjectStore)
-    pytest.importorskip("fsspec")
+    require("fsspec")
     from skyctl.adapters.fsspec_store import FsspecObjectStore
 
     # Bucket URLs go through fsspec; "file" via fsspec proves the wrapper without a cloud SDK.
     store = object_store_for(f"file://{tmp_path / 'via-fsspec'}")
-    assert isinstance(store, FileObjectStore)   # file:// is served by the stdlib adapter
+    assert isinstance(store, FileObjectStore)  # file:// is served by the stdlib adapter
     assert FsspecObjectStore("memory://z").scheme == "memory"
     with pytest.raises((ImportError, ValueError, Exception)):
-        FsspecObjectStore("s3://bucket/prefix").exists("x")   # no s3fs / credentials here
+        FsspecObjectStore("s3://bucket/prefix").exists("x")  # no s3fs / credentials here
 
 
 # ----------------------------------------------------------------------
 # Sessions
 # ----------------------------------------------------------------------
+
 
 def test_session_store_roundtrip(tmp_path):
     for store in (session_store_for(MemoryObjectStore()), FileSessionStore(tmp_path / "s")):
@@ -185,6 +203,7 @@ def test_client_reads_images_from_media_store(fake_atproto):
 # Jobs
 # ----------------------------------------------------------------------
 
+
 def test_job_store_roundtrip_and_lease():
     store = ObjectJobStore(MemoryObjectStore())
     assert isinstance(store, JobStore)
@@ -197,8 +216,8 @@ def test_job_store_roundtrip_and_lease():
 
     assert store.lease("me", 60)
     assert not store.lease("other", 60)
-    assert store.lease("me", 60)          # re-entrant for the same owner
-    store.release("other")                # not the owner: no effect
+    assert store.lease("me", 60)  # re-entrant for the same owner
+    store.release("other")  # not the owner: no effect
     assert not store.lease("other", 60)
     store.release("me")
     assert store.lease("other", 60)
@@ -207,6 +226,7 @@ def test_job_store_roundtrip_and_lease():
 # ----------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------
+
 
 def test_detect_cloud(monkeypatch):
     for var in ("SKYCTL_CLOUD", "ECS_CONTAINER_METADATA_URI_V4", "CONTAINER_APP_NAME", "K_SERVICE"):
@@ -227,8 +247,8 @@ def test_detect_cloud(monkeypatch):
 def test_load_settings_merges_secrets_without_overriding_platform_env(monkeypatch):
     import os
 
-    import skyctl.settings as settings_mod
     import skyctl.adapters as adapters_mod
+    import skyctl.settings as settings_mod
 
     # load_settings() writes into the real environment; isolate it.
     monkeypatch.setattr(os, "environ", dict(os.environ))
@@ -246,8 +266,8 @@ def test_load_settings_merges_secrets_without_overriding_platform_env(monkeypatc
     settings = load_settings(force=True)
     assert settings.secrets_are_remote
     assert settings.agent.max_writes == 2 and settings.agent.allow_writes is False
-    assert settings.http_token == "tok"                 # came from the secret
-    assert __import__("os").environ["BSKY_ACCOUNTS"] == "platform"   # platform value kept
+    assert settings.http_token == "tok"  # came from the secret
+    assert __import__("os").environ["BSKY_ACCOUNTS"] == "platform"  # platform value kept
     assert isinstance(StaticSecretStore({}), SecretStore)
     assert Settings.from_env().agent.accounts is None
 
@@ -263,7 +283,9 @@ def test_raw_value_secret_url_fragment():
     store.inner._client = SimpleNamespace(get_secret_value=lambda SecretId: {"SecretString": "s3cr3t-token\n"})
     assert store.load() == {"SKYCTL_HTTP_TOKEN": "s3cr3t-token"}
     # Without the fragment, a raw token parses to nothing (it is not a map).
-    plain = AwsSecretsManagerStore("x", client=SimpleNamespace(get_secret_value=lambda SecretId: {"SecretString": "s3cr3t-token"}))
+    plain = AwsSecretsManagerStore(
+        "x", client=SimpleNamespace(get_secret_value=lambda SecretId: {"SecretString": "s3cr3t-token"})
+    )
     assert plain.load() == {}
 
 

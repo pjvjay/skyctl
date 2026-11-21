@@ -1,10 +1,25 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The plan protocol: model, static checks, store transitions, deterministic execution."""
 
-import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from conftest import make_post_view
 from skyctl.adapters import MemoryObjectStore
 from skyctl.planning import (
     ApprovalRequired,
@@ -18,15 +33,13 @@ from skyctl.planning import (
 from skyctl.planning.model import RefError, iter_refs, resolve_path, substitute
 from skyctl.tools import ToolContext, ToolPolicy, registry
 
-from conftest import make_post_view
-
 
 @pytest.fixture
 def ctx(manager):
     c = ToolContext(manager, policy=ToolPolicy(allow_writes=True, max_writes=10))
     c.plans = PlanStore(MemoryObjectStore())
     c.principal = "tester"
-    c.grounding = "off"          # these tests build plans by hand; grounding has its own tests below
+    c.grounding = "off"  # these tests build plans by hand; grounding has its own tests below
     return c
 
 
@@ -47,6 +60,7 @@ def errors(check):
 # Model
 # ----------------------------------------------------------------------
 
+
 def test_plan_model_and_hash():
     p = plan(step("a", "post", account="work", text="hi"))
     assert p.hash.startswith("sha256:") and p.hash == plan(step("a", "post", account="work", text="hi")).hash
@@ -64,7 +78,10 @@ def test_refs():
     assert sorted(iter_refs(args)) == ["p1.uri", "t1.posts.0.url"]
     results = {"p1": {"uri": "at://p1"}, "t1": {"posts": [{"url": "https://t1"}]}}
     assert substitute(args, lambda p: resolve_path(results, p)) == {
-        "quote_uri": "at://p1", "nested": ["https://t1"], "plain": "x"}
+        "quote_uri": "at://p1",
+        "nested": ["https://t1"],
+        "plain": "x",
+    }
     with pytest.raises(RefError):
         resolve_path(results, "t1.posts.5.url")
     with pytest.raises(RefError):
@@ -75,12 +92,14 @@ def test_refs():
 # Static checks
 # ----------------------------------------------------------------------
 
+
 def test_a_good_plan_passes_with_a_preview(ctx):
     p = plan(
         step("p1", "post", account="work", text="Launch day! https://example.com #skyctl", _why="announce"),
         step("q1", "post", account="work", text="ICYMI", quote_uri={"$ref": "p1.uri"}, _depends_on=["p1"]),
         step("t1", "thread", account="work", text="word " * 120),
-        intent="publish", assumptions=["UTC"],
+        intent="publish",
+        assumptions=["UTC"],
     )
     c = check_plan(p, ctx, registry)
     assert c.ok, errors(c)
@@ -93,29 +112,41 @@ def test_a_good_plan_passes_with_a_preview(ctx):
     assert "[p1] post as @work.test" in text and "uses: p1.uri" in text and "Assumes: UTC" in text
 
 
-@pytest.mark.parametrize("bad_step,message", [
-    (step("a", "nope"), "unknown tool"),
-    (step("a", "plan_create", plan={}), "cannot be a plan step"),
-    (step("a", "post", account="work"), "invalid arguments for post: text"),
-    (step("a", "post", account="work", text="x" * 301), "301 graphemes"),
-    (step("a", "post", account="work", text="   "), "text is empty"),
-    (step("a", "post", account="ghost", text="hi"), "unknown account"),
-    (step("a", "post", account="work", text="hi", images=["1", "2", "3", "4", "5"]), "at most 4 images"),
-    (step("a", "post", account="work", text="hi", images=["a.png"], link_card="https://x.y"), "both images and a link card"),
-    (step("a", "schedule_post", account="work", text="hi", run_at="2001-01-01T00:00:00Z"), "not in the future"),
-    (step("a", "schedule_post", account="work", text="hi", run_at="tomorrow"), "not ISO 8601"),
-    (step("a", "schedule_cron", account="work", text="hi", cron="every day"), "valid 5-field"),
-    (step("a", "post", account="work", text="hi", quote_uri={"$ref": "later.uri"}), "earlier step"),
-    (step("a", "post", account="work", text="hi", _depends_on=["zz"]), "not an earlier step"),
-])
+@pytest.mark.parametrize(
+    ("bad_step", "message"),
+    [
+        (step("a", "nope"), "unknown tool"),
+        (step("a", "plan_create", plan={}), "cannot be a plan step"),
+        (step("a", "post", account="work"), "invalid arguments for post: text"),
+        (step("a", "post", account="work", text="x" * 301), "301 graphemes"),
+        (step("a", "post", account="work", text="   "), "text is empty"),
+        (step("a", "post", account="ghost", text="hi"), "unknown account"),
+        (step("a", "post", account="work", text="hi", images=["1", "2", "3", "4", "5"]), "at most 4 images"),
+        (
+            step("a", "post", account="work", text="hi", images=["a.png"], link_card="https://x.y"),
+            "both images and a link card",
+        ),
+        (step("a", "schedule_post", account="work", text="hi", run_at="2001-01-01T00:00:00Z"), "not in the future"),
+        (step("a", "schedule_post", account="work", text="hi", run_at="tomorrow"), "not ISO 8601"),
+        (step("a", "schedule_cron", account="work", text="hi", cron="every day"), "valid 5-field"),
+        (step("a", "post", account="work", text="hi", quote_uri={"$ref": "later.uri"}), "earlier step"),
+        (step("a", "post", account="work", text="hi", _depends_on=["zz"]), "not an earlier step"),
+    ],
+)
 def test_static_checks_catch(ctx, bad_step, message):
     c = check_plan(plan(bad_step), ctx, registry)
     assert not c.ok and any(message in m for m in errors(c)), errors(c)
 
 
 def test_ref_fields_are_checked_against_the_tool_result(ctx):
-    c = check_plan(plan(step("p1", "post", account="work", text="a"),
-                        step("q1", "post", account="work", text="b", quote_uri={"$ref": "p1.nonsense"})), ctx, registry)
+    c = check_plan(
+        plan(
+            step("p1", "post", account="work", text="a"),
+            step("q1", "post", account="work", text="b", quote_uri={"$ref": "p1.nonsense"}),
+        ),
+        ctx,
+        registry,
+    )
     assert any("post results have no 'nonsense'" in m for m in errors(c))
 
 
@@ -126,10 +157,16 @@ def test_questions_block_execution(ctx):
 
 def test_policy_scope_budget_and_permission(manager):
     c = ToolContext(manager, policy=ToolPolicy(accounts=["work"], allow_writes=True, max_writes=1))
-    assert any("outside this session's scope" in m for m in errors(check_plan(plan(step("a", "post", account="personal", text="x")), c, registry)))
+    assert any(
+        "outside this session's scope" in m
+        for m in errors(check_plan(plan(step("a", "post", account="personal", text="x")), c, registry))
+    )
     two = plan(step("a", "post", account="work", text="1"), step("b", "post", account="work", text="2"))
     assert any("only 1 remain" in m for m in errors(check_plan(two, c, registry)))
-    assert any("not permitted" in m for m in errors(check_plan(plan(step("a", "delete_post", account="work", uri="at://x")), c, registry)))
+    assert any(
+        "not permitted" in m
+        for m in errors(check_plan(plan(step("a", "delete_post", account="work", uri="at://x")), c, registry))
+    )
     # Writes disabled: valid, but the plan would only preview.
     c2 = ToolContext(manager, policy=ToolPolicy(allow_writes=False))
     r = check_plan(plan(step("a", "post", account="work", text="x")), c2, registry)
@@ -137,12 +174,49 @@ def test_policy_scope_budget_and_permission(manager):
 
 
 def test_hygiene_warnings(ctx):
-    p = plan(step("a", "post", account="work", text="same"), step("b", "post", account="work", text="same"),
-             step("c", "reply", account="work", parent_uri="at://p/1", text="one"),
-             step("d", "reply", account="work", parent_uri="at://p/1", text="two"))
+    p = plan(
+        step("a", "post", account="work", text="same"),
+        step("b", "post", account="work", text="same"),
+        step("c", "reply", account="work", parent_uri="at://p/1", text="one"),
+        step("d", "reply", account="work", parent_uri="at://p/1", text="two"),
+    )
     c = check_plan(p, ctx, registry)
     warnings = [f.message for f in c.findings if f.level == "warning"]
     assert c.ok and any("duplicates step 'a'" in w for w in warnings) and any("second reply" in w for w in warnings)
+
+
+def test_second_reply_to_same_author_warns(ctx):
+    p = plan(
+        step("a", "reply", account="work", parent_uri="at://did:plc:alice/app.bsky.feed.post/1", text="one"),
+        step("b", "reply", account="work", parent_uri="at://did:plc:alice/app.bsky.feed.post/2", text="two"),
+        step("c", "reply", account="work", parent_uri="at://did:plc:bob/app.bsky.feed.post/3", text="three"),
+    )
+    c = check_plan(p, ctx, registry)
+    same_author = [f for f in c.findings if "same author" in f.message]
+    assert c.ok and [f.step for f in same_author] == ["b"] and same_author[0].level == "warning"
+
+
+def test_preview_shows_the_post_answered_and_link_provenance(ctx):
+    from skyctl.tools.registry import _remember_uris
+
+    parent = "at://did:plc:alice/app.bsky.feed.post/1"
+    _remember_uris(
+        ctx, {"data": {"post": {"uri": parent, "author": {"handle": "alice.test"}, "text": "The bridge  is closed."}}}
+    )
+    ctx.seen_urls.add("https://news.example/bridge")
+    p = plan(
+        step(
+            "a",
+            "reply",
+            account="work",
+            parent_uri=parent,
+            text="It reopened: https://news.example/bridge and https://made.up/x",
+        )
+    )
+    text = render_preview(check_plan(p, ctx, registry), p)
+    assert "in reply to @alice.test: “The bridge is closed.”" in text
+    assert "link: https://news.example/bridge (retrieved in this run)" in text
+    assert "link: https://made.up/x (NOT retrieved by the agent)" in text
 
 
 def test_pluggable_validator_link_allowlist(ctx, monkeypatch):
@@ -157,6 +231,7 @@ def test_pluggable_validator_link_allowlist(ctx, monkeypatch):
 # Store transitions
 # ----------------------------------------------------------------------
 
+
 def _create(ctx, p, mode="none"):
     return ctx.plans.create(p, check_plan(p, ctx, registry), created_by="tester", approval_mode=mode)
 
@@ -166,7 +241,7 @@ def test_store_approval_states(ctx):
     reads = plan(step("a", "get_timeline", account="work"))
     assert _create(ctx, writes, "none")["status"] == "approved"
     assert _create(ctx, writes, "out_of_band")["status"] == "awaiting_approval"
-    assert _create(ctx, reads, "out_of_band")["status"] == "approved"        # read-only needs no approval
+    assert _create(ctx, reads, "out_of_band")["status"] == "approved"  # read-only needs no approval
     rec = _create(ctx, writes, "out_of_band")
     with pytest.raises(PlanError, match="hash mismatch"):
         ctx.plans.approve(rec["id"], "sha256:other", by="h", via="cli")
@@ -186,6 +261,7 @@ def test_store_approval_states(ctx):
 # Execution
 # ----------------------------------------------------------------------
 
+
 def test_execute_is_hash_bound_and_approval_gated(ctx, manager):
     rec = _create(ctx, plan(step("a", "post", account="work", text="hi")), "out_of_band")
     with pytest.raises(PlanError, match="hash mismatch"):
@@ -199,8 +275,10 @@ def test_execute_is_hash_bound_and_approval_gated(ctx, manager):
 
 
 def test_execute_chains_refs_and_is_idempotent(ctx, manager):
-    p = plan(step("t1", "thread", account="work", text="word " * 120),
-             step("r1", "reply", account="work", parent_uri={"$ref": "t1.posts.0.uri"}, text="and one more thing"))
+    p = plan(
+        step("t1", "thread", account="work", text="word " * 120),
+        step("r1", "reply", account="work", parent_uri={"$ref": "t1.posts.0.uri"}, text="and one more thing"),
+    )
     rec = _create(ctx, p)
     done = execute_plan(ctx.plans, rec["id"], rec["plan_hash"], ctx, registry)
     assert done["status"] == "completed"
@@ -213,9 +291,11 @@ def test_execute_chains_refs_and_is_idempotent(ctx, manager):
 
 def test_failure_stops_dependents_and_retry_resumes_without_duplicates(ctx, manager):
     fake = manager.client("work").login()._client
-    p = plan(step("a", "post", account="work", text="first"),
-             step("b", "post", account="work", text="second"),
-             step("c", "post", account="work", text="third", quote_uri={"$ref": "a.uri"}))
+    p = plan(
+        step("a", "post", account="work", text="first"),
+        step("b", "post", account="work", text="second"),
+        step("c", "post", account="work", text="third", quote_uri={"$ref": "a.uri"}),
+    )
     rec = _create(ctx, p)
     fake.fail_sends = 0
     original = fake.send_post
@@ -233,22 +313,24 @@ def test_failure_stops_dependents_and_retry_resumes_without_duplicates(ctx, mana
     assert {k: v["status"] for k, v in failed["steps"].items()} == {"a": "done", "b": "failed", "c": "skipped"}
     retried = execute_plan(ctx.plans, rec["id"], rec["plan_hash"], ctx, registry)
     assert retried["status"] == "completed"
-    assert [s["text"] for s in fake.sent] == ["first", "second", "third"]          # "first" not repeated
+    assert [s["text"] for s in fake.sent] == ["first", "second", "third"]  # "first" not repeated
     assert fake.sent[2]["embed"].record.uri == retried["steps"]["a"]["result"]["uri"]
 
 
 def test_continue_on_error(ctx, manager):
-    p = plan(step("a", "like", account="work", uri="at://did:plc:x/app.bsky.feed.post/missing", _continue_on_error=True),
-             step("b", "post", account="work", text="still posted"))
+    p = plan(
+        step("a", "like", account="work", uri="at://did:plc:x/app.bsky.feed.post/missing", _continue_on_error=True),
+        step("b", "post", account="work", text="still posted"),
+    )
     rec = _create(ctx, p)
     out = execute_plan(ctx.plans, rec["id"], rec["plan_hash"], ctx, registry)
     assert out["steps"]["a"]["status"] == "failed" and out["steps"]["b"]["status"] == "done"
-    assert out["status"] == "failed"                      # reported honestly, but b ran
+    assert out["status"] == "failed"  # reported honestly, but b ran
 
 
 def test_policy_is_rechecked_at_execution(ctx, manager):
     rec = _create(ctx, plan(step("a", "post", account="work", text="hi")))
-    ctx.policy = ToolPolicy(accounts=["personal"], allow_writes=True)     # tightened after approval
+    ctx.policy = ToolPolicy(accounts=["personal"], allow_writes=True)  # tightened after approval
     with pytest.raises(PlanError, match="no longer passes"):
         execute_plan(ctx.plans, rec["id"], rec["plan_hash"], ctx, registry)
     assert not manager.client("work")._client.sent
@@ -277,7 +359,9 @@ def test_exposure_versus_permission(manager):
     c.plans = PlanStore(MemoryObjectStore())
     direct = registry.call("post", {"account": "work", "text": "x"}, c)
     assert direct.denied and "plan_create" in direct.error
-    created = registry.call("plan_create", {"plan": {"goal": "g", "steps": [step("a", "post", account="work", text="x")]}}, c).result
+    created = registry.call(
+        "plan_create", {"plan": {"goal": "g", "steps": [step("a", "post", account="work", text="x")]}}, c
+    ).result
     done = registry.call("plan_execute", {"plan_id": created["plan_id"], "plan_hash": created["plan_hash"]}, c).result
     assert done["status"] == "completed" and done["steps"]["a"]["url"].startswith("https://bsky.app/")
 
@@ -286,17 +370,20 @@ def test_exposure_versus_permission(manager):
 # Grounding: plans may only target posts the session has observed
 # ----------------------------------------------------------------------
 
+
 def test_grounding_refuses_invented_targets_and_accepts_observed_ones(manager):
     c = ToolContext(manager, policy=ToolPolicy(allow_writes=True))
     target = "at://did:plc:other/app.bsky.feed.post/found"
     p = plan(step("r", "reply", account="work", parent_uri=target, text="hi"))
     refused = check_plan(p, c, registry)
     assert not refused.ok and "was not returned by any tool" in errors(refused)[0]
-    registry.call("search_posts", {"account": "work", "query": "anything"}, c)     # the fake returns `target`
+    registry.call("search_posts", {"account": "work", "query": "anything"}, c)  # the fake returns `target`
     assert target in c.seen_uris and check_plan(p, c, registry).ok
     # $refs to earlier steps are grounded by construction.
-    chained = plan(step("p", "post", account="work", text="a"),
-                   step("q", "post", account="work", text="b", quote_uri={"$ref": "p.uri"}))
+    chained = plan(
+        step("p", "post", account="work", text="a"),
+        step("q", "post", account="work", text="b", quote_uri={"$ref": "p.uri"}),
+    )
     assert check_plan(chained, c, registry).ok
     c.grounding = "warning"
     soft = check_plan(plan(step("l", "like", account="work", uri="at://did:plc:x/app.bsky.feed.post/zz")), c, registry)
@@ -309,7 +396,8 @@ def test_grounding_is_not_reapplied_by_the_executor(manager):
     proposer.plans = PlanStore(MemoryObjectStore())
     registry.call("search_posts", {"account": "work", "query": "x"}, proposer)
     manager.client("work")._client.posts["at://did:plc:other/app.bsky.feed.post/found"] = make_post_view(
-        "at://did:plc:other/app.bsky.feed.post/found", "cid-found")
+        "at://did:plc:other/app.bsky.feed.post/found", "cid-found"
+    )
     p = plan(step("l", "like", account="work", uri="at://did:plc:other/app.bsky.feed.post/found"))
     rec = proposer.plans.create(p, check_plan(p, proposer, registry), created_by="agent", approval_mode="none")
     executor = ToolContext(manager, policy=ToolPolicy(allow_writes=True))

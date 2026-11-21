@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.runtime
 =======================
@@ -18,15 +33,14 @@ from __future__ import annotations
 import os
 import warnings
 from functools import cached_property
-from typing import Optional
 
-from .base import Platform, detect_platform, get_platform
-from .capabilities import Cap, CapabilityError, ComputeProfile
 from . import services
+from .base import Platform, detect_platform
+from .capabilities import Cap, CapabilityError, ComputeProfile
 
 
 class Runtime:
-    def __init__(self, settings=None, platform: Optional[Platform] = None, compute: Optional[str] = None):
+    def __init__(self, settings=None, platform: Platform | None = None, compute: str | None = None):
         from ..settings import Settings
 
         self.settings = settings or Settings.from_env()
@@ -110,10 +124,10 @@ class Runtime:
         if self.has(Cap.BACKGROUND_AFTER_RESPONSE):
             return "thread"
         raise CapabilityError(
-            Cap.BACKGROUND_AFTER_RESPONSE, "Asynchronous agent runs (POST /runs)",
+            Cap.BACKGROUND_AFTER_RESPONSE,
+            "Asynchronous agent runs (POST /runs)",
             f"{self.platform.name}/{self.compute.name}",
-            "Set SKYCTL_QUEUE_URL so runs are executed by a worker "
-            "(or use an always-allocated CPU profile).",
+            "Set SKYCTL_QUEUE_URL so runs are executed by a worker (or use an always-allocated CPU profile).",
         )
 
     def describe(self) -> dict:
@@ -139,7 +153,7 @@ class Runtime:
             return f"unavailable: {e}"
 
 
-_runtime: Optional[Runtime] = None
+_runtime: Runtime | None = None
 
 
 def get_runtime(settings=None, refresh: bool = False) -> Runtime:

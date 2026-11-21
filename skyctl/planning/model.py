@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.planning.model
 =====================
@@ -32,7 +47,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Iterator, Literal, Optional
+from collections.abc import Iterator
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -45,7 +61,9 @@ class PlanStep(BaseModel):
 
     id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,31}$", description="Unique step id, e.g. r1.")
     tool: str = Field(description="A tool name from the catalogue.")
-    args: dict[str, Any] = Field(default_factory=dict, description='Tool arguments; {"$ref": "step.field"} for earlier results.')
+    args: dict[str, Any] = Field(
+        default_factory=dict, description='Tool arguments; {"$ref": "step.field"} for earlier results.'
+    )
     why: str = Field("", description="One line: why this step serves the goal.")
     depends_on: list[str] = Field(default_factory=list)
     continue_on_error: bool = False
@@ -55,9 +73,13 @@ class Plan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     goal: str = Field(min_length=1, description="The user's request, restated precisely.")
-    intent: Optional[Literal["publish", "engage", "research", "schedule", "manage", "delegate", "other"]] = None
-    assumptions: list[str] = Field(default_factory=list, description="Interpretations made where the request was loose.")
-    questions: list[str] = Field(default_factory=list, description="Unresolved ambiguities; a plan with questions cannot run.")
+    intent: Literal["publish", "engage", "research", "schedule", "manage", "delegate", "other"] | None = None
+    assumptions: list[str] = Field(
+        default_factory=list, description="Interpretations made where the request was loose."
+    )
+    questions: list[str] = Field(
+        default_factory=list, description="Unresolved ambiguities; a plan with questions cannot run."
+    )
     steps: list[PlanStep] = Field(min_length=1, max_length=50)
 
     @field_validator("steps")
@@ -70,7 +92,9 @@ class Plan(BaseModel):
         return steps
 
     def canonical(self) -> bytes:
-        return json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return json.dumps(
+            self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
 
     @property
     def hash(self) -> str:
@@ -80,6 +104,7 @@ class Plan(BaseModel):
 # ----------------------------------------------------------------------
 # References between steps
 # ----------------------------------------------------------------------
+
 
 class RefError(ValueError):
     pass

@@ -1,6 +1,20 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The provisioning plane: spec, validation, renderers, conformance (including negative tests)."""
 
-import copy
 import json
 from pathlib import Path
 
@@ -30,12 +44,15 @@ def rendered(spec):
 
 
 def failing(checks, name=None, target=None):
-    return [c for c in checks if not c.ok and (name is None or c.name == name) and (target is None or c.target == target)]
+    return [
+        c for c in checks if not c.ok and (name is None or c.name == name) and (target is None or c.target == target)
+    ]
 
 
 # ----------------------------------------------------------------------
 # Spec
 # ----------------------------------------------------------------------
+
 
 def test_example_spec_loads_validates_and_conforms(spec):
     assert spec.targets.names() == ["aws", "azure", "gcp", "kubernetes", "compose"]
@@ -78,6 +95,7 @@ def test_tasks_roundtrip_through_the_rendered_tasks_file(spec, tmp_path):
 # Validation: capabilities and limits
 # ----------------------------------------------------------------------
 
+
 def _with(spec, **changes):
     data = spec.model_dump()
     for path, value in changes.items():
@@ -104,7 +122,7 @@ def test_time_zones_are_rejected_only_where_unsupported(spec):
 def test_lambda_limits(spec):
     s = _with(spec, targets__aws__compute="lambda", service__enabled=False)
     msgs = errors(s, "aws")
-    assert msgs == []                                   # the example image is already ECR
+    assert msgs == []  # the example image is already ECR
     s2 = _with(s, app__image="ghcr.io/me/skyctl:1")
     assert any("ECR" in m for m in errors(s2, "aws"))
     data = s.model_dump()
@@ -116,13 +134,13 @@ def test_lambda_limits(spec):
 def test_run_time_must_fit_delivery_deadlines(spec):
     s = _with(spec, policy__max_run_seconds=1200)
     assert any("Pub/Sub push ack deadline" in m for m in errors(s, "gcp"))
-    assert errors(s, "azure") == []                     # the worker heartbeat renews Service Bus locks
+    assert errors(s, "azure") == []  # the worker heartbeat renews Service Bus locks
 
 
 def test_public_service_must_authenticate(spec):
     s = _with(spec, service__public=True, service__auth=["platform"])
     assert any("anyone could call it" in m for m in errors(s, "aws"))
-    assert not any("anyone" in m for m in errors(s, "gcp"))     # Cloud Run IAM enforces it
+    assert not any("anyone" in m for m in errors(s, "gcp"))  # Cloud Run IAM enforces it
 
 
 def test_eventbridge_unrepresentable_cron(spec):
@@ -140,16 +158,22 @@ def test_kubernetes_requirements(spec):
 # Renderers
 # ----------------------------------------------------------------------
 
+
 def test_cron_dialects_per_target(spec):
     arts = rendered(spec)
     by_target = {t: {s.name: s.expression for s in a.schedules} for t, a in arts.items()}
     assert by_target["aws"]["daily-engagement"] == "cron(0 9 ? * MON-FRI *)"
     assert by_target["gcp"]["daily-engagement"] == "0 9 * * mon-fri"
     k8s = json.loads(arts["kubernetes"].files["manifests.json"])
-    cron = next(i for i in k8s["items"] if i["kind"] == "CronJob" and i["metadata"]["name"] == "skyctl-daily-engagement")
+    cron = next(
+        i for i in k8s["items"] if i["kind"] == "CronJob" and i["metadata"]["name"] == "skyctl-daily-engagement"
+    )
     assert cron["spec"]["concurrencyPolicy"] == "Forbid" and cron["spec"]["timeZone"] == "UTC"
     args = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["args"]
-    assert args == ["invoke", '{"kind":"task.run","slot":{"cron":"0 9 * * mon-fri","timezone":"UTC"},"task":"daily-engagement"}']
+    assert args == [
+        "invoke",
+        '{"kind":"task.run","slot":{"cron":"0 9 * * mon-fri","timezone":"UTC"},"task":"daily-engagement"}',
+    ]
 
 
 def test_every_target_uses_native_identity_and_no_static_cloud_keys(spec):
@@ -168,10 +192,14 @@ def test_every_target_uses_native_identity_and_no_static_cloud_keys(spec):
 
 def test_gcp_avoids_self_reference_cycle_with_deterministic_url(spec):
     gcp = render(spec, "gcp")
-    svc_env = {e["name"]: e.get("value") for e in
-               gcp.terraform["resource"]["google_cloud_run_v2_service"]["svc"]["template"]["containers"][0]["env"]}
+    svc_env = {
+        e["name"]: e.get("value")
+        for e in gcp.terraform["resource"]["google_cloud_run_v2_service"]["svc"]["template"]["containers"][0]["env"]
+    }
     assert "google_cloud_run_v2_service.svc" not in json.dumps(svc_env)
-    assert svc_env["SKYCTL_DELAYED_URL"].startswith("cloudtasks://my-skyctl-project/europe-west1/skyctl-delayed?url=https://skyctl-svc-")
+    assert svc_env["SKYCTL_DELAYED_URL"].startswith(
+        "cloudtasks://my-skyctl-project/europe-west1/skyctl-delayed?url=https://skyctl-svc-"
+    )
     assert svc_env["SKYCTL_AUTH"].startswith("google-oidc")
 
 
@@ -179,7 +207,7 @@ def test_aws_lambda_variant(spec):
     s = _with(spec, targets__aws__compute="lambda", service__enabled=False)
     art = render(s, "aws")
     fn = art.terraform["resource"]["aws_lambda_function"]["skyctl"]
-    assert "AWS_REGION" not in fn["environment"]["variables"]           # reserved on Lambda
+    assert "AWS_REGION" not in fn["environment"]["variables"]  # reserved on Lambda
     esm = art.terraform["resource"]["aws_lambda_event_source_mapping"]["work"]
     assert esm["function_response_types"] == ["ReportBatchItemFailures"]
     assert art.terraform["resource"]["aws_sqs_queue"]["work"]["visibility_timeout_seconds"] >= 6 * fn["timeout"]
@@ -213,9 +241,12 @@ def test_generated_examples_are_up_to_date(example):
 # Conformance can fail (mutation tests)
 # ----------------------------------------------------------------------
 
+
 def test_conformance_catches_dangling_terraform_references(spec):
     arts = rendered(spec)
-    arts["gcp"].terraform["resource"]["google_storage_bucket_iam_member"]["runtime"]["bucket"] = "${google_storage_bucket.nope.name}"
+    arts["gcp"].terraform["resource"]["google_storage_bucket_iam_member"]["runtime"]["bucket"] = (
+        "${google_storage_bucket.nope.name}"
+    )
     assert failing(check(spec, arts), "terraform.references", "gcp")
     assert check_references({"resource": {"x_y": {"a": {"v": "${upper(var.q)}"}}}}) != []
 
@@ -272,14 +303,21 @@ def test_common_env_cannot_be_overridden_by_a_renderer(spec):
     from skyctl.deploy.render.base import common_env
 
     with pytest.raises(ValueError, match="override"):
-        common_env(spec, "aws", platform="aws", compute="ecs", secrets="env", state_url="s3://b",
-                   extra={"SKYCTL_AGENT_MAX_WRITES": "999"})
-
+        common_env(
+            spec,
+            "aws",
+            platform="aws",
+            compute="ecs",
+            secrets="env",
+            state_url="s3://b",
+            extra={"SKYCTL_AGENT_MAX_WRITES": "999"},
+        )
 
 
 # ----------------------------------------------------------------------
 # Decision 1: the state bucket is always provisioned and protected
 # ----------------------------------------------------------------------
+
 
 def test_every_cloud_target_provisions_a_protected_versioned_state_bucket(spec, k8s_spec):
     for s in (spec, k8s_spec):
@@ -308,6 +346,7 @@ def test_protection_can_be_turned_off_deliberately(spec):
 # Decision 2: Azure uses Storage Queues
 # ----------------------------------------------------------------------
 
+
 def test_azure_uses_storage_queues_not_service_bus(spec):
     art = render(spec, "azure")
     res = art.terraform["resource"]
@@ -327,12 +366,16 @@ def test_azure_uses_storage_queues_not_service_bus(spec):
 
 def test_azure_poll_interval_is_configurable(spec):
     art = render(_with(spec, worker__poll_minutes=5), "azure")
-    assert art.terraform["resource"]["azurerm_container_app_job"]["worker"]["schedule_trigger_config"]["cron_expression"] == "*/5 * * * *"
+    assert (
+        art.terraform["resource"]["azurerm_container_app_job"]["worker"]["schedule_trigger_config"]["cron_expression"]
+        == "*/5 * * * *"
+    )
 
 
 # ----------------------------------------------------------------------
 # Decision 3: managed serverless OR Kubernetes on each cloud
 # ----------------------------------------------------------------------
+
 
 def test_kubernetes_example_validates_and_conforms(k8s_spec):
     assert [k8s_spec.compute_for(t) for t in k8s_spec.targets.names()] == ["eks", "aks", "gke"]
@@ -344,14 +387,46 @@ def _backing(art, types):
     return {t: art.terraform["resource"].get(t) for t in types}
 
 
-@pytest.mark.parametrize("target,types", [
-    ("aws", ["aws_s3_bucket", "aws_s3_bucket_versioning", "aws_s3_bucket_lifecycle_configuration",
-             "aws_s3_bucket_server_side_encryption_configuration", "aws_s3_bucket_public_access_block",
-             "aws_s3_object", "aws_sqs_queue", "aws_secretsmanager_secret", "aws_scheduler_schedule_group"]),
-    ("azure", ["azurerm_storage_account", "azurerm_storage_container", "azurerm_storage_queue",
-               "azurerm_storage_management_policy", "azurerm_storage_blob", "azurerm_key_vault", "azurerm_key_vault_secret"]),
-    ("gcp", ["google_storage_bucket", "google_storage_bucket_object", "google_pubsub_topic", "google_secret_manager_secret"]),
-])
+@pytest.mark.parametrize(
+    ("target", "types"),
+    [
+        (
+            "aws",
+            [
+                "aws_s3_bucket",
+                "aws_s3_bucket_versioning",
+                "aws_s3_bucket_lifecycle_configuration",
+                "aws_s3_bucket_server_side_encryption_configuration",
+                "aws_s3_bucket_public_access_block",
+                "aws_s3_object",
+                "aws_sqs_queue",
+                "aws_secretsmanager_secret",
+                "aws_scheduler_schedule_group",
+            ],
+        ),
+        (
+            "azure",
+            [
+                "azurerm_storage_account",
+                "azurerm_storage_container",
+                "azurerm_storage_queue",
+                "azurerm_storage_management_policy",
+                "azurerm_storage_blob",
+                "azurerm_key_vault",
+                "azurerm_key_vault_secret",
+            ],
+        ),
+        (
+            "gcp",
+            [
+                "google_storage_bucket",
+                "google_storage_bucket_object",
+                "google_pubsub_topic",
+                "google_secret_manager_secret",
+            ],
+        ),
+    ],
+)
 def test_backing_services_are_identical_in_both_compute_options(spec, k8s_spec, target, types):
     """Choosing Kubernetes or managed serverless must not change the state, queue or secrets IaC."""
     managed, k8s = render(spec, target), render(k8s_spec, target)
@@ -360,7 +435,7 @@ def test_backing_services_are_identical_in_both_compute_options(spec, k8s_spec, 
         assert managed.env[key] == k8s.env[key], key
     # Same queue. The one intended difference: on GCP, Cloud Run consumes through a
     # push subscription and GKE through a pull subscription on the same topic.
-    topic = lambda url: url.split("?", 1)[0]     # noqa: E731
+    topic = lambda url: url.split("?", 1)[0]
     assert topic(managed.env["SKYCTL_QUEUE_URL"]) == topic(k8s.env["SKYCTL_QUEUE_URL"])
     if target != "gcp":
         assert managed.env["SKYCTL_QUEUE_URL"] == k8s.env["SKYCTL_QUEUE_URL"]
@@ -370,7 +445,7 @@ def test_k8s_modes_bind_cloud_values_without_cluster_credentials(k8s_spec):
     for target in ("aws", "azure", "gcp"):
         art = render(k8s_spec, target)
         res = art.terraform["resource"]
-        assert "local_file" in res and not any(t.startswith("kubernetes_") for t in res)   # no cluster creds needed
+        assert "local_file" in res and not any(t.startswith("kubernetes_") for t in res)  # no cluster creds needed
         bind = json.loads(res["local_file"]["k8s_bind"]["content"])
         kinds = [i["kind"] for i in bind["items"]]
         assert kinds[:3] == ["Namespace", "ServiceAccount", "ConfigMap"]
@@ -387,9 +462,15 @@ def test_k8s_modes_bind_cloud_values_without_cluster_credentials(k8s_spec):
 def test_k8s_identity_per_cloud(k8s_spec):
     aws = render(k8s_spec, "aws").terraform["resource"]
     assert aws["aws_eks_pod_identity_association"]["app"]["service_account"] == "skyctl"
-    irsa = render(_with(k8s_spec, targets__aws__kubernetes__identity="irsa",
-                        targets__aws__kubernetes__oidc_provider_arn="arn:aws:iam::1:oidc-provider/oidc.eks.x/id/A",
-                        targets__aws__kubernetes__oidc_issuer="oidc.eks.x/id/A"), "aws").terraform["resource"]
+    irsa = render(
+        _with(
+            k8s_spec,
+            targets__aws__kubernetes__identity="irsa",
+            targets__aws__kubernetes__oidc_provider_arn="arn:aws:iam::1:oidc-provider/oidc.eks.x/id/A",
+            targets__aws__kubernetes__oidc_issuer="oidc.eks.x/id/A",
+        ),
+        "aws",
+    ).terraform["resource"]
     assert "aws_eks_pod_identity_association" not in irsa
     trust = json.loads(irsa["aws_iam_role"]["app"]["assume_role_policy"])["Statement"][0]
     assert trust["Condition"]["StringEquals"]["oidc.eks.x/id/A:sub"] == "system:serviceaccount:skyctl:skyctl"
@@ -398,23 +479,33 @@ def test_k8s_identity_per_cloud(k8s_spec):
     assert sa["metadata"]["annotations"] == {"eks.amazonaws.com/role-arn": "${aws_iam_role.app.arn}"}
 
     az = render(k8s_spec, "azure").terraform["resource"]
-    assert az["azurerm_federated_identity_credential"]["k8s_app"]["issuer"] == "${data.azurerm_kubernetes_cluster.aks.oidc_issuer_url}"
+    assert (
+        az["azurerm_federated_identity_credential"]["k8s_app"]["issuer"]
+        == "${data.azurerm_kubernetes_cluster.aks.oidc_issuer_url}"
+    )
     gcp = render(k8s_spec, "gcp").terraform["resource"]
     assert gcp["google_service_account_iam_member"]["workload_identity"]["role"] == "roles/iam.workloadIdentityUser"
     assert "google_cloud_run_v2_service" not in gcp and "push_config" not in gcp["google_pubsub_subscription"]["work"]
 
 
 def test_k8s_mode_fetches_the_http_token_from_the_cloud_secret_store(k8s_spec):
-    for target, expected in (("aws", "aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN"),
-                             ("gcp", "gcp-sm://my-skyctl-project/skyctl-http-token#SKYCTL_HTTP_TOKEN")):
+    for target, expected in (
+        ("aws", "aws-sm://skyctl/http-token#SKYCTL_HTTP_TOKEN"),
+        ("gcp", "gcp-sm://my-skyctl-project/skyctl-http-token#SKYCTL_HTTP_TOKEN"),
+    ):
         assert expected in render(k8s_spec, target).env["SKYCTL_SECRETS"]
     aws = render(k8s_spec, "aws").terraform["resource"]
     policy = json.loads(aws["aws_iam_role_policy"]["app"]["policy"])
-    assert policy["Statement"][0]["Resource"] == ["${aws_secretsmanager_secret.config.arn}", "${aws_secretsmanager_secret.http_token.arn}"]
+    assert policy["Statement"][0]["Resource"] == [
+        "${aws_secretsmanager_secret.config.arn}",
+        "${aws_secretsmanager_secret.http_token.arn}",
+    ]
 
 
 def test_k8s_validation(k8s_spec):
-    assert any("oidc_provider_arn" in m for m in errors(_with(k8s_spec, targets__aws__kubernetes__identity="irsa"), "aws"))
+    assert any(
+        "oidc_provider_arn" in m for m in errors(_with(k8s_spec, targets__aws__kubernetes__identity="irsa"), "aws")
+    )
     warn = [f.message for f in validate(_with(k8s_spec, targets__aws__kubernetes__keda_operator_role_arn=None), "aws")]
     assert any("KEDA operator" in m for m in warn)
     assert any("tick catch-up" in f.message for f in validate(k8s_spec, "gcp"))
@@ -422,5 +513,7 @@ def test_k8s_validation(k8s_spec):
     data = k8s_spec.model_dump()
     data["schedules"][1]["timezone"] = "Europe/London"
     assert errors(DeploySpec.model_validate(data), "azure") == []
-    with pytest.raises(ValueError, match="targets.gcp.kubernetes"):
-        DeploySpec.model_validate({**k8s_spec.model_dump(), "targets": {"gcp": {"project": "p", "region": "r", "compute": "gke"}}})
+    with pytest.raises(ValueError, match=r"targets\.gcp\.kubernetes"):
+        DeploySpec.model_validate(
+            {**k8s_spec.model_dump(), "targets": {"gcp": {"project": "p", "region": "r", "compute": "gke"}}}
+        )

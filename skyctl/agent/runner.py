@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.agent.runner
 ===================
@@ -21,13 +36,14 @@ import hashlib
 import json
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Callable, Optional
 
 from ..llm import LLMError, LLMRefusal, default_model
 from ..manager import BskyManager
 from ..ports import ChatProvider, Message, ObjectStore, ToolResult
-from ..tools import ToolContext, ToolRegistry, registry as default_registry
+from ..tools import ToolContext, ToolRegistry
+from ..tools import registry as default_registry
 from .task import RunResult, TaskSpec
 
 RUNS_PREFIX = "runs/"
@@ -42,13 +58,15 @@ def _now() -> datetime:
 # Persistence helpers
 # ----------------------------------------------------------------------
 
+
 class RunLog:
     """Append-only JSONL transcript of one run in the state store."""
 
-    def __init__(self, store: Optional[ObjectStore], run_id: str):
+    def __init__(self, store: ObjectStore | None, run_id: str):
         self.store = store
         self.key = f"{RUNS_PREFIX}{run_id}.jsonl"
-        self.entries: list[dict] = []       # kept in memory too (HTTP status, tests)
+        self.entries: list[dict] = []  # kept in memory too (HTTP status, tests)
+        self.on_event: Callable[[dict], None] | None = None
 
     def append(self, kind: str, **data) -> None:
         entry = {"type": kind, "at": _now().isoformat(), **data}
@@ -79,7 +97,7 @@ class WriteLedger:
         payload = json.dumps([self.task_key, tool, args], sort_keys=True, default=str)
         return f"{LEDGER_PREFIX}{hashlib.sha256(payload.encode('utf-8')).hexdigest()}.json"
 
-    def seen(self, key: str) -> Optional[dict]:
+    def seen(self, key: str) -> dict | None:
         if not self.store.exists(key):
             return None
         try:
@@ -120,9 +138,10 @@ How to work:
 
 
 def build_system_prompt(ctx: ToolContext, now: datetime) -> str:
-    accounts = "\n".join(
-        f"- {alias}: @{ctx.manager.client(alias).config.handle}" for alias in ctx.visible_accounts()
-    ) or "- (none)"
+    accounts = (
+        "\n".join(f"- {alias}: @{ctx.manager.client(alias).config.handle}" for alias in ctx.visible_accounts())
+        or "- (none)"
+    )
     policy = ctx.policy.describe() if ctx.policy else "No restrictions."
     return SYSTEM_PROMPT.format(accounts=accounts, policy=policy, now=now.isoformat(timespec="seconds"))
 
@@ -136,6 +155,15 @@ You are in PLAN MODE. You cannot call write tools directly. Instead:
    an earlier step's result (e.g. quote a post you create in an earlier step).
 4. Call plan_check and fix every error. Then call plan_create once.
 5. Finish with a short report: what the plan does, its assumptions, and whether it awaits approval.
+
+Facts and sources: when a post states facts about current events, check them with web_search and read the
+source with fetch_page; cite the source's URL in the text. Only cite URLs that your tools returned.
+
+Correcting claims in replies: reply only to clear, checkable factual claims that reliable, recent sources
+contradict. Skip opinions, predictions, jokes, sarcasm, questions and contested interpretations; when the evidence
+is unclear, do not reply and say so in your report. At most one reply per author. Be brief and civil: state the
+correction, cite the source, no insults, no speculation about motives. In each step's "why", quote the claim and
+name the evidence.
 """
 
 
@@ -154,6 +182,7 @@ def build_user_prompt(task: TaskSpec) -> str:
 # Runner
 # ----------------------------------------------------------------------
 
+
 class AgentRunner:
     """
     Args:
@@ -169,13 +198,16 @@ class AgentRunner:
     def __init__(
         self,
         manager: BskyManager,
-        provider: Optional[ChatProvider] = None,
+        provider: ChatProvider | None = None,
         registry: ToolRegistry = default_registry,
-        state: Optional[ObjectStore] = None,
-        provider_factory: Optional[Callable[..., ChatProvider]] = None,
+        state: ObjectStore | None = None,
+        provider_factory: Callable[..., ChatProvider] | None = None,
         clock: Callable[[], datetime] = _now,
-        on_event: Optional[Callable[[dict], None]] = None,
+        on_event: Callable[[dict], None] | None = None,
+        search=None,
+        fetcher=None,
     ):
+        self.search, self.fetcher = search, fetcher
         self.manager = manager
         self.provider = provider
         self.registry = registry
@@ -185,7 +217,7 @@ class AgentRunner:
         self._on_event = on_event
 
     @classmethod
-    def from_settings(cls, manager: Optional[BskyManager] = None, settings=None, **kwargs) -> "AgentRunner":
+    def from_settings(cls, manager: BskyManager | None = None, settings=None, **kwargs) -> AgentRunner:
         from ..platform.runtime import get_runtime
 
         runtime = get_runtime(settings)
@@ -210,7 +242,7 @@ class AgentRunner:
         if task.mode == "plan":
             # Reads and plan drafting only; the plan executor does the writing.
             policy.expose_tags = {"read", "plan"}
-            policy.deny_tools = list(policy.deny_tools) + ["plan_execute", "plan_cancel", "plan_list"]
+            policy.deny_tools = [*list(policy.deny_tools), "plan_execute", "plan_cancel", "plan_list"]
         ledger = None
         if self.state is not None and task.allow_writes:
             # Scope the ledger to one logical run (a retry of it shares the key);
@@ -225,6 +257,15 @@ class AgentRunner:
             ctx.plans = PlanStore(self.state)
         ctx.plan_approval = task.plan_approval or ("none" if task.approval == "none" else "out_of_band")
         ctx.principal = f"agent-run:{run_id}"
+        ctx.use_research(self.search, self.fetcher)
+        # The runner sees the whole request, so links in it are the user's own; any other link a
+        # plan publishes must have been retrieved with web_search/fetch_page.
+        import re as _re
+
+        request_text = task.goal + " " + " ".join(str(v) for v in task.context.values())
+        ctx.trusted_urls = {u.rstrip(".,;:!?)") for u in _re.findall(r"https?://[^\s<>\"']+", request_text)}
+        ctx.link_grounding = "error"
+        ctx.require_citations = task.require_citations
         return ctx
 
     def _emit(self, log: RunLog, kind: str, **data) -> None:
@@ -238,8 +279,8 @@ class AgentRunner:
     def run(
         self,
         task: TaskSpec,
-        run_id: Optional[str] = None,
-        on_event: Optional[Callable[[dict], None]] = None,
+        run_id: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ) -> RunResult:
         """Run one task. `on_event` receives each transcript entry as it is written."""
         run_id = run_id or f"{self._clock():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
@@ -278,9 +319,13 @@ class AgentRunner:
                 for k in usage:
                     usage[k] += int(turn.usage.get(k, 0) or 0)
                 self._emit(
-                    log, "turn", n=turn_no, text=turn.text,
+                    log,
+                    "turn",
+                    n=turn_no,
+                    text=turn.text,
                     tool_calls=[{"id": c.id, "name": c.name, "args": c.args} for c in turn.tool_calls],
-                    stop_reason=turn.stop_reason, usage=turn.usage,
+                    stop_reason=turn.stop_reason,
+                    usage=turn.usage,
                 )
                 messages.append(Message(role="assistant", text=turn.text, tool_calls=turn.tool_calls, raw=turn.raw))
 
@@ -297,9 +342,11 @@ class AgentRunner:
                         continue
                     result.tool_calls += 1
                     content, record = self.registry.call_json(call.name, call.args, ctx)
-                    if record.ok and not (record.dry_run or record.pending_approval or record.skipped_duplicate):
-                        if self.registry.get(call.name).mutating:
-                            result.writes += 1
+                    effective = record.ok and not (
+                        record.dry_run or record.pending_approval or record.skipped_duplicate
+                    )
+                    if effective and self.registry.get(call.name).mutating:
+                        result.writes += 1
                     if record.pending_approval:
                         pending += 1
                     self._emit(log, "tool_call", call_id=call.id, **record.to_dict())
@@ -328,13 +375,17 @@ class AgentRunner:
         """Plan mode: execute the proposed plan if it needs no approval, else leave it awaiting one."""
         from ..planning import PlanError, execute_plan
 
-        created = [e for e in log.entries if e.get("type") == "tool_call" and e.get("name") == "plan_create" and e.get("ok")]
+        created = [
+            e for e in log.entries if e.get("type") == "tool_call" and e.get("name") == "plan_create" and e.get("ok")
+        ]
         if not created:
-            return                                   # a read-only request: the summary is the answer
+            return  # a read-only request: the summary is the answer
         info = created[-1]["result"]
         result.plan_id, result.plan_status = info["plan_id"], info["status"]
         if info["status"] != "approved" or not task.allow_writes or task.dry_run:
             result.status = "needs_approval" if info["status"] == "awaiting_approval" else result.status
+            return
+        if ctx.plans is None:
             return
         exec_ctx = self._context(task, result.run_id)
         exec_ctx.writes_done = ctx.writes_done
@@ -348,20 +399,26 @@ class AgentRunner:
         self._emit(log, "plan_executed", plan_id=info["plan_id"], status=record["status"])
         if record["status"] == "failed":
             result.status = "error"
-            result.error = "; ".join(f"{sid}: {s.get('error')}" for sid, s in record["steps"].items() if s["status"] == "failed")
+            result.error = "; ".join(
+                f"{sid}: {s.get('error')}" for sid, s in record["steps"].items() if s["status"] == "failed"
+            )
 
     # -- approval replay -----------------------------------------------
 
     def pending_calls(self, run_id: str) -> list[dict]:
         if self.state is None:
             raise RuntimeError("Approval needs a state store (SKYCTL_STATE_URL).")
-        return [e for e in RunLog.load(self.state, run_id) if e.get("type") == "tool_call" and e.get("pending_approval")]
+        return [
+            e for e in RunLog.load(self.state, run_id) if e.get("type") == "tool_call" and e.get("pending_approval")
+        ]
 
-    def approve(self, run_id: str, call_ids: Optional[list[str]] = None) -> list[dict]:
+    def approve(self, run_id: str, call_ids: list[str] | None = None) -> list[dict]:
         """
         Execute the writes a previous run queued for approval. Returns one
         record per call. Pass call_ids to approve only some of them.
         """
+        if self.state is None:
+            raise RuntimeError("Approval needs a state store (SKYCTL_STATE_URL).")
         entries = RunLog.load(self.state, run_id)
         task_entry = next((e for e in entries if e.get("type") == "task"), None)
         if task_entry is None:
@@ -384,8 +441,11 @@ class AgentRunner:
 
 def _count_writes(record: dict, registry) -> int:
     tools = {s["id"]: s["tool"] for s in record["plan"]["steps"]}
-    return sum(1 for sid, st in record["steps"].items()
-               if st["status"] == "done" and sid in tools and tools[sid] in registry and registry.get(tools[sid]).mutating)
+    return sum(
+        1
+        for sid, st in record["steps"].items()
+        if st["status"] == "done" and sid in tools and tools[sid] in registry and registry.get(tools[sid]).mutating
+    )
 
 
 def _wants_openai_tools(provider) -> bool:

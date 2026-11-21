@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Kubernetes on every cloud: EKS, AKS and GKE (existing clusters).
 # Same intent as managed.deploy.toml; only [targets] differ. skyctl creates
 # the cloud-side backing services (state bucket, queue, secrets) and the
@@ -21,6 +36,7 @@ image = "ghcr.io/example/skyctl:1.2.0"
 model = "anthropic:claude-opus-5-5"
 log_format = "json"
 delayed_delivery = true
+search = "gdelt://"           # web/news search for agents (brave:// / tavily:// need a key in the secrets map)
 
 [policy]                      # ceilings for every agent run, identical on every target
 allow_writes = true

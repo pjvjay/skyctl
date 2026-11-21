@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 
 from skyctl.richtext import (
@@ -11,9 +26,9 @@ from skyctl.richtext import (
 
 def test_grapheme_len_counts_emoji_sequences_as_one():
     assert grapheme_len("hello") == 5
-    assert grapheme_len("👨‍👩‍👧") == 1      # family joined with ZWJ
-    assert grapheme_len("é") == 1     # e + combining accent
-    assert grapheme_len("🇨🇦") == 1         # flag
+    assert grapheme_len("👨‍👩‍👧") == 1  # family joined with ZWJ
+    assert grapheme_len("é") == 1  # e + combining accent
+    assert grapheme_len("🇨🇦") == 1  # flag
 
 
 def test_validate_length_accepts_300_and_rejects_301():
@@ -26,7 +41,7 @@ def test_detect_facets_finds_link_mention_and_tag():
     facets = detect_facets("hi @bsky.app see https://example.com/a?b=1. #test")
     assert [(f.kind, f.value) for f in facets] == [
         ("mention", "bsky.app"),
-        ("link", "https://example.com/a?b=1"),   # trailing full stop dropped
+        ("link", "https://example.com/a?b=1"),  # trailing full stop dropped
         ("tag", "test"),
     ]
 
@@ -35,7 +50,7 @@ def test_facet_offsets_are_utf8_bytes():
     text = "café ☕ https://example.com"
     (facet,) = detect_facets(text)
     raw = text.encode("utf-8")
-    assert raw[facet.byte_start:facet.byte_end].decode("utf-8") == "https://example.com"
+    assert raw[facet.byte_start : facet.byte_end].decode("utf-8") == "https://example.com"
 
 
 def test_detect_facets_ignores_non_facets():

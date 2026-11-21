@@ -101,11 +101,11 @@ cannot do (§3.2).
 ### 2.2 Two independent axes
 
 ```python
-rt = Runtime(settings)                      # skyctl/platform/runtime.py
-rt.platform.name, rt.compute.name           # ("gcp", "cloud-run")      ← compute axis
-rt.object_store()                           # S3ObjectStore / AzureBlob… ← service axis (SKYCTL_STATE_URL)
-rt.has(Cap.BACKGROUND_AFTER_RESPONSE)       # False on request-billed Cloud Run
-rt.run_strategy()                           # "queue" | "thread" | CapabilityError(remedy)
+rt = Runtime(settings)  # skyctl/platform/runtime.py
+rt.platform.name, rt.compute.name  # ("gcp", "cloud-run")      ← compute axis
+rt.object_store()  # S3ObjectStore / AzureBlob… ← service axis (SKYCTL_STATE_URL)
+rt.has(Cap.BACKGROUND_AFTER_RESPONSE)  # False on request-billed Cloud Run
+rt.run_strategy()  # "queue" | "thread" | CapabilityError(remedy)
 ```
 
 ### 2.3 Capabilities and limits
@@ -871,4 +871,3 @@ Corrections found while implementing these:
   injection there, so the token is fetched from the same cloud secret store
   with a `#KEY` URL fragment, keeping one set of secret resources for both
   options. `SKYCTL_SECRETS` now accepts a comma-separated list.
-

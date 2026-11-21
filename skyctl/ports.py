@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.ports
 ============
@@ -21,9 +36,10 @@ skyctl.testing.contracts. See docs/CLOUD_FRAMEWORK.md §3.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .models import ScheduledPost
 
@@ -46,8 +62,9 @@ class SecretStore(Protocol):
 @dataclass(frozen=True)
 class Versioned:
     """Object bytes plus the opaque version token to pass back to put()."""
+
     data: bytes
-    version: str            # S3/Blob: ETag; GCS: generation; file/memory: content hash/counter
+    version: str  # S3/Blob: ETag; GCS: generation; file/memory: content hash/counter
 
 
 @runtime_checkable
@@ -72,11 +89,11 @@ class ObjectStore(Protocol):
     def delete(self, key: str) -> None: ...
     def list(self, prefix: str = "") -> list[str]: ...
 
-    def get(self, key: str) -> Optional[Versioned]:
+    def get(self, key: str) -> Versioned | None:
         """The object and its version, or None if absent."""
         ...
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         """Write, optionally conditionally. Returns the new version. Raises PreconditionFailed."""
         ...
 
@@ -88,9 +105,9 @@ class ObjectStore(Protocol):
 def cas_update(
     store: ObjectStore,
     key: str,
-    mutate: Callable[[Optional[bytes]], Optional[bytes]],
+    mutate: Callable[[bytes | None], bytes | None],
     retries: int = 12,
-) -> Optional[str]:
+) -> str | None:
     """
     Optimistic read-modify-write. `mutate(current_bytes_or_None)` returns the
     new bytes, or None to leave the object unchanged. Retries on
@@ -110,13 +127,13 @@ def cas_update(
                 return store.put(key, new, if_absent=True)
             return store.put(key, new, if_version=current.version)
         except PreconditionFailed:
-            time.sleep(min(0.5, 0.005 * (2 ** attempt)) * (0.5 + random.random()))
+            time.sleep(min(0.5, 0.005 * (2**attempt)) * (0.5 + random.random()))
     raise ConflictError(f"Gave up updating {key!r} after {retries} conflicting writes.")
 
 
 @runtime_checkable
 class SessionStore(Protocol):
-    def get(self, alias: str) -> Optional[str]: ...
+    def get(self, alias: str) -> str | None: ...
     def set(self, alias: str, session: str) -> None: ...
     def clear(self, alias: str) -> None: ...
 
@@ -149,12 +166,13 @@ class JobStore(Protocol):
 # Messaging
 # ----------------------------------------------------------------------
 
+
 @dataclass
 class QueueMessage:
     id: str
     body: dict
-    receipt: Any                 # adapter-specific handle for ack/nack
-    attempt: int = 1             # delivery count, 1-based (where the service reports it)
+    receipt: Any  # adapter-specific handle for ack/nack
+    attempt: int = 1  # delivery count, 1-based (where the service reports it)
 
 
 @runtime_checkable
@@ -169,8 +187,10 @@ class WorkQueue(Protocol):
     Pub/Sub (ack deadline) and Redis/NATS on Kubernetes.
     """
 
-    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str: ...
-    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]: ...
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: str | None = None) -> str: ...
+    def receive(
+        self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0
+    ) -> list[QueueMessage]: ...
     def ack(self, message: QueueMessage) -> None: ...
     def nack(self, message: QueueMessage, delay_seconds: int = 0) -> None: ...
 
@@ -193,7 +213,7 @@ class DelayedDelivery(Protocol):
     always the safety net, so a missed or duplicated delivery is harmless.
     """
 
-    max_horizon_seconds: Optional[int]
+    max_horizon_seconds: int | None
 
     def schedule(self, key: str, when: datetime, body: dict) -> None: ...
     def cancel(self, key: str) -> None: ...
@@ -202,6 +222,7 @@ class DelayedDelivery(Protocol):
 # ----------------------------------------------------------------------
 # Tool-using chat (task agent)
 # ----------------------------------------------------------------------
+
 
 @dataclass
 class ToolCall:
@@ -214,25 +235,26 @@ class ToolCall:
 class ToolResult:
     call_id: str
     name: str
-    content: str            # JSON text
+    content: str  # JSON text
     is_error: bool = False
 
 
 @dataclass
 class Message:
     """One conversation item in a provider-neutral shape."""
-    role: str                                       # "user" | "assistant" | "tool"
+
+    role: str  # "user" | "assistant" | "tool"
     text: str = ""
-    tool_calls: list[ToolCall] = field(default_factory=list)      # assistant
+    tool_calls: list[ToolCall] = field(default_factory=list)  # assistant
     tool_results: list[ToolResult] = field(default_factory=list)  # tool
-    raw: Any = None      # provider-native content, kept so a turn can be echoed back exactly
+    raw: Any = None  # provider-native content, kept so a turn can be echoed back exactly
 
 
 @dataclass
 class ChatTurn:
     text: str
     tool_calls: list[ToolCall]
-    stop_reason: str                    # "end" | "tool_use" | "max_tokens" | "refusal" | other
+    stop_reason: str  # "end" | "tool_use" | "max_tokens" | "refusal" | other
     usage: dict[str, int] = field(default_factory=dict)
     raw: Any = None
 
@@ -243,8 +265,7 @@ class ChatProvider(Protocol):
 
     model: str
 
-    def chat(self, system: str, messages: list[Message], tools: list[dict]) -> ChatTurn:
-        ...
+    def chat(self, system: str, messages: list[Message], tools: list[dict]) -> ChatTurn: ...
 
 
 class Clock(Protocol):

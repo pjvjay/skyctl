@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.server
 =============
@@ -39,14 +54,13 @@ import contextlib
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Mount, Route
+from starlette.routing import BaseRoute, Mount, Route
 
 from .agent import AgentRunner, PolicyCeilingError, RunLog, TaskConfigError, TaskSpec, apply_deployment_ceilings
 from .manager import BskyManager
@@ -72,8 +86,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if not self.chain.methods:
             return JSONResponse(
-                {"error": "No authentication configured; refusing. Set SKYCTL_HTTP_TOKEN or SKYCTL_AUTH "
-                          "(e.g. 'platform' behind Cloud Run IAM / Easy Auth)."},
+                {
+                    "error": "No authentication configured; refusing. Set SKYCTL_HTTP_TOKEN or SKYCTL_AUTH "
+                    "(e.g. 'platform' behind Cloud Run IAM / Easy Auth)."
+                },
                 status_code=503,
             )
         try:
@@ -104,20 +120,20 @@ class RunRegistry:
             if run_id in self._runs:
                 self._runs[run_id].update(status=result["status"], result=result)
 
-    def get(self, run_id: str) -> Optional[dict]:
+    def get(self, run_id: str) -> dict | None:
         with self._lock:
             return self._runs.get(run_id)
 
 
 def create_app(
-    settings: Optional[Settings] = None,
-    manager: Optional[BskyManager] = None,
-    scheduler: Optional[BskyScheduler] = None,
-    runner: Optional[AgentRunner] = None,
+    settings: Settings | None = None,
+    manager: BskyManager | None = None,
+    scheduler: BskyScheduler | None = None,
+    runner: AgentRunner | None = None,
     mcp_server=None,
-    runtime: Optional[Runtime] = None,
-    dispatcher: Optional[Dispatcher] = None,
-    auth_chain: Optional[AuthChain] = None,
+    runtime: Runtime | None = None,
+    dispatcher: Dispatcher | None = None,
+    auth_chain: AuthChain | None = None,
     workers: int = 4,
 ) -> Starlette:
     settings = settings or load_settings()
@@ -155,8 +171,13 @@ def create_app(
 
     def default_policy_fields() -> dict:
         d = settings.agent
-        return {"accounts": d.accounts, "allow_writes": d.allow_writes, "allow_delete": d.allow_delete,
-                "max_writes": d.max_writes, "max_turns": d.max_turns}
+        return {
+            "accounts": d.accounts,
+            "allow_writes": d.allow_writes,
+            "allow_delete": d.allow_delete,
+            "max_writes": d.max_writes,
+            "max_turns": d.max_turns,
+        }
 
     # -- routes --------------------------------------------------------
 
@@ -167,8 +188,15 @@ def create_app(
         try:
             aliases = get_manager().aliases()
             runtime.object_store().exists("readyz")
-            return JSONResponse({"ok": True, "accounts": aliases, "cloud": runtime.platform.name,
-                                 "runtime": runtime.describe(), "auth": auth_chain.names})
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "accounts": aliases,
+                    "cloud": runtime.platform.name,
+                    "runtime": runtime.describe(),
+                    "auth": auth_chain.names,
+                }
+            )
         except Exception as e:
             return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
 
@@ -194,7 +222,9 @@ def create_app(
         outcomes = []
         for inv in invocations:
             outcome = await anyio.to_thread.run_sync(get_dispatcher().dispatch, inv)
-            log_event("invocation", kind=inv.kind, source=inv.source, attempt=inv.attempt, ok=outcome.ok, error=outcome.error)
+            log_event(
+                "invocation", kind=inv.kind, source=inv.source, attempt=inv.attempt, ok=outcome.ok, error=outcome.error
+            )
             if inv.kind == "eventgrid.validate" and outcome.ok:
                 return JSONResponse(outcome.result)
             outcomes.append(outcome)
@@ -284,9 +314,13 @@ def create_app(
         from .tools import ToolContext, ToolPolicy
 
         d = settings.agent
-        ctx = ToolContext(get_manager(), policy=ToolPolicy(accounts=d.accounts, allow_writes=d.allow_writes,
-                                                           allow_delete=d.allow_delete, max_writes=d.max_writes),
-                          scheduler=state["scheduler"])
+        ctx = ToolContext(
+            get_manager(),
+            policy=ToolPolicy(
+                accounts=d.accounts, allow_writes=d.allow_writes, allow_delete=d.allow_delete, max_writes=d.max_writes
+            ),
+            scheduler=state["scheduler"],
+        )
         ctx.plans = PlanStore(runtime.object_store())
         principal = getattr(request.state, "principal", None)
         ctx.principal = principal.subject if principal is not None else "anonymous"
@@ -306,12 +340,15 @@ def create_app(
         ctx = plan_context(request)
         approvers = plan_approvers()
         if ctx.principal.lower() not in approvers:
-            return JSONResponse({"error": f"{ctx.principal!r} may not approve plans (SKYCTL_APPROVER_TOKEN / "
-                                          "SKYCTL_PLAN_APPROVERS)"}, status_code=403)
+            return JSONResponse(
+                {"error": f"{ctx.principal!r} may not approve plans (SKYCTL_APPROVER_TOKEN / SKYCTL_PLAN_APPROVERS)"},
+                status_code=403,
+            )
         body = await request.json() if await request.body() else {}
         try:
-            record = ctx.plans.approve(request.path_params["plan_id"], str(body.get("plan_hash", "")),
-                                       by=ctx.principal, via="http")
+            record = ctx.plans.approve(
+                request.path_params["plan_id"], str(body.get("plan_hash", "")), by=ctx.principal, via="http"
+            )
         except PlanError as e:
             return JSONResponse({"error": str(e)}, status_code=409)
         return JSONResponse({"plan_id": record["id"], "status": record["status"], "approval": record["approval"]})
@@ -326,8 +363,11 @@ def create_app(
         ctx = plan_context(request)
         body = await request.json() if await request.body() else {}
         try:
-            record = await anyio.to_thread.run_sync(lambda: execute_plan(
-                ctx.plans, request.path_params["plan_id"], str(body.get("plan_hash", "")), ctx, registry))
+            record = await anyio.to_thread.run_sync(
+                lambda: execute_plan(
+                    ctx.plans, request.path_params["plan_id"], str(body.get("plan_hash", "")), ctx, registry
+                )
+            )
         except ApprovalRequired as e:
             return JSONResponse({"error": str(e)}, status_code=403)
         except PlanError as e:
@@ -344,7 +384,7 @@ def create_app(
             return JSONResponse({"error": str(e)}, status_code=409)
         return JSONResponse({"plan_id": record["id"], "status": record["status"]})
 
-    routes = [
+    routes: list[BaseRoute] = [
         Route("/healthz", healthz),
         Route("/readyz", readyz),
         Route("/invoke", invoke, methods=["POST"]),
@@ -376,16 +416,28 @@ def create_app(
         )
         config = McpConfig.from_env(default_profile="plan", default_approval="out_of_band")
         config.principal = "mcp-http"
-        config.grounding = "error" if os.getenv("SKYCTL_MCP_STATEFUL", "").lower() in ("1", "true", "yes") else "warning"
+        config.grounding = (
+            "error" if os.getenv("SKYCTL_MCP_STATEFUL", "").lower() in ("1", "true", "yes") else "warning"
+        )
         stateful = os.getenv("SKYCTL_MCP_STATEFUL", "").lower() in ("1", "true", "yes")
         if config.approval == "elicit" and not stateful:
-            log_event("mcp.config", level="warning",
-                      message="SKYCTL_MCP_APPROVAL=elicit needs SKYCTL_MCP_STATEFUL=true (and session affinity); "
-                              "stateless sessions cannot carry the elicitation round-trip.")
+            log_event(
+                "mcp.config",
+                level="warning",
+                message="SKYCTL_MCP_APPROVAL=elicit needs SKYCTL_MCP_STATEFUL=true (and session affinity); "
+                "stateless sessions cannot carry the elicitation round-trip.",
+            )
         mcp_server = build_mcp_server(
-            get_manager(), policy, config=config, state=runtime.object_store(), runner=get_runner(),
-            scheduler=state["scheduler"], streamable_http_path="/",
-            stateless_http=not stateful, json_response=not stateful, **_transport_security(),
+            get_manager(),
+            policy,
+            config=config,
+            state=runtime.object_store(),
+            runner=get_runner(),
+            scheduler=state["scheduler"],
+            streamable_http_path="/",
+            stateless_http=not stateful,
+            json_response=not stateful,
+            **_transport_security(),
         )
     if mcp_server is not None:
         mcp_app = mcp_server.streamable_http_app()
@@ -417,17 +469,20 @@ def _transport_security() -> dict:
     """
     try:
         from mcp.server.transport_security import TransportSecuritySettings
-    except ImportError:          # older SDKs have no such check
+    except ImportError:  # older SDKs have no such check
         return {}
     hosts = [h.strip() for h in os.getenv("SKYCTL_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
     if hosts:
         origins = [o.strip() for o in os.getenv("SKYCTL_MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
-        return {"transport_security": TransportSecuritySettings(
-            enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)}
+        return {
+            "transport_security": TransportSecuritySettings(
+                enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins
+            )
+        }
     return {"transport_security": TransportSecuritySettings(enable_dns_rebinding_protection=False)}
 
 
-def serve(host: str = "0.0.0.0", port: Optional[int] = None) -> None:
+def serve(host: str = "0.0.0.0", port: int | None = None) -> None:
     import uvicorn
 
     from .platform.logging import configure_logging
@@ -435,5 +490,6 @@ def serve(host: str = "0.0.0.0", port: Optional[int] = None) -> None:
 
     runtime = get_runtime()
     configure_logging(runtime.platform, os.getenv("SKYCTL_LOG_FORMAT", "auto"))
-    uvicorn.run(create_app(runtime.settings, runtime=runtime), host=host, port=port or runtime.settings.port,
-                log_level="info")
+    uvicorn.run(
+        create_app(runtime.settings, runtime=runtime), host=host, port=port or runtime.settings.port, log_level="info"
+    )

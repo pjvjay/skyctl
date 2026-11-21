@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters.queues
 ======================
@@ -34,7 +49,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..ports import QueueMessage
@@ -48,29 +63,36 @@ class QueueCapabilityError(ValueError):
 # Memory
 # ----------------------------------------------------------------------
 
+
 class MemoryQueue:
     supports_delay = True
-    max_delay_seconds: Optional[int] = None
+    max_delay_seconds: int | None = None
 
     def __init__(self, clock=time.monotonic):
         self._clock = clock
         self._lock = threading.Lock()
-        self._items: dict[str, dict] = {}      # id -> {body, visible_at, attempts}
+        self._items: dict[str, dict] = {}  # id -> {body, visible_at, attempts}
 
-    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str:
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: str | None = None) -> str:
         msg_id = dedupe_id or uuid.uuid4().hex
         with self._lock:
             if dedupe_id and dedupe_id in self._items:
                 return dedupe_id
-            self._items[msg_id] = {"body": json.loads(json.dumps(body)), "visible_at": self._clock() + delay_seconds, "attempts": 0}
+            self._items[msg_id] = {
+                "body": json.loads(json.dumps(body)),
+                "visible_at": self._clock() + delay_seconds,
+                "attempts": 0,
+            }
         return msg_id
 
-    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]:
+    def receive(
+        self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0
+    ) -> list[QueueMessage]:
         deadline = self._clock() + wait_seconds
         while True:
             with self._lock:
                 now = self._clock()
-                out = []
+                out: list[QueueMessage] = []
                 for msg_id, item in self._items.items():
                     if len(out) >= max_messages:
                         break
@@ -102,12 +124,13 @@ class MemoryQueue:
 # AWS SQS
 # ----------------------------------------------------------------------
 
+
 class SqsQueue:
     supports_delay = True
-    max_delay_seconds = 900          # SQS DelaySeconds ceiling
-    MAX_VISIBILITY = 43_200          # 12 hours
+    max_delay_seconds = 900  # SQS DelaySeconds ceiling
+    MAX_VISIBILITY = 43_200  # 12 hours
 
-    def __init__(self, queue_url: str, client=None, region: Optional[str] = None):
+    def __init__(self, queue_url: str, client=None, region: str | None = None):
         self.queue_url = queue_url
         self.fifo = queue_url.endswith(".fifo")
         self._client = client
@@ -121,10 +144,12 @@ class SqsQueue:
             self._client = boto3.client("sqs", region_name=self._region)
         return self._client
 
-    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str:
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: str | None = None) -> str:
         if delay_seconds > self.max_delay_seconds:
-            raise QueueCapabilityError(f"SQS delays are limited to {self.max_delay_seconds}s; use DelayedDelivery for longer.")
-        kwargs = {"QueueUrl": self.queue_url, "MessageBody": json.dumps(body)}
+            raise QueueCapabilityError(
+                f"SQS delays are limited to {self.max_delay_seconds}s; use DelayedDelivery for longer."
+            )
+        kwargs: dict[str, Any] = {"QueueUrl": self.queue_url, "MessageBody": json.dumps(body)}
         if self.fifo:
             # FIFO queues ignore per-message delays; dedupe and group ids are required.
             kwargs["MessageGroupId"] = body.get("kind", "skyctl")
@@ -133,7 +158,9 @@ class SqsQueue:
             kwargs["DelaySeconds"] = int(delay_seconds)
         return self.client.send_message(**kwargs)["MessageId"]
 
-    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]:
+    def receive(
+        self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0
+    ) -> list[QueueMessage]:
         resp = self.client.receive_message(
             QueueUrl=self.queue_url,
             MaxNumberOfMessages=max(1, min(max_messages, 10)),
@@ -156,7 +183,8 @@ class SqsQueue:
 
     def nack(self, message: QueueMessage, delay_seconds: int = 0) -> None:
         self.client.change_message_visibility(
-            QueueUrl=self.queue_url, ReceiptHandle=message.receipt,
+            QueueUrl=self.queue_url,
+            ReceiptHandle=message.receipt,
             VisibilityTimeout=min(delay_seconds, self.MAX_VISIBILITY),
         )
 
@@ -167,6 +195,7 @@ class SqsQueue:
 # ----------------------------------------------------------------------
 # Azure Service Bus
 # ----------------------------------------------------------------------
+
 
 class ServiceBusQueue:
     """
@@ -179,7 +208,7 @@ class ServiceBusQueue:
     """
 
     supports_delay = True
-    max_delay_seconds: Optional[int] = None
+    max_delay_seconds: int | None = None
 
     def __init__(self, namespace: str, queue: str, client=None):
         self.namespace = namespace
@@ -209,22 +238,26 @@ class ServiceBusQueue:
             self._receiver = self.client.get_queue_receiver(queue_name=self.queue)
         return self._receiver
 
-    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str:
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: str | None = None) -> str:
         from azure.servicebus import ServiceBusMessage
 
         msg_id = dedupe_id or uuid.uuid4().hex
-        kwargs = {"message_id": msg_id, "content_type": "application/json"}
+        kwargs: dict[str, Any] = {"message_id": msg_id, "content_type": "application/json"}
         if delay_seconds:
             kwargs["scheduled_enqueue_time_utc"] = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         self.sender.send_messages(ServiceBusMessage(json.dumps(body), **kwargs))
         return msg_id
 
-    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]:
+    def receive(
+        self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0
+    ) -> list[QueueMessage]:
         msgs = self.receiver.receive_messages(max_message_count=max_messages, max_wait_time=max(wait_seconds, 1))
         out = []
         for m in msgs:
             body = b"".join(m.body) if not isinstance(m.body, (bytes, str)) else m.body
-            out.append(QueueMessage(id=m.message_id, body=json.loads(body), receipt=m, attempt=int(m.delivery_count or 0) + 1))
+            out.append(
+                QueueMessage(id=m.message_id, body=json.loads(body), receipt=m, attempt=int(m.delivery_count or 0) + 1)
+            )
         return out
 
     def ack(self, message: QueueMessage) -> None:
@@ -245,6 +278,7 @@ class ServiceBusQueue:
 # ----------------------------------------------------------------------
 # Azure Storage Queues
 # ----------------------------------------------------------------------
+
 
 class AzureStorageQueue:
     """
@@ -288,20 +322,24 @@ class AzureStorageQueue:
             self._poison = self._make(f"{self.queue}-poison")
         return self._poison
 
-    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str:
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: str | None = None) -> str:
         if delay_seconds > self.max_delay_seconds:
             raise QueueCapabilityError("Storage Queue delays are limited to 7 days; the tick reconciler covers longer.")
         msg = self.client.send_message(json.dumps(body), visibility_timeout=int(delay_seconds) or None, time_to_live=-1)
         return msg.id
 
-    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]:
+    def receive(
+        self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0
+    ) -> list[QueueMessage]:
         # Storage Queues have no long polling; emulate a short wait.
         deadline = time.monotonic() + wait_seconds
         while True:
-            msgs = list(self.client.receive_messages(
-                max_messages=max(1, min(max_messages, 32)),
-                visibility_timeout=min(visibility_seconds, self.MAX_VISIBILITY),
-            ))
+            msgs = list(
+                self.client.receive_messages(
+                    max_messages=max(1, min(max_messages, 32)),
+                    visibility_timeout=min(visibility_seconds, self.MAX_VISIBILITY),
+                )
+            )
             if msgs or time.monotonic() >= deadline:
                 break
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
@@ -317,20 +355,22 @@ class AzureStorageQueue:
         updated = self.client.update_message(
             message.id, message.receipt, visibility_timeout=min(max(delay_seconds, 0), self.MAX_VISIBILITY)
         )
-        message.receipt = updated.pop_receipt        # the old receipt is now invalid
+        message.receipt = updated.pop_receipt  # the old receipt is now invalid
 
     def extend(self, message: QueueMessage, seconds: int) -> None:
         self.nack(message, delay_seconds=seconds)
 
     def dead_letter(self, message: QueueMessage, reason: str = "") -> None:
-        self.poison.send_message(json.dumps({"body": message.body, "reason": reason, "attempt": message.attempt}),
-                                 time_to_live=-1)
+        self.poison.send_message(
+            json.dumps({"body": message.body, "reason": reason, "attempt": message.attempt}), time_to_live=-1
+        )
         self.ack(message)
 
 
 # ----------------------------------------------------------------------
 # Google Pub/Sub
 # ----------------------------------------------------------------------
+
 
 class PubSubQueue:
     """
@@ -367,24 +407,28 @@ class PubSubQueue:
             self._subscriber = pubsub_v1.SubscriberClient()
         return self._subscriber
 
-    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: Optional[str] = None) -> str:
+    def send(self, body: dict, delay_seconds: int = 0, dedupe_id: str | None = None) -> str:
         if delay_seconds:
             raise QueueCapabilityError("Pub/Sub has no delayed delivery; use Cloud Tasks (DelayedDelivery).")
         attrs = {"dedupe_id": dedupe_id} if dedupe_id else {}
         return self.publisher.publish(self.topic_path, json.dumps(body).encode("utf-8"), **attrs).result()
 
-    def receive(self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0) -> list[QueueMessage]:
+    def receive(
+        self, max_messages: int = 1, visibility_seconds: int = 300, wait_seconds: int = 0
+    ) -> list[QueueMessage]:
         resp = self.subscriber.pull(
             request={"subscription": self.subscription_path, "max_messages": max_messages},
             timeout=max(wait_seconds, 1),
         )
         received = list(resp.received_messages)
         if received:
-            self.subscriber.modify_ack_deadline(request={
-                "subscription": self.subscription_path,
-                "ack_ids": [r.ack_id for r in received],
-                "ack_deadline_seconds": min(visibility_seconds, self.MAX_ACK_DEADLINE),
-            })
+            self.subscriber.modify_ack_deadline(
+                request={
+                    "subscription": self.subscription_path,
+                    "ack_ids": [r.ack_id for r in received],
+                    "ack_deadline_seconds": min(visibility_seconds, self.MAX_ACK_DEADLINE),
+                }
+            )
         return [
             QueueMessage(
                 id=r.message.message_id,
@@ -399,11 +443,13 @@ class PubSubQueue:
         self.subscriber.acknowledge(request={"subscription": self.subscription_path, "ack_ids": [message.receipt]})
 
     def nack(self, message: QueueMessage, delay_seconds: int = 0) -> None:
-        self.subscriber.modify_ack_deadline(request={
-            "subscription": self.subscription_path,
-            "ack_ids": [message.receipt],
-            "ack_deadline_seconds": min(max(delay_seconds, 0), self.MAX_ACK_DEADLINE),
-        })
+        self.subscriber.modify_ack_deadline(
+            request={
+                "subscription": self.subscription_path,
+                "ack_ids": [message.receipt],
+                "ack_deadline_seconds": min(max(delay_seconds, 0), self.MAX_ACK_DEADLINE),
+            }
+        )
 
     def extend(self, message: QueueMessage, seconds: int) -> None:
         self.nack(message, delay_seconds=seconds)

@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """WorkQueue and DelayedDelivery adapters against moto (AWS) and SDK-faithful fakes."""
 
 import json
@@ -5,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from conftest import require
 from skyctl.adapters.delayed import (
     CloudTasksDelivery,
     EventBridgeSchedulerDelivery,
@@ -26,8 +42,8 @@ from skyctl.testing.fakes import FakeCloudTasks, FakePubSub, FakeServiceBus
 
 @pytest.fixture
 def aws():
-    moto = pytest.importorskip("moto")
-    boto3 = pytest.importorskip("boto3")
+    moto = require("moto")
+    boto3 = require("boto3")
     with moto.mock_aws():
         yield boto3
 
@@ -82,11 +98,16 @@ def test_queue_url_factory():
 # Delayed delivery
 # ----------------------------------------------------------------------
 
+
 def test_eventbridge_scheduler_one_shot(aws):
     client = aws.client("scheduler", region_name="us-east-1")
     client.create_schedule_group(Name="skyctl")
-    d = EventBridgeSchedulerDelivery("skyctl", "arn:aws:sqs:us-east-1:123456789012:skyctl-work",
-                                     "arn:aws:iam::123456789012:role/scheduler", client=client)
+    d = EventBridgeSchedulerDelivery(
+        "skyctl",
+        "arn:aws:sqs:us-east-1:123456789012:skyctl-work",
+        "arn:aws:iam::123456789012:role/scheduler",
+        client=client,
+    )
     assert isinstance(d, DelayedDelivery) and d.max_horizon_seconds is None
     when = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
     d.schedule("job/1", when, {"kind": "post.send", "job_id": "job/1"})
@@ -94,10 +115,12 @@ def test_eventbridge_scheduler_one_shot(aws):
     assert got["ScheduleExpression"] == "at(2030-01-01T09:00:00)"
     assert got["ActionAfterCompletion"] == "DELETE"
     assert json.loads(got["Target"]["Input"]) == {"kind": "post.send", "job_id": "job/1"}
-    d.schedule("job/1", when + timedelta(hours=1), {"kind": "post.send", "job_id": "job/1"})   # reschedule replaces
-    assert client.get_schedule(Name="skyctl-job-1", GroupName="skyctl")["ScheduleExpression"] == "at(2030-01-01T10:00:00)"
+    d.schedule("job/1", when + timedelta(hours=1), {"kind": "post.send", "job_id": "job/1"})  # reschedule replaces
+    assert (
+        client.get_schedule(Name="skyctl-job-1", GroupName="skyctl")["ScheduleExpression"] == "at(2030-01-01T10:00:00)"
+    )
     d.cancel("job/1")
-    d.cancel("job/1")   # idempotent
+    d.cancel("job/1")  # idempotent
     assert client.list_schedules(GroupName="skyctl")["Schedules"] == []
 
 
@@ -107,16 +130,23 @@ def test_sqs_delay_delivery_has_a_15_minute_horizon(aws):
     d = QueueDelayDelivery(q)
     assert d.max_horizon_seconds == 900
     d.schedule("j", datetime.now(timezone.utc) + timedelta(seconds=30), {"kind": "post.send", "job_id": "j"})
-    assert q.receive(visibility_seconds=1) == []        # not yet visible
+    assert q.receive(visibility_seconds=1) == []  # not yet visible
 
 
 def test_cloud_tasks_delivery():
     fake = FakeCloudTasks()
-    d = CloudTasksDelivery("proj", "europe-west1", "skyctl", "https://svc.run.app/invoke", "invoker@proj.iam.gserviceaccount.com", client=fake)
+    d = CloudTasksDelivery(
+        "proj",
+        "europe-west1",
+        "skyctl",
+        "https://svc.run.app/invoke",
+        "invoker@proj.iam.gserviceaccount.com",
+        client=fake,
+    )
     assert d.max_horizon_seconds == 30 * 24 * 3600
     when = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
     d.schedule("abc", when, {"kind": "post.send", "job_id": "abc"})
-    d.schedule("abc", when, {"kind": "post.send", "job_id": "abc"})     # duplicate is absorbed
+    d.schedule("abc", when, {"kind": "post.send", "job_id": "abc"})  # duplicate is absorbed
     [(name, task)] = fake.tasks.items()
     assert name == "projects/proj/locations/europe-west1/queues/skyctl/tasks/skyctl-abc"
     assert task["http_request"]["oidc_token"]["audience"] == "https://svc.run.app/invoke"
@@ -144,6 +174,7 @@ def test_delayed_url_factory():
 # Azure Storage Queues (the chosen Azure queue)
 # ----------------------------------------------------------------------
 
+
 def _storage_queue():
     from skyctl.adapters.queues import AzureStorageQueue
     from skyctl.testing.fakes import FakeStorageQueue
@@ -161,7 +192,7 @@ def test_storage_queue_delay_up_to_seven_days_never_expires():
     q, main, _ = _storage_queue()
     q.send({"kind": "post.send", "job_id": "j"}, delay_seconds=7 * 24 * 3600)
     [m] = main.messages.values()
-    assert m["ttl"] == -1                                  # otherwise a 7-day delay would expire first
+    assert m["ttl"] == -1  # otherwise a 7-day delay would expire first
     with pytest.raises(QueueCapabilityError):
         q.send({"kind": "x"}, delay_seconds=7 * 24 * 3600 + 1)
     assert QueueDelayDelivery(q).max_horizon_seconds == 7 * 24 * 3600
@@ -172,9 +203,9 @@ def test_storage_queue_tracks_the_new_pop_receipt_after_extend():
     q.send({"kind": "tick"})
     [m] = q.receive(visibility_seconds=30)
     first = m.receipt
-    q.extend(m, 60)                                       # heartbeat during a long run
+    q.extend(m, 60)  # heartbeat during a long run
     assert m.receipt != first
-    q.ack(m)                                              # would fail with the stale receipt
+    q.ack(m)  # would fail with the stale receipt
     assert q.receive(visibility_seconds=1) == []
 
 
@@ -186,7 +217,10 @@ def test_storage_queue_poison_messages_go_to_a_poison_queue():
     stats = run_worker(q, Dispatcher({}), idle_exit_seconds=0, wait_seconds=0)
     assert stats.dropped == 1 and main.messages == {}
     [p] = poison.messages.values()
-    assert json.loads(p["content"])["body"] == {"kind": "unknown-kind"} and "No handler" in json.loads(p["content"])["reason"]
+    assert (
+        json.loads(p["content"])["body"] == {"kind": "unknown-kind"}
+        and "No handler" in json.loads(p["content"])["reason"]
+    )
 
 
 def test_storage_queue_url():

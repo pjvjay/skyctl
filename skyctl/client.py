@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.client
 =============
@@ -8,11 +23,10 @@ All methods return typed result objects rather than raw API dicts.
 from __future__ import annotations
 
 import html as html_lib
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from atproto import Client as AtProtoClient
 from atproto import models as at_models
@@ -26,9 +40,7 @@ if TYPE_CHECKING:  # pragma: no cover
 MAX_IMAGES = 4
 MAX_THUMB_BYTES = 1_000_000
 
-_BSKY_URL_RE = re.compile(
-    r"^https?://bsky\.app/profile/([^/]+)/post/([^/?#]+)"
-)
+_BSKY_URL_RE = re.compile(r"^https?://bsky\.app/profile/([^/]+)/post/([^/?#]+)")
 
 
 def _now_utc() -> str:
@@ -64,24 +76,27 @@ def fetch_link_metadata(url: str) -> dict:
     Fetch title, description and preview image bytes for a link card.
     Never raises: on any failure the card falls back to the bare URL.
     """
-    meta = {"title": url, "description": "", "thumb": None}
+    meta: dict[str, Any] = {"title": url, "description": "", "thumb": None}
     try:
         import httpx
 
+        from .research import check_url
+
+        check_url(url)  # SSRF: never fetch internal / metadata addresses for a card
+
         headers = {"User-Agent": "skyctl-linkcard"}
-        resp = httpx.get(url, follow_redirects=True, timeout=10, headers=headers)
+        resp = httpx.get(url, follow_redirects=False, timeout=10, headers=headers)
         page = resp.text[:300_000]
         title = _meta_content(page, "og:title")
         if not title:
             m = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
             title = html_lib.unescape(m.group(1)).strip() if m else ""
         meta["title"] = title or url
-        meta["description"] = _meta_content(page, "og:description") or _meta_content(
-            page, "description"
-        )
+        meta["description"] = _meta_content(page, "og:description") or _meta_content(page, "description")
         image_url = _meta_content(page, "og:image")
         if image_url:
             image_url = str(httpx.URL(str(resp.url)).join(image_url))
+            check_url(image_url)
             img = httpx.get(image_url, follow_redirects=True, timeout=10, headers=headers)
             if img.status_code == 200 and len(img.content) <= MAX_THUMB_BYTES:
                 meta["thumb"] = img.content
@@ -106,9 +121,9 @@ class BskyClient:
     def __init__(
         self,
         config: AccountConfig,
-        session_dir: Optional[Union[str, Path]] = None,
-        session_store: Optional["SessionStore"] = None,
-        media_store: Optional["ObjectStore"] = None,
+        session_dir: str | Path | None = None,
+        session_store: SessionStore | None = None,
+        media_store: ObjectStore | None = None,
         atproto_factory=None,
     ):
         """
@@ -153,7 +168,7 @@ class BskyClient:
         self._ensure_logged_in()
         return self._client.me.did
 
-    def login(self) -> "BskyClient":
+    def login(self) -> BskyClient:
         """
         Authenticate with Bluesky. Returns self for chaining.
 
@@ -170,9 +185,7 @@ class BskyClient:
                 # Expired or corrupt session: start clean and use the password.
                 self._client = self._new_client()
 
-        self._profile = self._client.login(
-            self.config.handle, self.config.password
-        )
+        self._profile = self._client.login(self.config.handle, self.config.password)
         self._after_login()
         return self
 
@@ -211,11 +224,11 @@ class BskyClient:
     def post(
         self,
         text: str,
-        image_paths: Optional[list[str]] = None,
-        langs: Optional[list[str]] = None,
-        image_alts: Optional[list[str]] = None,
-        quote_uri: Optional[str] = None,
-        link_card: Optional[str] = None,
+        image_paths: list[str] | None = None,
+        langs: list[str] | None = None,
+        image_alts: list[str] | None = None,
+        quote_uri: str | None = None,
+        link_card: str | None = None,
     ) -> PostResult:
         """
         Create a new top-level post.
@@ -246,14 +259,14 @@ class BskyClient:
         self,
         text: str,
         parent_uri: str,
-        parent_cid: Optional[str] = None,
-        image_paths: Optional[list[str]] = None,
-        langs: Optional[list[str]] = None,
-        image_alts: Optional[list[str]] = None,
-        root_uri: Optional[str] = None,
-        root_cid: Optional[str] = None,
-        quote_uri: Optional[str] = None,
-        link_card: Optional[str] = None,
+        parent_cid: str | None = None,
+        image_paths: list[str] | None = None,
+        langs: list[str] | None = None,
+        image_alts: list[str] | None = None,
+        root_uri: str | None = None,
+        root_cid: str | None = None,
+        quote_uri: str | None = None,
+        link_card: str | None = None,
     ) -> PostResult:
         """
         Reply to an existing post.
@@ -280,10 +293,10 @@ class BskyClient:
 
     def thread(
         self,
-        text: Union[str, list[str]],
-        image_paths: Optional[list[str]] = None,
-        image_alts: Optional[list[str]] = None,
-        langs: Optional[list[str]] = None,
+        text: str | list[str],
+        image_paths: list[str] | None = None,
+        image_alts: list[str] | None = None,
+        langs: list[str] | None = None,
     ) -> list[PostResult]:
         """
         Post a thread. A string is split into parts of at most 300
@@ -300,11 +313,7 @@ class BskyClient:
             except ValueError as e:
                 return [self._error(str(e))]
 
-        results = [
-            self.post(
-                parts[0], image_paths=image_paths, image_alts=image_alts, langs=langs
-            )
-        ]
+        results = [self.post(parts[0], image_paths=image_paths, image_alts=image_alts, langs=langs)]
         root = results[0]
         for part in parts[1:]:
             prev = results[-1]
@@ -322,7 +331,7 @@ class BskyClient:
             )
         return results
 
-    def repost(self, uri: str, cid: Optional[str] = None) -> PostResult:
+    def repost(self, uri: str, cid: str | None = None) -> PostResult:
         """Repost (boost) an existing post."""
         self._ensure_logged_in()
         try:
@@ -334,7 +343,7 @@ class BskyClient:
         except Exception as e:
             return self._error(str(e))
 
-    def like(self, uri: str, cid: Optional[str] = None) -> PostResult:
+    def like(self, uri: str, cid: str | None = None) -> PostResult:
         """Like a post."""
         self._ensure_logged_in()
         try:
@@ -368,12 +377,10 @@ class BskyClient:
     def get_notifications(self, limit: int = 20) -> list[dict]:
         """Fetch unread notifications."""
         self._ensure_logged_in()
-        resp = self._client.app.bsky.notification.list_notifications(
-            {"limit": limit}
-        )
+        resp = self._client.app.bsky.notification.list_notifications({"limit": limit})
         return [n.model_dump() for n in resp.notifications]
 
-    def get_profile(self, handle: Optional[str] = None) -> dict:
+    def get_profile(self, handle: str | None = None) -> dict:
         """Get profile info. Defaults to the logged-in account."""
         self._ensure_logged_in()
         handle = handle or self.config.handle
@@ -383,9 +390,7 @@ class BskyClient:
     def search_posts(self, query: str, limit: int = 25) -> list[dict]:
         """Search posts by keyword."""
         self._ensure_logged_in()
-        resp = self._client.app.bsky.feed.search_posts(
-            {"q": query, "limit": limit}
-        )
+        resp = self._client.app.bsky.feed.search_posts({"q": query, "limit": limit})
         return [self._flatten_post_record(p) for p in resp.posts]
 
     def get_post(self, uri: str) -> dict:
@@ -400,7 +405,32 @@ class BskyClient:
         data["replies"] = getattr(post, "reply_count", None)
         return data
 
-    def list_posts(self, actor: Optional[str] = None, limit: int = 30) -> list[dict]:
+    def get_post_thread(self, uri: str, depth: int = 6, max_replies: int = 100) -> dict:
+        """
+        A post and its replies ("the comments"), flattened breadth-first:
+        {"post": {...}, "replies": [{uri, cid, author, text, created_at, likes,
+        reply_to, depth}, ...]}. Deleted or blocked replies are skipped.
+        """
+        self._ensure_logged_in()
+        uri = self._normalize_uri(uri)
+        resp = self._client.get_post_thread(uri=uri, depth=depth, parent_height=0)
+        root = resp.thread
+        if getattr(root, "post", None) is None:
+            raise ValueError(f"Post not found or not visible: {uri}")
+        out: dict[str, Any] = {"post": self._flatten_post_record(root.post), "replies": []}
+        queue = [(r, root.post.uri, 1) for r in (getattr(root, "replies", None) or [])]
+        while queue and len(out["replies"]) < max_replies:
+            node, parent, level = queue.pop(0)
+            post = getattr(node, "post", None)
+            if post is None:  # NotFoundPost / BlockedPost
+                continue
+            item = self._flatten_post_record(post)
+            item.update(reply_to=parent, depth=level)
+            out["replies"].append(item)
+            queue += [(r, post.uri, level + 1) for r in (getattr(node, "replies", None) or [])]
+        return out
+
+    def list_posts(self, actor: str | None = None, limit: int = 30) -> list[dict]:
         """
         List an account's recent posts (newest first) straight from its
         repo on the PDS. `actor` is a handle or DID; defaults to this account.
@@ -423,9 +453,7 @@ class BskyClient:
     def _flatten_repo_record(record, author: str) -> dict:
         def field(obj, *names):
             for name in names:
-                value = (
-                    obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
-                )
+                value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
                 if value is not None:
                     return value
             return None
@@ -457,9 +485,7 @@ class BskyClient:
         )
 
     def _error(self, message: str) -> PostResult:
-        return PostResult(
-            account=self.alias, uri="", cid="", url="", error=message
-        )
+        return PostResult(account=self.alias, uri="", cid="", url="", error=message)
 
     def _send(
         self,
@@ -555,9 +581,7 @@ class BskyClient:
             parent = StrongRef(uri=parent_uri, cid=parent_cid or parent_post.cid)
             parent_reply = getattr(parent_post.record, "reply", None)
             if parent_reply is not None:
-                root = StrongRef(
-                    uri=parent_reply.root.uri, cid=parent_reply.root.cid
-                )
+                root = StrongRef(uri=parent_reply.root.uri, cid=parent_reply.root.cid)
             else:
                 root = parent
         return at_models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
@@ -597,17 +621,13 @@ class BskyClient:
 
         quote_uri = self._normalize_uri(quote_uri)
         record = at_models.AppBskyEmbedRecord.Main(
-            record=at_models.ComAtprotoRepoStrongRef.Main(
-                uri=quote_uri, cid=self._fetch_cid(quote_uri)
-            )
+            record=at_models.ComAtprotoRepoStrongRef.Main(uri=quote_uri, cid=self._fetch_cid(quote_uri))
         )
         if media is None:
             return record
         return at_models.AppBskyEmbedRecordWithMedia.Main(record=record, media=media)
 
-    def _build_image_embed(
-        self, image_paths: list[str], image_alts: Optional[list[str]] = None
-    ):
+    def _build_image_embed(self, image_paths: list[str], image_alts: list[str] | None = None):
         """Upload images and return an embed object."""
         image_alts = image_alts or []
         images = []
@@ -616,9 +636,7 @@ class BskyClient:
             data = self._read_image(path_str)
             blob = self._client.upload_blob(data)
             alt = image_alts[i] if i < len(image_alts) else path.stem
-            images.append(
-                at_models.AppBskyEmbedImages.Image(image=blob.blob, alt=alt)
-            )
+            images.append(at_models.AppBskyEmbedImages.Image(image=blob.blob, alt=alt))
         return at_models.AppBskyEmbedImages.Main(images=images)
 
     def _build_link_card(self, url: str):

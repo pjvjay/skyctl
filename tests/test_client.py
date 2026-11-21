@@ -1,11 +1,26 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from types import SimpleNamespace
 
 from atproto import models as at_models
 
 import skyctl
 import skyctl.client as client_mod
-from skyctl import AccountConfig, BskyClient
 from conftest import make_post_view
+from skyctl import AccountConfig, BskyClient
 
 ROOT = "at://did:plc:alice/app.bsky.feed.post/root"
 MIDDLE = "at://did:plc:bob/app.bsky.feed.post/middle"
@@ -16,6 +31,7 @@ def test_public_classes_are_exported():
 
 
 # -- posting quality ---------------------------------------------------
+
 
 def test_post_sends_facets_for_link_mention_and_tag(client):
     result = client.post("hi @bsky.app https://example.com #test")
@@ -70,6 +86,7 @@ def test_missing_image_is_an_error_before_login(client):
 
 # -- replies and threads -----------------------------------------------
 
+
 def test_reply_to_top_level_post_uses_parent_as_root(client):
     client._client.posts[ROOT] = make_post_view(ROOT, "cid-root")
     client.reply("hi", parent_uri=ROOT)
@@ -121,6 +138,7 @@ def test_thread_stops_at_first_failure(client):
 
 # -- embeds ------------------------------------------------------------
 
+
 def test_quote_post_produces_a_record_embed(client):
     client._client.posts[ROOT] = make_post_view(ROOT, "cid-root")
     client.post("worth reading", quote_uri=ROOT)
@@ -168,6 +186,7 @@ def test_images_and_link_card_together_are_rejected(client, tmp_path):
 
 # -- other actions -----------------------------------------------------
 
+
 def test_like_repost_delete_and_search(client):
     client._client.posts[ROOT] = make_post_view(ROOT, "cid-root")
     assert client.like(ROOT).success
@@ -181,21 +200,18 @@ def test_like_repost_delete_and_search(client):
 
 # -- session reuse -----------------------------------------------------
 
+
 def test_second_start_reuses_cached_session(tmp_path, fake_atproto):
     config = AccountConfig("personal", "me.test", "app-pass")
 
     first = BskyClient(config, session_dir=tmp_path).login()
-    assert first._client.login_calls == [
-        {"login": "me.test", "password": "app-pass", "session_string": None}
-    ]
+    assert first._client.login_calls == [{"login": "me.test", "password": "app-pass", "session_string": None}]
     session_file = tmp_path / "personal.session"
     assert session_file.read_text() == "fake-session-string"
     assert (session_file.stat().st_mode & 0o777) == 0o600
 
     second = BskyClient(config, session_dir=tmp_path).login()
-    assert second._client.login_calls == [
-        {"login": None, "password": None, "session_string": "fake-session-string"}
-    ]
+    assert second._client.login_calls == [{"login": None, "password": None, "session_string": "fake-session-string"}]
 
 
 def test_expired_session_falls_back_to_password(tmp_path, fake_atproto):

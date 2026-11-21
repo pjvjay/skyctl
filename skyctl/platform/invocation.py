@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.invocation
 ==========================
@@ -24,6 +39,7 @@ Payload kinds (the canonical vocabulary):
     {"kind": "task.run", "task": "<name>" | {TaskSpec fields}, "run_id": "...", "overrides": {...},
      "slot": {"cron": "0 9 * * mon-fri", "timezone": "UTC"}}      # added to scheduled runs
     {"kind": "task.approve", "run_id": "...", "call_ids": [...]}
+    {"kind": "plan.execute", "plan_id": "...", "plan_hash": "sha256:..."}   # an already-approved plan
 
 Delivery is at-least-once on every platform, so every handler is
 idempotent (claim protocol for posts, write ledger for agent runs).
@@ -35,8 +51,9 @@ import base64
 import json
 import time
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional
+from typing import Any
 
 from .base import TraceContext, _header
 
@@ -55,7 +72,7 @@ class Invocation:
     trace: TraceContext = field(default_factory=TraceContext)
 
     @classmethod
-    def from_payload(cls, payload: Any, **kw) -> "Invocation":
+    def from_payload(cls, payload: Any, **kw) -> Invocation:
         if not isinstance(payload, dict) or not isinstance(payload.get("kind"), str):
             raise InvocationError(f"Payload must be a JSON object with a 'kind': {str(payload)[:200]}")
         return cls(kind=payload["kind"], payload=payload, **kw)
@@ -65,7 +82,8 @@ class Invocation:
 # Decoders
 # ----------------------------------------------------------------------
 
-def decode_json(body: Any, source: str = "direct", attempt: int = 1, msg_id: Optional[str] = None) -> Invocation:
+
+def decode_json(body: Any, source: str = "direct", attempt: int = 1, msg_id: str | None = None) -> Invocation:
     if isinstance(body, (bytes, str)):
         try:
             body = json.loads(body)
@@ -115,7 +133,7 @@ def decode_http(headers: Mapping[str, str], body: bytes, platform=None) -> list[
 
     # CloudEvents, structured content mode.
     if "application/cloudevents" in ctype or (isinstance(doc, dict) and "specversion" in doc and "type" in doc):
-        events = doc if isinstance(doc, list) else [doc]       # batch mode is a JSON array
+        events = doc if isinstance(doc, list) else [doc]  # batch mode is a JSON array
         out = []
         for ev in events:
             data = ev.get("data")
@@ -145,7 +163,7 @@ def decode_http(headers: Mapping[str, str], body: bytes, platform=None) -> list[
     return done([decode_json(doc, source="http")])
 
 
-def decode_lambda_event(event: Any, platform=None) -> tuple[str, list[tuple[Optional[str], Invocation]]]:
+def decode_lambda_event(event: Any, platform=None) -> tuple[str, list[tuple[str | None, Invocation]]]:
     """
     Returns (shape, [(item_id, invocation)]). shape is "sqs" (partial batch
     failures apply), "http" (function URL / API Gateway) or "direct".
@@ -156,7 +174,9 @@ def decode_lambda_event(event: Any, platform=None) -> tuple[str, list[tuple[Opti
             if rec.get("eventSource") != "aws:sqs":
                 raise InvocationError(f"Unsupported record source {rec.get('eventSource')!r}")
             attempt = int((rec.get("attributes") or {}).get("ApproximateReceiveCount", 1))
-            items.append((rec["messageId"], decode_json(rec["body"], source="sqs", attempt=attempt, msg_id=rec["messageId"])))
+            items.append(
+                (rec["messageId"], decode_json(rec["body"], source="sqs", attempt=attempt, msg_id=rec["messageId"]))
+            )
         return "sqs", items
     if isinstance(event, dict) and "requestContext" in event and "body" in event:
         body = event.get("body") or ""
@@ -171,6 +191,7 @@ def decode_lambda_event(event: Any, platform=None) -> tuple[str, list[tuple[Opti
 # Dispatch
 # ----------------------------------------------------------------------
 
+
 class RetryableError(RuntimeError):
     """The handler failed transiently; the platform should redeliver."""
 
@@ -180,7 +201,7 @@ class Outcome:
     ok: bool
     kind: str
     result: Any = None
-    error: Optional[str] = None
+    error: str | None = None
     retry: bool = False
 
     def to_dict(self) -> dict:
@@ -191,7 +212,7 @@ Handler = Callable[[Invocation], Any]
 
 
 class Dispatcher:
-    def __init__(self, handlers: Optional[dict[str, Handler]] = None):
+    def __init__(self, handlers: dict[str, Handler] | None = None):
         self.handlers: dict[str, Handler] = dict(handlers or {})
 
     def register(self, kind: str, handler: Handler) -> None:
@@ -201,15 +222,27 @@ class Dispatcher:
         handler = self.handlers.get(inv.kind)
         if handler is None:
             # Unknown kinds are permanent failures: retrying will not help.
-            return Outcome(False, inv.kind, error=f"No handler for kind {inv.kind!r}. Known: {', '.join(sorted(self.handlers))}")
+            return Outcome(
+                False, inv.kind, error=f"No handler for kind {inv.kind!r}. Known: {', '.join(sorted(self.handlers))}"
+            )
         try:
             return Outcome(True, inv.kind, result=handler(inv))
         except RetryableError as e:
             return Outcome(False, inv.kind, error=str(e), retry=True)
         except (InvocationError, ValueError, PermissionError, KeyError) as e:
             return Outcome(False, inv.kind, error=f"{type(e).__name__}: {e}")
-        except Exception as e:           # unexpected: let the platform retry (bounded by its DLQ policy)
+        except Exception as e:  # unexpected: let the platform retry (bounded by its DLQ policy)
             return Outcome(False, inv.kind, error=f"{type(e).__name__}: {e}", retry=True)
+
+
+def deployment_policy(settings):
+    """The ToolPolicy implied by a deployment's ceilings (SKYCTL_AGENT_*)."""
+    from ..tools import ToolPolicy
+
+    d = settings.agent
+    return ToolPolicy(
+        accounts=d.accounts, allow_writes=d.allow_writes, allow_delete=d.allow_delete, max_writes=max(d.max_writes, 1)
+    )
 
 
 def default_dispatcher(runtime=None, manager=None, scheduler=None, runner=None) -> Dispatcher:
@@ -252,8 +285,12 @@ def default_dispatcher(runtime=None, manager=None, scheduler=None, runner=None) 
         if not job_id:
             raise InvocationError("post.send needs job_id")
         result = sched().send_now(job_id)
-        return {"job_id": job_id, "sent": bool(result and result.success), "noop": result is None,
-                "error": result.error if result is not None else None}
+        return {
+            "job_id": job_id,
+            "sent": bool(result and result.success),
+            "noop": result is None,
+            "error": result.error if result is not None else None,
+        }
 
     def task_run(inv: Invocation):
         from ..agent import TaskSpec, apply_deployment_ceilings, load_tasks
@@ -289,21 +326,46 @@ def default_dispatcher(runtime=None, manager=None, scheduler=None, runner=None) 
     def task_approve(inv: Invocation):
         return run().approve(inv.payload["run_id"], inv.payload.get("call_ids"))
 
+    def plan_execute(inv: Invocation):
+        """Execute an approved plan with the deployment's identity (e.g. after `skyctl run-cloud-task` approval)."""
+        from ..planning import ApprovalRequired, PlanError, PlanStore, execute_plan
+        from ..tools import ToolContext, registry
+        from ..tools.plan_tools import _detail
+
+        plan_id, plan_hash = inv.payload.get("plan_id"), inv.payload.get("plan_hash")
+        if not plan_id or not plan_hash:
+            raise InvocationError("plan.execute needs plan_id and plan_hash")
+        ctx = ToolContext(mgr(), policy=deployment_policy(rt().settings), scheduler=sched())
+        ctx.plans = PlanStore(rt().object_store())
+        ctx.principal = f"worker:{inv.source}"
+        try:
+            return _detail(execute_plan(ctx.plans, plan_id, plan_hash, ctx, registry))
+        except ApprovalRequired as e:
+            raise PermissionError(str(e)) from None  # permanent: nobody approved it
+        except PlanError as e:
+            if "already executing" in str(e):
+                raise RetryableError(str(e)) from None  # a duplicate delivery; try again later
+            raise ValueError(str(e)) from None
+
     def eventgrid_validate(inv: Invocation):
         return {"validationResponse": inv.payload.get("validationCode")}
 
-    return Dispatcher({
-        "tick": tick,
-        "post.send": post_send,
-        "task.run": task_run,
-        "task.approve": task_approve,
-        "eventgrid.validate": eventgrid_validate,
-    })
+    return Dispatcher(
+        {
+            "tick": tick,
+            "post.send": post_send,
+            "task.run": task_run,
+            "task.approve": task_approve,
+            "plan.execute": plan_execute,
+            "eventgrid.validate": eventgrid_validate,
+        }
+    )
 
 
 # ----------------------------------------------------------------------
 # Queue worker
 # ----------------------------------------------------------------------
+
 
 @dataclass
 class WorkerStats:
@@ -319,7 +381,7 @@ class WorkerStats:
 class _Heartbeat:
     """Extends a message's visibility in the background while it is being handled."""
 
-    def __init__(self, queue, message, visibility_seconds: int, every: Optional[float]):
+    def __init__(self, queue, message, visibility_seconds: int, every: float | None):
         import threading
 
         self.queue, self.message = queue, message
@@ -357,12 +419,12 @@ def run_worker(
     *,
     max_messages: int = 1,
     visibility_seconds: int = 900,
-    idle_exit_seconds: Optional[float] = 30,
+    idle_exit_seconds: float | None = 30,
     max_attempts: int = 5,
     retry_base_seconds: int = 30,
-    stop: Optional[Callable[[], bool]] = None,
+    stop: Callable[[], bool] | None = None,
     wait_seconds: int = 10,
-    heartbeat_seconds: Optional[float] = 60,
+    heartbeat_seconds: float | None = 60,
 ) -> WorkerStats:
     """
     Drain a WorkQueue. Exits after `idle_exit_seconds` with nothing to do
@@ -382,7 +444,9 @@ def run_worker(
     stats = WorkerStats()
     idle_since = time.monotonic()
     while not (stop and stop()):
-        messages = queue.receive(max_messages=max_messages, visibility_seconds=visibility_seconds, wait_seconds=wait_seconds)
+        messages = queue.receive(
+            max_messages=max_messages, visibility_seconds=visibility_seconds, wait_seconds=wait_seconds
+        )
         if not messages:
             if idle_exit_seconds is not None and time.monotonic() - idle_since >= idle_exit_seconds:
                 break
@@ -404,10 +468,19 @@ def run_worker(
                 queue.nack(msg, delay_seconds=min(retry_base_seconds * 2 ** (msg.attempt - 1), 900))
             else:
                 stats.dropped += 1
-                print(json.dumps({"event": "invocation.dropped", "kind": outcome.kind, "error": outcome.error,
-                                  "attempt": msg.attempt, "message_id": msg.id}))
+                print(
+                    json.dumps(
+                        {
+                            "event": "invocation.dropped",
+                            "kind": outcome.kind,
+                            "error": outcome.error,
+                            "attempt": msg.attempt,
+                            "message_id": msg.id,
+                        }
+                    )
+                )
                 if hasattr(queue, "dead_letter"):
-                    queue.dead_letter(msg, outcome.error or "")   # services without a native DLQ
+                    queue.dead_letter(msg, outcome.error or "")  # services without a native DLQ
                 else:
                     queue.ack(msg)
     return stats

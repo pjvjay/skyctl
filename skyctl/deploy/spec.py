@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.deploy.spec
 ==================
@@ -12,9 +27,8 @@ or a reference to an existing secret (Kubernetes, Compose).
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,7 +37,17 @@ try:
 except ImportError:  # Python 3.10
     import tomli as tomllib
 
-KNOWN_KINDS = {"tick", "post.send", "task.run", "task.approve"}
+_T = TypeVar("_T")
+
+
+def required(value: _T | None, name: str) -> _T:
+    """A configured part of the spec, or a clear error (typed narrowing for renderers)."""
+    if value is None:
+        raise ValueError(f"[targets.{name}] is not configured in the deployment spec")
+    return value
+
+
+KNOWN_KINDS = {"tick", "post.send", "task.run", "task.approve", "plan.execute"}
 
 
 class _Strict(BaseModel):
@@ -38,11 +62,17 @@ class AppSpec(_Strict):
 class RuntimeSpec(_Strict):
     model: str = "anthropic:claude-opus-5-5"
     log_format: Literal["json", "text", "auto"] = "json"
-    delayed_delivery: bool = True        # use the platform's native one-shot scheduling fast path
+    delayed_delivery: bool = True  # use the platform's native one-shot scheduling fast path
+    search: str = Field(
+        "gdelt://",
+        description="Web/news search for agents: gdelt:// (no key), brave://, "
+        "tavily:// (put the API key in the secrets map) or none.",
+    )
 
 
 class PolicySpec(_Strict):
     """Deployment-wide ceilings for the task agent (identical on every target)."""
+
     allow_writes: bool = False
     allow_delete: bool = False
     max_writes: int = Field(5, ge=0)
@@ -67,8 +97,13 @@ class WorkerSpec(_Strict):
     max_concurrency: int = Field(2, ge=1)
     visibility_seconds: int = Field(900, ge=60)
     max_attempts: int = Field(5, ge=1)
-    poll_minutes: int = Field(1, ge=1, le=60, description="Where the worker drains the queue on a schedule "
-                              "(Azure Container Apps + Storage Queues): how often.")
+    poll_minutes: int = Field(
+        1,
+        ge=1,
+        le=60,
+        description="Where the worker drains the queue on a schedule "
+        "(Azure Container Apps + Storage Queues): how often.",
+    )
 
 
 class ScheduleSpec(_Strict):
@@ -111,40 +146,46 @@ class StateSpec(_Strict):
     The state bucket: one JSON document for scheduled posts (queue.json, CAS),
     plus sessions/, runs/, ledger/ and config/. Every cloud target creates it.
     """
+
     versioning: bool = True
     retention_days: int = Field(90, ge=1, description="runs/ transcripts and ledger/ entries expire after this.")
-    protect: bool = Field(True, description="Terraform prevent_destroy on the bucket: the job document is the "
-                          "source of truth, so `terraform destroy` must not take it with the compute.")
+    protect: bool = Field(
+        True,
+        description="Terraform prevent_destroy on the bucket: the job document is the "
+        "source of truth, so `terraform destroy` must not take it with the compute.",
+    )
 
 
 # ----------------------------------------------------------------------
 # Targets
 # ----------------------------------------------------------------------
 
+
 class ClusterSpec(_Strict):
     """An existing Kubernetes cluster to run on (skyctl does not create clusters)."""
+
     namespace: str = "skyctl"
-    keda: bool = False                          # scale the worker to zero with KEDA (must be installed)
+    keda: bool = False  # scale the worker to zero with KEDA (must be installed)
     keda_namespace: str = "keda"
-    ingress_host: Optional[str] = None
-    ingress_class: Optional[str] = None
+    ingress_host: str | None = None
+    ingress_class: str | None = None
 
 
 class EksSpec(ClusterSpec):
     cluster_name: str
     identity: Literal["pod-identity", "irsa"] = "pod-identity"
-    oidc_provider_arn: Optional[str] = None     # irsa only
-    oidc_issuer: Optional[str] = None           # irsa only, e.g. oidc.eks.us-east-1.amazonaws.com/id/ABC123
-    keda_operator_role_arn: Optional[str] = None  # lets the KEDA operator assume the app role to read SQS depth
+    oidc_provider_arn: str | None = None  # irsa only
+    oidc_issuer: str | None = None  # irsa only, e.g. oidc.eks.us-east-1.amazonaws.com/id/ABC123
+    keda_operator_role_arn: str | None = None  # lets the KEDA operator assume the app role to read SQS depth
 
 
 class AksSpec(ClusterSpec):
     cluster_name: str
-    cluster_resource_group: str                 # needs OIDC issuer + workload identity enabled
+    cluster_resource_group: str  # needs OIDC issuer + workload identity enabled
 
 
 class GkeSpec(ClusterSpec):
-    pass                                        # needs GKE Workload Identity enabled
+    pass  # needs GKE Workload Identity enabled
 
 
 K8S_COMPUTE = {"eks", "aks", "gke"}
@@ -153,13 +194,13 @@ K8S_COMPUTE = {"eks", "aks", "gke"}
 class AwsTarget(_Strict):
     region: str
     compute: Literal["ecs", "lambda", "eks"] = "ecs"
-    kubernetes: Optional[EksSpec] = None
-    model: Optional[str] = None
-    vpc_id: Optional[str] = None
+    kubernetes: EksSpec | None = None
+    model: str | None = None
+    vpc_id: str | None = None
     subnet_ids: list[str] = []
     security_group_ids: list[str] = []
     assign_public_ip: bool = True
-    certificate_arn: Optional[str] = None       # HTTPS listener for the service
+    certificate_arn: str | None = None  # HTTPS listener for the service
 
     @model_validator(mode="after")
     def _k8s(self):
@@ -171,24 +212,28 @@ class AwsTarget(_Strict):
 class AzureTarget(_Strict):
     location: str
     compute: Literal["container-apps", "aks"] = "container-apps"
-    kubernetes: Optional[AksSpec] = None
-    model: Optional[str] = None
-    openai_endpoint: Optional[str] = None       # https://<resource>.openai.azure.com
-    openai_resource_id: Optional[str] = None    # grants the identity "Cognitive Services OpenAI User"
+    kubernetes: AksSpec | None = None
+    model: str | None = None
+    openai_endpoint: str | None = None  # https://<resource>.openai.azure.com
+    openai_resource_id: str | None = None  # grants the identity "Cognitive Services OpenAI User"
+    operators: list[str] = []  # Entra object ids allowed to run-cloud-task (bucket + queue)
 
     @model_validator(mode="after")
     def _k8s(self):
         if self.compute == "aks" and self.kubernetes is None:
-            raise ValueError('compute = "aks" needs a [targets.azure.kubernetes] table (cluster_name, cluster_resource_group)')
+            raise ValueError(
+                'compute = "aks" needs a [targets.azure.kubernetes] table (cluster_name, cluster_resource_group)'
+            )
         return self
 
 
 class GcpTarget(_Strict):
     project: str
     region: str
+    operators: list[str] = []  # IAM members (user:…, group:…) allowed to run-cloud-task
     compute: Literal["cloud-run", "gke"] = "cloud-run"
-    kubernetes: Optional[GkeSpec] = None
-    model: Optional[str] = None
+    kubernetes: GkeSpec | None = None
+    model: str | None = None
 
     @model_validator(mode="after")
     def _k8s(self):
@@ -199,31 +244,32 @@ class GcpTarget(_Strict):
 
 class KubernetesTarget(_Strict):
     """Any cluster, bring-your-own services: nothing cloud-side is provisioned."""
+
     namespace: str = "skyctl"
     cloud: Literal["aws", "azure", "gcp", "none"] = "none"
-    identity: Optional[str] = None              # IAM role ARN / UAMI client id / GSA email
-    state_url: str                              # an existing bucket: s3://, az://, gs://
-    queue_url: Optional[str] = None
-    delayed_url: Optional[str] = None
-    secret_name: str = "skyctl-secrets"         # existing k8s Secret holding the BSKY_* keys
-    model: Optional[str] = None
+    identity: str | None = None  # IAM role ARN / UAMI client id / GSA email
+    state_url: str  # an existing bucket: s3://, az://, gs://
+    queue_url: str | None = None
+    delayed_url: str | None = None
+    secret_name: str = "skyctl-secrets"  # existing k8s Secret holding the BSKY_* keys
+    model: str | None = None
     keda: bool = False
-    ingress_host: Optional[str] = None
-    ingress_class: Optional[str] = None
+    ingress_host: str | None = None
+    ingress_class: str | None = None
     extra_env: dict[str, str] = {}
 
 
 class ComposeTarget(_Strict):
     port: int = 8080
-    model: Optional[str] = None
+    model: str | None = None
 
 
 class Targets(_Strict):
-    aws: Optional[AwsTarget] = None
-    azure: Optional[AzureTarget] = None
-    gcp: Optional[GcpTarget] = None
-    kubernetes: Optional[KubernetesTarget] = None
-    compose: Optional[ComposeTarget] = None
+    aws: AwsTarget | None = None
+    azure: AzureTarget | None = None
+    gcp: GcpTarget | None = None
+    kubernetes: KubernetesTarget | None = None
+    compose: ComposeTarget | None = None
 
     def names(self) -> list[str]:
         return [n for n in ("aws", "azure", "gcp", "kubernetes", "compose") if getattr(self, n) is not None]
@@ -241,13 +287,15 @@ class DeploySpec(_Strict):
     targets: Targets = Targets()
 
     @model_validator(mode="after")
-    def _check(self) -> "DeploySpec":
+    def _check(self) -> DeploySpec:
         names = [s.name for s in self.schedules]
         if len(names) != len(set(names)):
             raise ValueError("schedule names must be unique")
         if "tick" not in names:
             # Every deployment needs the reconciler; add it rather than fail.
-            self.schedules.insert(0, ScheduleSpec(name="tick", cron="*/5 * * * *", invoke={"kind": "tick"}, timeout_s=300))
+            self.schedules.insert(
+                0, ScheduleSpec(name="tick", cron="*/5 * * * *", invoke={"kind": "tick"}, timeout_s=300)
+            )
         from ..agent.task import TaskConfigError, TaskSpec
 
         for name, raw in self.tasks.items():
@@ -298,9 +346,9 @@ def _toml_value(v) -> str:
         return str(v)
     if isinstance(v, list):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
-    return json.dumps(str(v))            # a TOML basic string is JSON-compatible
+    return json.dumps(str(v))  # a TOML basic string is JSON-compatible
 
 
-def load_spec(path: Union[str, Path]) -> DeploySpec:
+def load_spec(path: str | Path) -> DeploySpec:
     data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     return DeploySpec.model_validate(data)

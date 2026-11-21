@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters.azure_blob
 ==========================
@@ -18,7 +33,7 @@ Needs `skyctl[azure]`.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any
 
 from ..ports import PreconditionFailed, Versioned
 
@@ -26,7 +41,7 @@ from ..ports import PreconditionFailed, Versioned
 class AzureBlobObjectStore:
     atomic_cas = True
 
-    def __init__(self, container: str, prefix: str = "", account: Optional[str] = None, container_client=None):
+    def __init__(self, container: str, prefix: str = "", account: str | None = None, container_client=None):
         self.container = container
         self.prefix = prefix.strip("/")
         self.account = account or os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "").strip()
@@ -53,7 +68,7 @@ class AzureBlobObjectStore:
             raise ValueError(f"Key escapes the store root: {key}")
         return f"{self.prefix}/{key}" if self.prefix else key
 
-    def get(self, key: str) -> Optional[Versioned]:
+    def get(self, key: str) -> Versioned | None:
         from azure.core.exceptions import ResourceNotFoundError
 
         try:
@@ -63,12 +78,12 @@ class AzureBlobObjectStore:
         data = downloader.readall()
         return Versioned(data, downloader.properties.etag)
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         from azure.core import MatchConditions
         from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
         blob = self.cc.get_blob_client(self._k(key))
-        kwargs = {"overwrite": not if_absent}
+        kwargs: dict[str, Any] = {"overwrite": not if_absent}
         if if_version is not None:
             kwargs.update(etag=if_version, match_condition=MatchConditions.IfNotModified)
         try:

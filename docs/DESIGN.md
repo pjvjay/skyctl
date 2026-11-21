@@ -294,7 +294,7 @@ TaskSpec(
     max_turns=25,
     dry_run=False,
     model="bedrock:anthropic.claude-opus-5-5",
-    approval="none",            # none | writes | all
+    approval="none",  # none | writes | all
     context={"since_hours": 24},
 )
 ```

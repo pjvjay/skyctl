@@ -233,7 +233,7 @@
           "operating_system_family": "LINUX",
           "cpu_architecture": "X86_64"
         },
-        "container_definitions": "[{\"name\": \"skyctl\", \"image\": \"${var.image}\", \"essential\": true, \"command\": [\"serve\"], \"environment\": [{\"name\": \"SKYCTL_PLATFORM\", \"value\": \"aws\"}, {\"name\": \"SKYCTL_COMPUTE\", \"value\": \"ecs\"}, {\"name\": \"SKYCTL_SECRETS\", \"value\": \"aws-sm://skyctl/config\"}, {\"name\": \"SKYCTL_STATE_URL\", \"value\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\"}, {\"name\": \"SKYCTL_QUEUE_URL\", \"value\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\"}, {\"name\": \"SKYCTL_DELAYED_URL\", \"value\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\"}, {\"name\": \"SKYCTL_AGENT_MODEL\", \"value\": \"bedrock:anthropic.claude-opus-5-5\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_WRITES\", \"value\": \"true\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_DELETE\", \"value\": \"false\"}, {\"name\": \"SKYCTL_AGENT_MAX_WRITES\", \"value\": \"5\"}, {\"name\": \"SKYCTL_AGENT_MAX_TURNS\", \"value\": \"25\"}, {\"name\": \"SKYCTL_AGENT_MAX_SECONDS\", \"value\": \"540\"}, {\"name\": \"SKYCTL_AGENT_ACCOUNTS\", \"value\": \"work\"}, {\"name\": \"SKYCTL_LOG_FORMAT\", \"value\": \"json\"}, {\"name\": \"SKYCTL_AUTH\", \"value\": \"bearer\"}, {\"name\": \"SKYCTL_HTTP_MCP\", \"value\": \"true\"}, {\"name\": \"AWS_REGION\", \"value\": \"us-east-1\"}], \"readonlyRootFilesystem\": true, \"mountPoints\": [{\"sourceVolume\": \"tmp\", \"containerPath\": \"/tmp\", \"readOnly\": false}], \"stopTimeout\": 120, \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {\"awslogs-group\": \"${aws_cloudwatch_log_group.main.name}\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"http\"}}, \"secrets\": [{\"name\": \"SKYCTL_HTTP_TOKEN\", \"valueFrom\": \"${aws_secretsmanager_secret.http_token.arn}\"}], \"portMappings\": [{\"containerPort\": 8080, \"protocol\": \"tcp\"}]}]"
+        "container_definitions": "[{\"name\": \"skyctl\", \"image\": \"${var.image}\", \"essential\": true, \"command\": [\"serve\"], \"environment\": [{\"name\": \"SKYCTL_PLATFORM\", \"value\": \"aws\"}, {\"name\": \"SKYCTL_COMPUTE\", \"value\": \"ecs\"}, {\"name\": \"SKYCTL_SECRETS\", \"value\": \"aws-sm://skyctl/config\"}, {\"name\": \"SKYCTL_STATE_URL\", \"value\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\"}, {\"name\": \"SKYCTL_QUEUE_URL\", \"value\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\"}, {\"name\": \"SKYCTL_DELAYED_URL\", \"value\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\"}, {\"name\": \"SKYCTL_AGENT_MODEL\", \"value\": \"bedrock:anthropic.claude-opus-5-5\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_WRITES\", \"value\": \"true\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_DELETE\", \"value\": \"false\"}, {\"name\": \"SKYCTL_AGENT_MAX_WRITES\", \"value\": \"5\"}, {\"name\": \"SKYCTL_AGENT_MAX_TURNS\", \"value\": \"25\"}, {\"name\": \"SKYCTL_AGENT_MAX_SECONDS\", \"value\": \"540\"}, {\"name\": \"SKYCTL_AGENT_ACCOUNTS\", \"value\": \"work\"}, {\"name\": \"SKYCTL_LOG_FORMAT\", \"value\": \"json\"}, {\"name\": \"SKYCTL_AUTH\", \"value\": \"bearer\"}, {\"name\": \"SKYCTL_HTTP_MCP\", \"value\": \"true\"}, {\"name\": \"SKYCTL_SEARCH_URL\", \"value\": \"gdelt://\"}, {\"name\": \"AWS_REGION\", \"value\": \"us-east-1\"}], \"readonlyRootFilesystem\": true, \"mountPoints\": [{\"sourceVolume\": \"tmp\", \"containerPath\": \"/tmp\", \"readOnly\": false}], \"stopTimeout\": 120, \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {\"awslogs-group\": \"${aws_cloudwatch_log_group.main.name}\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"http\"}}, \"secrets\": [{\"name\": \"SKYCTL_HTTP_TOKEN\", \"valueFrom\": \"${aws_secretsmanager_secret.http_token.arn}\"}], \"portMappings\": [{\"containerPort\": 8080, \"protocol\": \"tcp\"}]}]"
       },
       "worker": {
         "family": "skyctl-worker",
@@ -254,7 +254,7 @@
           "operating_system_family": "LINUX",
           "cpu_architecture": "X86_64"
         },
-        "container_definitions": "[{\"name\": \"skyctl\", \"image\": \"${var.image}\", \"essential\": true, \"command\": [\"worker\"], \"environment\": [{\"name\": \"SKYCTL_PLATFORM\", \"value\": \"aws\"}, {\"name\": \"SKYCTL_COMPUTE\", \"value\": \"ecs\"}, {\"name\": \"SKYCTL_SECRETS\", \"value\": \"aws-sm://skyctl/config\"}, {\"name\": \"SKYCTL_STATE_URL\", \"value\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\"}, {\"name\": \"SKYCTL_QUEUE_URL\", \"value\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\"}, {\"name\": \"SKYCTL_DELAYED_URL\", \"value\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\"}, {\"name\": \"SKYCTL_AGENT_MODEL\", \"value\": \"bedrock:anthropic.claude-opus-5-5\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_WRITES\", \"value\": \"true\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_DELETE\", \"value\": \"false\"}, {\"name\": \"SKYCTL_AGENT_MAX_WRITES\", \"value\": \"5\"}, {\"name\": \"SKYCTL_AGENT_MAX_TURNS\", \"value\": \"25\"}, {\"name\": \"SKYCTL_AGENT_MAX_SECONDS\", \"value\": \"540\"}, {\"name\": \"SKYCTL_AGENT_ACCOUNTS\", \"value\": \"work\"}, {\"name\": \"SKYCTL_LOG_FORMAT\", \"value\": \"json\"}, {\"name\": \"SKYCTL_AUTH\", \"value\": \"bearer\"}, {\"name\": \"SKYCTL_HTTP_MCP\", \"value\": \"true\"}, {\"name\": \"AWS_REGION\", \"value\": \"us-east-1\"}], \"readonlyRootFilesystem\": true, \"mountPoints\": [{\"sourceVolume\": \"tmp\", \"containerPath\": \"/tmp\", \"readOnly\": false}], \"stopTimeout\": 120, \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {\"awslogs-group\": \"${aws_cloudwatch_log_group.main.name}\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"worker\"}}}]"
+        "container_definitions": "[{\"name\": \"skyctl\", \"image\": \"${var.image}\", \"essential\": true, \"command\": [\"worker\"], \"environment\": [{\"name\": \"SKYCTL_PLATFORM\", \"value\": \"aws\"}, {\"name\": \"SKYCTL_COMPUTE\", \"value\": \"ecs\"}, {\"name\": \"SKYCTL_SECRETS\", \"value\": \"aws-sm://skyctl/config\"}, {\"name\": \"SKYCTL_STATE_URL\", \"value\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\"}, {\"name\": \"SKYCTL_QUEUE_URL\", \"value\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\"}, {\"name\": \"SKYCTL_DELAYED_URL\", \"value\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\"}, {\"name\": \"SKYCTL_AGENT_MODEL\", \"value\": \"bedrock:anthropic.claude-opus-5-5\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_WRITES\", \"value\": \"true\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_DELETE\", \"value\": \"false\"}, {\"name\": \"SKYCTL_AGENT_MAX_WRITES\", \"value\": \"5\"}, {\"name\": \"SKYCTL_AGENT_MAX_TURNS\", \"value\": \"25\"}, {\"name\": \"SKYCTL_AGENT_MAX_SECONDS\", \"value\": \"540\"}, {\"name\": \"SKYCTL_AGENT_ACCOUNTS\", \"value\": \"work\"}, {\"name\": \"SKYCTL_LOG_FORMAT\", \"value\": \"json\"}, {\"name\": \"SKYCTL_AUTH\", \"value\": \"bearer\"}, {\"name\": \"SKYCTL_HTTP_MCP\", \"value\": \"true\"}, {\"name\": \"SKYCTL_SEARCH_URL\", \"value\": \"gdelt://\"}, {\"name\": \"AWS_REGION\", \"value\": \"us-east-1\"}], \"readonlyRootFilesystem\": true, \"mountPoints\": [{\"sourceVolume\": \"tmp\", \"containerPath\": \"/tmp\", \"readOnly\": false}], \"stopTimeout\": 120, \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {\"awslogs-group\": \"${aws_cloudwatch_log_group.main.name}\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"worker\"}}}]"
       },
       "job": {
         "family": "skyctl-job",
@@ -275,7 +275,7 @@
           "operating_system_family": "LINUX",
           "cpu_architecture": "X86_64"
         },
-        "container_definitions": "[{\"name\": \"skyctl\", \"image\": \"${var.image}\", \"essential\": true, \"command\": [\"invoke\", \"{\\\"kind\\\":\\\"tick\\\"}\"], \"environment\": [{\"name\": \"SKYCTL_PLATFORM\", \"value\": \"aws\"}, {\"name\": \"SKYCTL_COMPUTE\", \"value\": \"ecs\"}, {\"name\": \"SKYCTL_SECRETS\", \"value\": \"aws-sm://skyctl/config\"}, {\"name\": \"SKYCTL_STATE_URL\", \"value\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\"}, {\"name\": \"SKYCTL_QUEUE_URL\", \"value\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\"}, {\"name\": \"SKYCTL_DELAYED_URL\", \"value\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\"}, {\"name\": \"SKYCTL_AGENT_MODEL\", \"value\": \"bedrock:anthropic.claude-opus-5-5\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_WRITES\", \"value\": \"true\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_DELETE\", \"value\": \"false\"}, {\"name\": \"SKYCTL_AGENT_MAX_WRITES\", \"value\": \"5\"}, {\"name\": \"SKYCTL_AGENT_MAX_TURNS\", \"value\": \"25\"}, {\"name\": \"SKYCTL_AGENT_MAX_SECONDS\", \"value\": \"540\"}, {\"name\": \"SKYCTL_AGENT_ACCOUNTS\", \"value\": \"work\"}, {\"name\": \"SKYCTL_LOG_FORMAT\", \"value\": \"json\"}, {\"name\": \"SKYCTL_AUTH\", \"value\": \"bearer\"}, {\"name\": \"SKYCTL_HTTP_MCP\", \"value\": \"true\"}, {\"name\": \"AWS_REGION\", \"value\": \"us-east-1\"}], \"readonlyRootFilesystem\": true, \"mountPoints\": [{\"sourceVolume\": \"tmp\", \"containerPath\": \"/tmp\", \"readOnly\": false}], \"stopTimeout\": 120, \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {\"awslogs-group\": \"${aws_cloudwatch_log_group.main.name}\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"job\"}}}]"
+        "container_definitions": "[{\"name\": \"skyctl\", \"image\": \"${var.image}\", \"essential\": true, \"command\": [\"invoke\", \"{\\\"kind\\\":\\\"tick\\\"}\"], \"environment\": [{\"name\": \"SKYCTL_PLATFORM\", \"value\": \"aws\"}, {\"name\": \"SKYCTL_COMPUTE\", \"value\": \"ecs\"}, {\"name\": \"SKYCTL_SECRETS\", \"value\": \"aws-sm://skyctl/config\"}, {\"name\": \"SKYCTL_STATE_URL\", \"value\": \"s3://${aws_s3_bucket.state.bucket}/skyctl\"}, {\"name\": \"SKYCTL_QUEUE_URL\", \"value\": \"sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work\"}, {\"name\": \"SKYCTL_DELAYED_URL\", \"value\": \"eventbridge://skyctl-delayed?target=${aws_sqs_queue.work.arn}&role=${aws_iam_role.delivery.arn}\"}, {\"name\": \"SKYCTL_AGENT_MODEL\", \"value\": \"bedrock:anthropic.claude-opus-5-5\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_WRITES\", \"value\": \"true\"}, {\"name\": \"SKYCTL_AGENT_ALLOW_DELETE\", \"value\": \"false\"}, {\"name\": \"SKYCTL_AGENT_MAX_WRITES\", \"value\": \"5\"}, {\"name\": \"SKYCTL_AGENT_MAX_TURNS\", \"value\": \"25\"}, {\"name\": \"SKYCTL_AGENT_MAX_SECONDS\", \"value\": \"540\"}, {\"name\": \"SKYCTL_AGENT_ACCOUNTS\", \"value\": \"work\"}, {\"name\": \"SKYCTL_LOG_FORMAT\", \"value\": \"json\"}, {\"name\": \"SKYCTL_AUTH\", \"value\": \"bearer\"}, {\"name\": \"SKYCTL_HTTP_MCP\", \"value\": \"true\"}, {\"name\": \"SKYCTL_SEARCH_URL\", \"value\": \"gdelt://\"}, {\"name\": \"AWS_REGION\", \"value\": \"us-east-1\"}], \"readonlyRootFilesystem\": true, \"mountPoints\": [{\"sourceVolume\": \"tmp\", \"containerPath\": \"/tmp\", \"readOnly\": false}], \"stopTimeout\": 120, \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {\"awslogs-group\": \"${aws_cloudwatch_log_group.main.name}\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"job\"}}}]"
       }
     },
     "aws_security_group": {
@@ -573,6 +573,13 @@
           }
         }
       }
+    },
+    "aws_iam_policy": {
+      "operator": {
+        "name": "skyctl-operator",
+        "description": "Submit skyctl tasks and approve plans (attach to operator users/roles)",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sqs:SendMessage\",\"Resource\":\"${aws_sqs_queue.work.arn}\"},{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\"],\"Resource\":\"${aws_s3_bucket.state.arn}/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"${aws_s3_bucket.state.arn}\"}]}"
+      }
     }
   },
   "output": {
@@ -597,6 +604,7 @@
         "SKYCTL_LOG_FORMAT": "json",
         "SKYCTL_AUTH": "bearer",
         "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
         "AWS_REGION": "us-east-1"
       }
     },
@@ -605,6 +613,19 @@
     },
     "queue_url": {
       "value": "${aws_sqs_queue.work.url}"
+    },
+    "operator_policy_arn": {
+      "value": "${aws_iam_policy.operator.arn}"
+    },
+    "skyctl_connection": {
+      "value": {
+        "platform": "aws",
+        "state_url": "s3://${aws_s3_bucket.state.bucket}/skyctl",
+        "queue_url": "sqs://sqs.us-east-1.amazonaws.com/${data.aws_caller_identity.current.account_id}/skyctl-work",
+        "env": {
+          "AWS_REGION": "us-east-1"
+        }
+      }
     }
   }
 }

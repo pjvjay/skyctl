@@ -23,6 +23,7 @@
         "SKYCTL_LOG_FORMAT": "json",
         "SKYCTL_AUTH": "bearer",
         "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
         "SKYCTL_SCHEDULES_JSON": "[{\"name\":\"tick\",\"cron\":\"*/5 * * * *\",\"timezone\":\"UTC\",\"invoke\":{\"kind\":\"tick\"}},{\"name\":\"daily-engagement\",\"cron\":\"0 9 * * mon-fri\",\"timezone\":\"UTC\",\"invoke\":{\"kind\":\"task.run\",\"task\":\"daily-engagement\",\"slot\":{\"cron\":\"0 9 * * mon-fri\",\"timezone\":\"UTC\"}}}]"
       },
       "volumes": [
@@ -60,6 +61,7 @@
         "SKYCTL_LOG_FORMAT": "json",
         "SKYCTL_AUTH": "bearer",
         "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
         "PORT": "8080"
       },
       "volumes": [

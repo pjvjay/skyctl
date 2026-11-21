@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.planning.check
 =====================
@@ -13,8 +28,10 @@ Checks, in order:
   6. content       grapheme limits, thread splitting, images vs. link cards,
                    schedule times in the future, cron syntax
   7. grounding     posts a step targets (parent_uri, uri, quote_uri) were returned by a tool
-                   in this session, so a model cannot act on a URI it invented
-  8. hygiene       duplicate writes, two replies to one post
+                   in this session, so a model cannot act on a URI it invented; links it
+                   publishes were retrieved by research tools (or given by the user), and
+                   with require_citations every post/reply cites one
+  8. hygiene       duplicate writes, two replies to one post or one author
   9. validators    pluggable organisation rules (e.g. a link allow-list)
 """
 
@@ -22,39 +39,67 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any
 
 from ..richtext import MAX_GRAPHEMES, detect_facets, grapheme_len, split_thread
-from ..tools.registry import ToolDenied, ToolRegistry
+from ..tools.registry import ToolRegistry
 from .model import Plan, PlanStep, iter_refs, substitute
 
 META_TAGS = {"plan", "agent"}
-URI_ARGS = ("parent_uri", "uri", "quote_uri")       # arguments that name an existing post
+URI_ARGS = ("parent_uri", "uri", "quote_uri")  # arguments that name an existing post
+PUBLISHING_TOOLS = {"post", "reply", "thread", "schedule_post", "schedule_cron"}
+CITING_TOOLS = {"post", "reply", "thread"}
+_LINK = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _uri_author(uri: str) -> str:
+    """The repository (author DID or handle) of an AT URI: at://<author>/<collection>/<rkey>."""
+    if not uri.startswith("at://"):
+        return ""
+    return uri[5:].split("/", 1)[0]
+
+
+def links_in(args: dict) -> list[str]:
+    found = _LINK.findall(str(args.get("text") or ""))
+    if isinstance(args.get("link_card"), str):
+        found.append(args["link_card"])
+    return [u.rstrip(".,;:!?)]}\"'") for u in found]
+
+
 TEXT_TOOLS = {"post", "reply", "schedule_post", "schedule_cron"}
 
 # Top-level result fields a $ref may use, per tool (unknown tools are not checked).
 _POST_RESULT = {"account", "success", "uri", "cid", "url", "created_at", "error"}
 RESULT_FIELDS: dict[str, set] = {
-    "post": _POST_RESULT, "reply": _POST_RESULT, "repost": _POST_RESULT, "like": _POST_RESULT,
+    "post": _POST_RESULT,
+    "reply": _POST_RESULT,
+    "repost": _POST_RESULT,
+    "like": _POST_RESULT,
     "thread": {"posts", "success"},
     "delete_post": {"success", "uri"},
     "schedule_post": {"job_id", "account", "run_at", "status"},
     "schedule_cron": {"job_id", "account", "cron", "status"},
     "cancel_job": {"job_id", "cancelled"},
-    "list_accounts": {"accounts"}, "list_jobs": {"jobs"},
-    "get_profile": {"data", "note"}, "get_timeline": {"data", "note"}, "get_notifications": {"data", "note"},
-    "search_posts": {"data", "note"}, "list_posts": {"data", "note"}, "get_post": {"data", "note"},
+    "list_accounts": {"accounts"},
+    "list_jobs": {"jobs"},
+    "get_profile": {"data", "note"},
+    "get_timeline": {"data", "note"},
+    "get_notifications": {"data", "note"},
+    "search_posts": {"data", "note"},
+    "list_posts": {"data", "note"},
+    "get_post": {"data", "note"},
     "fetch_link_metadata": {"data", "note"},
 }
 
 
 @dataclass
 class Finding:
-    level: str                 # "error" | "warning"
+    level: str  # "error" | "warning"
     message: str
-    step: Optional[str] = None
+    step: str | None = None
 
     def to_dict(self) -> dict:
         return {"level": self.level, "step": self.step, "message": self.message}
@@ -74,10 +119,12 @@ class PlanCheck:
 
     def to_dict(self) -> dict:
         return {
-            "ok": self.ok, "plan_hash": self.plan_hash,
+            "ok": self.ok,
+            "plan_hash": self.plan_hash,
             "errors": [f.to_dict() for f in self.findings if f.level == "error"],
             "warnings": [f.to_dict() for f in self.findings if f.level == "warning"],
-            "summary": self.summary, "preview": self.preview,
+            "summary": self.summary,
+            "preview": self.preview,
         }
 
 
@@ -105,8 +152,14 @@ def link_allowlist(plan: Plan, step: PlanStep, args: dict, ctx) -> list[Finding]
     return [Finding("error", f"link to {h} is not in SKYCTL_PLAN_LINK_ALLOWLIST", step.id) for h in bad]
 
 
-def check_plan(plan: Plan, ctx, registry: ToolRegistry, now: Optional[datetime] = None,
-               completed_steps: frozenset = frozenset(), proposal: bool = True) -> PlanCheck:
+def check_plan(
+    plan: Plan,
+    ctx,
+    registry: ToolRegistry,
+    now: datetime | None = None,
+    completed_steps: frozenset = frozenset(),
+    proposal: bool = True,
+) -> PlanCheck:
     """
     `completed_steps` (on resume) are checked structurally but not re-judged or re-counted.
     `proposal=False` is the executor's re-check: grounding asks whether the *proposing*
@@ -114,8 +167,8 @@ def check_plan(plan: Plan, ctx, registry: ToolRegistry, now: Optional[datetime] 
     """
     now = now or datetime.now(timezone.utc)
     findings: list[Finding] = []
-    err = lambda msg, step=None: findings.append(Finding("error", msg, step))      # noqa: E731
-    warn = lambda msg, step=None: findings.append(Finding("warning", msg, step))   # noqa: E731
+    err = lambda msg, step=None: findings.append(Finding("error", msg, step))  # noqa: E731
+    warn = lambda msg, step=None: findings.append(Finding("warning", msg, step))  # noqa: E731
     policy = ctx.policy
     seen: dict[str, PlanStep] = {}
     writes, reads, destructive = 0, 0, 0
@@ -124,10 +177,13 @@ def check_plan(plan: Plan, ctx, registry: ToolRegistry, now: Optional[datetime] 
     preview: list[dict] = []
     write_keys: dict[str, str] = {}
     reply_parents: dict[str, str] = {}
+    reply_authors: dict[str, str] = {}
 
     if plan.questions:
-        err("the plan has unresolved questions; ask the user, then submit a plan without them: "
-            + " | ".join(plan.questions))
+        err(
+            "the plan has unresolved questions; ask the user, then submit a plan without them: "
+            + " | ".join(plan.questions)
+        )
 
     for step in plan.steps:
         # -- structure ---------------------------------------------------
@@ -144,7 +200,10 @@ def check_plan(plan: Plan, ctx, registry: ToolRegistry, now: Optional[datetime] 
             if not top:
                 err(f"$ref {path!r} must name a field of {ref_step!r}'s result", step.id)
             elif fields is not None and top not in fields:
-                err(f"$ref {path!r}: {seen[ref_step].tool} results have no {top!r} (fields: {', '.join(sorted(fields))})", step.id)
+                err(
+                    f"$ref {path!r}: {seen[ref_step].tool} results have no {top!r} (fields: {', '.join(sorted(fields))})",
+                    step.id,
+                )
 
         # -- tool ------------------------------------------------------------
         if step.tool not in registry:
@@ -235,15 +294,55 @@ def check_plan(plan: Plan, ctx, registry: ToolRegistry, now: Optional[datetime] 
             for key in URI_ARGS:
                 value = step.args.get(key)
                 if isinstance(value, str) and value.startswith("at://") and value not in ctx.seen_uris:
-                    findings.append(Finding(
-                        "error" if grounding == "error" else "warning",
-                        f"{key} {value} was not returned by any tool in this session; read it first "
-                        "(get_post / get_notifications / search_posts) so it is known to exist", step.id))
+                    findings.append(
+                        Finding(
+                            "error" if grounding == "error" else "warning",
+                            f"{key} {value} was not returned by any tool in this session; read it first "
+                            "(get_post / get_notifications / search_posts) so it is known to exist",
+                            step.id,
+                        )
+                    )
+
+        # -- citations: links published must come from research (or the user's request) ----
+        if proposal and step.tool in PUBLISHING_TOOLS:
+            links = links_in(args)
+            known = getattr(ctx, "seen_urls", set()) | getattr(ctx, "trusted_urls", set())
+            link_mode = getattr(ctx, "link_grounding", "off")
+            if link_mode != "off":
+                for link in links:
+                    if link not in known:
+                        findings.append(
+                            Finding(
+                                "error" if link_mode == "error" else "warning",
+                                f"link {link} was not retrieved with web_search/fetch_page in this session "
+                                "(cite only sources you actually read)",
+                                step.id,
+                            )
+                        )
+            if (
+                getattr(ctx, "require_citations", False)
+                and step.tool in CITING_TOOLS
+                and not any(link in known for link in links)
+            ):
+                err(
+                    "this session requires every post and reply to cite a source retrieved with web_search/fetch_page",
+                    step.id,
+                )
 
         if step.tool == "reply" and isinstance(args.get("parent_uri"), str) and "at://ref/" not in args["parent_uri"]:
             parent = args["parent_uri"]
             if parent in reply_parents:
                 warn(f"second reply to the same post as step {reply_parents[parent]!r}", step.id)
+            else:
+                author = _uri_author(parent)
+                if author and author in reply_authors:
+                    warn(
+                        f"second reply to the same author as step {reply_authors[author]!r}; "
+                        "one reply per person avoids pile-ons",
+                        step.id,
+                    )
+                if author:
+                    reply_authors.setdefault(author, step.id)
             reply_parents.setdefault(parent, step.id)
 
         for validator in _VALIDATORS:
@@ -262,9 +361,14 @@ def check_plan(plan: Plan, ctx, registry: ToolRegistry, now: Optional[datetime] 
                 err(f"the plan makes {writes} writes but only {remaining} remain in this session's budget")
 
     summary = {
-        "steps": len(plan.steps), "reads": reads, "writes": writes, "destructive": destructive,
-        "writes_by_account": by_account, "public_network_accounts": sorted(public_accounts),
-        "tools": sorted({s.tool for s in plan.steps}), "intent": plan.intent,
+        "steps": len(plan.steps),
+        "reads": reads,
+        "writes": writes,
+        "destructive": destructive,
+        "writes_by_account": by_account,
+        "public_network_accounts": sorted(public_accounts),
+        "tools": sorted({s.tool for s in plan.steps}),
+        "intent": plan.intent,
         "assumptions": plan.assumptions,
     }
     ok = not any(f.level == "error" for f in findings)
@@ -296,16 +400,28 @@ def _preview(step: PlanStep, spec, args: dict, ctx) -> dict:
     for key in ("parent_uri", "uri", "quote_uri", "link_card", "run_at", "cron", "job_id", "query", "images"):
         if args.get(key):
             item[key] = args[key]
+    target = args.get("parent_uri") or args.get("quote_uri")
+    seen_posts = getattr(ctx, "seen_posts", None)
+    if isinstance(target, str) and isinstance(seen_posts, dict) and target in seen_posts:
+        item["target_post"] = dict(seen_posts[target])  # what the reviewer is answering, as the agent read it
+    if isinstance(text, str):
+        known = getattr(ctx, "seen_urls", set()) | getattr(ctx, "trusted_urls", set())
+        links = links_in({"text": text, "link_card": args.get("link_card")})
+        if links:
+            item["links"] = [{"url": u, "retrieved": u in known} for u in links]
     return item
 
 
 def render_preview(check: PlanCheck, plan: Plan) -> str:
     """The plan as a human reads it before approving (elicitation, CLI, chat)."""
     s = check.summary
-    lines = [f"Plan: {plan.goal}", f"Hash: {check.plan_hash[:19]}…",
-             f"{s['writes']} write(s), {s['reads']} read(s)"
-             + (f", {s['destructive']} DESTRUCTIVE" if s.get("destructive") else "")
-             + (f"; public accounts: {', '.join(s['public_network_accounts'])}" if s.get("public_network_accounts") else "")]
+    lines = [
+        f"Plan: {plan.goal}",
+        f"Hash: {check.plan_hash[:19]}…",
+        f"{s['writes']} write(s), {s['reads']} read(s)"
+        + (f", {s['destructive']} DESTRUCTIVE" if s.get("destructive") else "")
+        + (f"; public accounts: {', '.join(s['public_network_accounts'])}" if s.get("public_network_accounts") else ""),
+    ]
     for a in plan.assumptions:
         lines.append(f"Assumes: {a}")
     for p in check.preview:
@@ -318,12 +434,20 @@ def render_preview(check: PlanCheck, plan: Plan) -> str:
         if p.get("run_at") or p.get("cron"):
             head += f" at {p.get('run_at') or p.get('cron')}"
         lines.append(head)
+        target = p.get("target_post")
+        if target:
+            quoted = " ".join(str(target.get("text") or "").split())
+            quoted = quoted[:280] + ("…" if len(quoted) > 280 else "")
+            lines.append(f"    in reply to @{target.get('author') or '?'}: “{quoted}”")
         if p.get("text"):
             lines.append(f"    “{p['text']}”")
         for i, part in enumerate(p.get("parts", []), 1):
             lines.append(f"    {i}/ “{part}”")
         if p.get("link_card"):
             lines.append(f"    card: {p['link_card']}")
+        for link in p.get("links", []):
+            mark = "retrieved in this run" if link["retrieved"] else "NOT retrieved by the agent"
+            lines.append(f"    link: {link['url']} ({mark})")
         if p.get("uses"):
             lines.append(f"    uses: {', '.join(p['uses'])}")
     for f in check.findings:

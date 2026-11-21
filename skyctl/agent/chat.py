@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.agent.chat
 =================
@@ -21,9 +36,9 @@ converted at the edge, so the runner never sees vendor formats.
 from __future__ import annotations
 
 import json
-import os
 import uuid
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from ..llm import LLMError, LLMRefusal, make_anthropic_client, openai_compat_settings
 from ..ports import ChatTurn, Message, ToolCall
@@ -46,10 +61,11 @@ _STOP = {
 # Anthropic Messages API (direct, Bedrock, Vertex, Foundry)
 # ----------------------------------------------------------------------
 
+
 class AnthropicChat:
     tool_format = "anthropic"
 
-    def __init__(self, model: str, client=None, effort: Optional[str] = None, max_tokens: int = 4096):
+    def __init__(self, model: str, client=None, effort: str | None = None, max_tokens: int = 4096):
         try:
             import anthropic
         except ImportError as e:
@@ -62,7 +78,7 @@ class AnthropicChat:
 
     @staticmethod
     def _to_api(messages: list[Message]) -> list[dict]:
-        out = []
+        out: list[dict[str, Any]] = []
         for m in messages:
             if m.role == "user":
                 out.append({"role": "user", "content": m.text})
@@ -71,24 +87,23 @@ class AnthropicChat:
                     out.append({"role": "assistant", "content": m.raw})
                 else:
                     blocks: list[dict] = [{"type": "text", "text": m.text}] if m.text else []
-                    blocks += [
-                        {"type": "tool_use", "id": c.id, "name": c.name, "input": c.args}
-                        for c in m.tool_calls
-                    ]
+                    blocks += [{"type": "tool_use", "id": c.id, "name": c.name, "input": c.args} for c in m.tool_calls]
                     out.append({"role": "assistant", "content": blocks})
             elif m.role == "tool":
-                out.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": r.call_id,
-                            "content": r.content,
-                            "is_error": r.is_error,
-                        }
-                        for r in m.tool_results
-                    ],
-                })
+                out.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": r.call_id,
+                                "content": r.content,
+                                "is_error": r.is_error,
+                            }
+                            for r in m.tool_results
+                        ],
+                    }
+                )
         return out
 
     def chat(self, system: str, messages: list[Message], tools: list[dict]) -> ChatTurn:
@@ -118,9 +133,7 @@ class AnthropicChat:
 
         text = "".join(b.text for b in response.content if b.type == "text").strip()
         calls = [
-            ToolCall(id=b.id, name=b.name, args=dict(b.input or {}))
-            for b in response.content
-            if b.type == "tool_use"
+            ToolCall(id=b.id, name=b.name, args=dict(b.input or {})) for b in response.content if b.type == "tool_use"
         ]
         stop = _STOP.get(response.stop_reason or "", response.stop_reason or "end")
         if stop == "refusal":
@@ -140,6 +153,7 @@ class AnthropicChat:
 # OpenAI-compatible chat completions (OpenAI, Azure OpenAI, OpenRouter, Ollama, vLLM…)
 # ----------------------------------------------------------------------
 
+
 class OpenAIChat:
     tool_format = "openai"
 
@@ -147,10 +161,10 @@ class OpenAIChat:
         self,
         model: str,
         base_url: str,
-        api_key: Optional[str] = None,
-        headers: Optional[dict[str, str]] = None,
+        api_key: str | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float = 300.0,
-        max_tokens: Optional[int] = None,
+        max_tokens: int | None = None,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -234,6 +248,7 @@ class OpenAIChat:
 # Factory
 # ----------------------------------------------------------------------
 
+
 def _anthropic_family(provider: str):
     def build(model: str, **options) -> AnthropicChat:
         return AnthropicChat(model, client=make_anthropic_client(provider), effort=options.get("effort"))
@@ -267,7 +282,7 @@ def register_chat_provider(name: str, factory: Callable[..., Any]) -> None:
     _CHAT_PROVIDERS[name.lower()] = factory
 
 
-def get_chat_provider(spec: Optional[str] = None, **options):
+def get_chat_provider(spec: str | None = None, **options):
     from ..llm import default_model
 
     spec = (spec or "").strip() or default_model()

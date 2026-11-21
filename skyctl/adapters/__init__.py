@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters
 ===============
@@ -72,15 +87,18 @@ def secret_store_for(url: str, env_file: str = ".env"):
         raise ValueError(f"SKYCTL_SECRETS must be 'env' or a URL, got {url!r}")
     if scheme == "aws-sm":
         from .aws import AwsSecretsManagerStore
+
         return AwsSecretsManagerStore(rest)
     if scheme == "azure-kv":
         from .azure import AzureKeyVaultStore
+
         vault, _, secret = rest.partition("/")
         if not vault or not secret:
             raise ValueError("azure-kv URL must be azure-kv://<vault>/<secret>")
         return AzureKeyVaultStore(vault, secret)
     if scheme == "gcp-sm":
         from .gcp import GcpSecretManagerStore
+
         project, _, secret = rest.partition("/")
         secret, _, version = secret.partition("@")
         if not project or not secret:

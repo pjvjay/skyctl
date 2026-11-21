@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.services
 ========================
@@ -16,7 +31,7 @@ point name is "<kind>:<scheme>", e.g. "state:oci" = "skyctl_oci:make_store".
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 _FACTORIES: dict[tuple[str, str], Callable] = {}
@@ -58,7 +73,7 @@ def build(kind: str, url: str, **kwargs):
         if kind == "state":
             from ..adapters.fsspec_store import FsspecObjectStore
 
-            return FsspecObjectStore(url)       # generic fallback; atomic_cas=False
+            return FsspecObjectStore(url)  # generic fallback; atomic_cas=False
         raise ValueError(f"No {kind} adapter for scheme {scheme!r} (known: {', '.join(schemes(kind))}).")
     return factory(url, **kwargs)
 
@@ -66,6 +81,7 @@ def build(kind: str, url: str, **kwargs):
 # ----------------------------------------------------------------------
 # Built-ins
 # ----------------------------------------------------------------------
+
 
 def _bucket_and_prefix(url: str) -> tuple[str, str]:
     p = urlparse(url)
@@ -120,7 +136,13 @@ def _delayed(url, queue=None, **_):
     return delayed_for(url, queue=queue)
 
 
-for _s, _f in (("file", _state_file), ("memory", _state_memory), ("s3", _state_s3), ("az", _state_az), ("gs", _state_gs)):
+for _s, _f in (
+    ("file", _state_file),
+    ("memory", _state_memory),
+    ("s3", _state_s3),
+    ("az", _state_az),
+    ("gs", _state_gs),
+):
     register_scheme("state", _s, _f)
 for _s in ("env", "aws-sm", "azure-kv", "gcp-sm"):
     register_scheme("secrets", _s, _secrets)

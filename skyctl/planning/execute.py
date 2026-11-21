@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.planning.execute
 =======================
@@ -18,8 +33,9 @@ from __future__ import annotations
 
 import socket
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Any
 
 from ..tools.registry import ToolRegistry
 from .check import check_plan
@@ -38,8 +54,14 @@ def _child_context(ctx, plan_id: str):
     from ..agent.runner import WriteLedger
     from ..tools import ToolContext
 
-    child = ToolContext(ctx.manager, policy=ctx.policy, scheduler=ctx._scheduler, dry_run=ctx.dry_run,
-                        run_id=f"plan:{plan_id}", approved=True)
+    child = ToolContext(
+        ctx.manager,
+        policy=ctx.policy,
+        scheduler=ctx._scheduler,
+        dry_run=ctx.dry_run,
+        run_id=f"plan:{plan_id}",
+        approved=True,
+    )
     child.via_plan = True
     child.writes_done = ctx.writes_done
     state = ctx.plans.store if ctx.plans is not None else None
@@ -66,8 +88,8 @@ def execute_plan(
     ctx,
     registry: ToolRegistry,
     *,
-    in_band_approval: Optional[str] = None,
-    on_progress: Optional[ProgressFn] = None,
+    in_band_approval: str | None = None,
+    on_progress: ProgressFn | None = None,
     claim_seconds: int = 900,
 ) -> dict:
     record = plans.require(plan_id)
@@ -84,10 +106,12 @@ def execute_plan(
 
     plan = Plan.model_validate(record["plan"])
     finished = {sid for sid, st in record["steps"].items() if st["status"] in ("done", "dry_run")}
-    recheck = check_plan(plan, ctx, registry, completed_steps=finished, proposal=False)
+    recheck = check_plan(plan, ctx, registry, completed_steps=frozenset(finished), proposal=False)
     if not recheck.ok:
-        raise PlanError("the plan no longer passes the current policy: "
-                        + "; ".join(f"[{f.step}] {f.message}" if f.step else f.message for f in recheck.errors))
+        raise PlanError(
+            "the plan no longer passes the current policy: "
+            + "; ".join(f"[{f.step}] {f.message}" if f.step else f.message for f in recheck.errors)
+        )
 
     owner = f"{socket.gethostname()}:{uuid.uuid4().hex[:6]}"
 
@@ -95,7 +119,7 @@ def execute_plan(
         busy = r["status"] == "executing" and r.get("claimed_until") and r["claimed_until"] > _now().isoformat()
         if busy and r.get("claimed_by") != owner:
             raise PlanError("the plan is already executing elsewhere")
-        if r["status"] == "failed":          # re-executing a failed plan retries its failed steps
+        if r["status"] == "failed":  # re-executing a failed plan retries its failed steps
             for st in r["steps"].values():
                 if st["status"] in ("failed", "skipped"):
                     st.clear()
@@ -117,7 +141,10 @@ def execute_plan(
             continue
         blocked = [d for d in step.depends_on if d in failed]
         if blocked or (failed and not all(record["steps"][f].get("continue_on_error") for f in failed)):
-            outcome = {"status": "skipped", "error": f"skipped: {', '.join(blocked) or 'an earlier step'} failed"}
+            outcome: dict[str, Any] = {
+                "status": "skipped",
+                "error": f"skipped: {', '.join(blocked) or 'an earlier step'} failed",
+            }
         else:
             try:
                 args = substitute(step.args, lambda path: resolve_path(results, path))
@@ -125,7 +152,7 @@ def execute_plan(
                 status = _succeeded(call)
                 result = call.result
                 if call.skipped_duplicate and isinstance(result, dict):
-                    result = (result.get("previous") or {}).get("result", result)   # resume: reuse the earlier result
+                    result = (result.get("previous") or {}).get("result", result)  # resume: reuse the earlier result
                     status = "done"
                 error = call.error or (result.get("error") if isinstance(result, dict) else None)
                 outcome = {"status": status, "result": result, "error": error if status == "failed" else None}
@@ -150,8 +177,13 @@ def execute_plan(
 
     def finish(r: dict) -> None:
         states = [s["status"] for s in r["steps"].values()]
-        r["status"] = ("failed" if any(s in ("failed", "skipped") for s in states)
-                       else "dry_run" if any(s == "dry_run" for s in states) else "completed")
+        r["status"] = (
+            "failed"
+            if any(s in ("failed", "skipped") for s in states)
+            else "dry_run"
+            if any(s == "dry_run" for s in states)
+            else "completed"
+        )
         r["claimed_by"] = r["claimed_until"] = None
         r["events"].append({"at": _now().isoformat(), "type": r["status"]})
 

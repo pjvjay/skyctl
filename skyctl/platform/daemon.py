@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.daemon
 ======================
@@ -17,13 +32,12 @@ from __future__ import annotations
 import json
 import os
 import threading
-from typing import Optional
 
 from .invocation import Dispatcher, Invocation, run_worker
 from .logging import log_event
 
 
-def load_schedules(raw: Optional[str] = None) -> list[dict]:
+def load_schedules(raw: str | None = None) -> list[dict]:
     raw = raw if raw is not None else os.getenv("SKYCTL_SCHEDULES_JSON", "")
     if not raw.strip():
         return [{"name": "tick", "cron": "* * * * *", "timezone": "UTC", "invoke": {"kind": "tick"}}]
@@ -41,23 +55,31 @@ def build_scheduler(dispatcher: Dispatcher, schedules: list[dict], blocking: boo
 
     sched = (BlockingScheduler if blocking else BackgroundScheduler)(timezone="UTC")
     for s in schedules:
+
         def fire(s=s):
             inv = Invocation.from_payload(s["invoke"], source=f"daemon:{s['name']}")
             outcome = dispatcher.dispatch(inv)
             log_event("schedule.fired", name=s["name"], kind=inv.kind, ok=outcome.ok, error=outcome.error)
 
-        sched.add_job(fire, CronTrigger.from_crontab(s["cron"], timezone=s.get("timezone", "UTC")),
-                      id=s["name"], max_instances=1, coalesce=True, misfire_grace_time=300)
+        sched.add_job(
+            fire,
+            CronTrigger.from_crontab(s["cron"], timezone=s.get("timezone", "UTC")),
+            id=s["name"],
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+        )
     return sched
 
 
-def run_daemon(dispatcher: Dispatcher, queue=None, schedules: Optional[list[dict]] = None) -> None:
+def run_daemon(dispatcher: Dispatcher, queue=None, schedules: list[dict] | None = None) -> None:
     schedules = schedules if schedules is not None else load_schedules()
     stop = threading.Event()
     if queue is not None:
         threading.Thread(
             target=lambda: run_worker(queue, dispatcher, idle_exit_seconds=None, stop=stop.is_set),
-            name="skyctl-worker", daemon=True,
+            name="skyctl-worker",
+            daemon=True,
         ).start()
     log_event("daemon.start", schedules=[s["name"] for s in schedules], worker=queue is not None)
     try:

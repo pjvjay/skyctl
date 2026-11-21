@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.scheduler
 ================
@@ -21,10 +36,10 @@ from __future__ import annotations
 
 import socket
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -33,9 +48,8 @@ from apscheduler.triggers.date import DateTrigger
 
 from .adapters.local import FileJobStore
 from .manager import BskyManager
-from .models import ScheduledPost, PostResult
+from .models import PostResult, ScheduledPost
 from .richtext import validate_length
-
 
 QUEUE_FILE = Path(".skyctl_queue.json")
 ACTIVE_STATUSES = ("pending", "retrying", "recurring", "sending")
@@ -50,10 +64,11 @@ def _now() -> datetime:
 @dataclass
 class TickResult:
     """What one scheduler pass did."""
+
     at: datetime
     sent: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
-    skipped: Optional[str] = None        # reason the tick did nothing at all
+    skipped: str | None = None  # reason the tick did nothing at all
 
     def to_dict(self) -> dict:
         return {
@@ -131,7 +146,7 @@ class BskyScheduler:
             self._register(sp)
 
     @classmethod
-    def from_settings(cls, manager: Optional[BskyManager] = None, settings=None, **kwargs) -> "BskyScheduler":
+    def from_settings(cls, manager: BskyManager | None = None, settings=None, **kwargs) -> BskyScheduler:
         """A scheduler whose queue lives in SKYCTL_STATE_URL (cloud entry points)."""
         from .platform.runtime import get_runtime
 
@@ -149,8 +164,8 @@ class BskyScheduler:
         alias: str,
         text: str,
         run_at: datetime,
-        reply_to_uri: Optional[str] = None,
-        image_paths: Optional[list[str]] = None,
+        reply_to_uri: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> ScheduledPost:
         """
         Schedule a one-time post.
@@ -178,7 +193,7 @@ class BskyScheduler:
             image_paths=image_paths or [],
         )
         self.job_store.update(lambda jobs: jobs.__setitem__(job_id, sp))
-        self._queue[job_id] = sp       # the returned object stays live in this process
+        self._queue[job_id] = sp  # the returned object stays live in this process
         self._sync_from_disk()
         self._register(sp)
         self._notify_scheduled(sp)
@@ -191,8 +206,8 @@ class BskyScheduler:
         hour: int = 9,
         minute: int = 0,
         day_of_week: str = "*",
-        job_id: Optional[str] = None,
-        cron: Optional[str] = None,
+        job_id: str | None = None,
+        cron: str | None = None,
     ) -> str:
         """
         Schedule a recurring post.
@@ -215,11 +230,7 @@ class BskyScheduler:
         expr = cron or f"{minute} {hour} * * {day_of_week}"
         CronTrigger.from_crontab(expr, timezone="UTC")  # raises ValueError if invalid
         if job_id is None:
-            job_id = (
-                f"cron_{str(uuid.uuid4())[:8]}"
-                if cron
-                else f"cron_{alias}_{hour:02d}{minute:02d}"
-            )
+            job_id = f"cron_{str(uuid.uuid4())[:8]}" if cron else f"cron_{alias}_{hour:02d}{minute:02d}"
         sp = ScheduledPost(
             id=job_id,
             account=alias,
@@ -252,16 +263,18 @@ class BskyScheduler:
         jobs = []
         for sp in self._queue.values():
             preview = sp.text[:60] + "…" if len(sp.text) > 60 else sp.text
-            jobs.append({
-                "id": sp.id,
-                "next_run": self._next_run(sp),
-                "account": sp.account,
-                "text_preview": preview,
-                "status": sp.status,
-                "schedule": sp.cron or sp.run_at.isoformat(),
-                "attempts": sp.attempts,
-                "last_error": sp.last_error,
-            })
+            jobs.append(
+                {
+                    "id": sp.id,
+                    "next_run": self._next_run(sp),
+                    "account": sp.account,
+                    "text_preview": preview,
+                    "status": sp.status,
+                    "schedule": sp.cron or sp.run_at.isoformat(),
+                    "attempts": sp.attempts,
+                    "last_error": sp.last_error,
+                }
+            )
         return jobs
 
     # ------------------------------------------------------------------
@@ -363,11 +376,9 @@ class BskyScheduler:
                 return client.reply(sp.text, parent_uri=sp.reply_to_uri)
             return client.post(sp.text, image_paths=sp.image_paths or None)
         except Exception as e:
-            return PostResult(
-                account=sp.account, uri="", cid="", url="", error=str(e)
-            )
+            return PostResult(account=sp.account, uri="", cid="", url="", error=str(e))
 
-    def _apply_result(self, sp: ScheduledPost, result: PostResult, now: datetime) -> Optional[float]:
+    def _apply_result(self, sp: ScheduledPost, result: PostResult, now: datetime) -> float | None:
         """
         Update a job after a send attempt. Returns the retry delay in
         seconds when the job should be retried, else None. Shared by the
@@ -389,10 +400,7 @@ class BskyScheduler:
             delay = self.retry_delay * (2 ** (sp.attempts - 1))
             if not sp.cron:
                 sp.status = "retrying"
-            print(
-                f"[scheduler] Job {sp.id} failed (attempt {sp.attempts}): "
-                f"{result.error}. Retrying in {delay:.0f}s."
-            )
+            print(f"[scheduler] Job {sp.id} failed (attempt {sp.attempts}): {result.error}. Retrying in {delay:.0f}s.")
             return delay
         # Out of retries. Recurring jobs wait for their next slot.
         print(f"[scheduler] Job {sp.id} failed after {sp.attempts} attempts: {result.error}")
@@ -423,7 +431,7 @@ class BskyScheduler:
 
     def _claimable(self, sp: ScheduledPost, now: datetime, require_due: bool, grace: timedelta) -> bool:
         if sp.status == "sending":
-            return sp.claimed_until is not None and sp.claimed_until <= now     # stale claim
+            return sp.claimed_until is not None and sp.claimed_until <= now  # stale claim
         if sp.status not in ACTIVE_STATUSES:
             return False
         return self.is_due(sp, now, grace) if require_due else True
@@ -432,7 +440,7 @@ class BskyScheduler:
         self,
         owner: str,
         now: datetime,
-        only: Optional[str] = None,
+        only: str | None = None,
         require_due: bool = True,
         grace: timedelta = timedelta(days=1),
     ) -> list[ScheduledPost]:
@@ -443,6 +451,7 @@ class BskyScheduler:
         claim in `_recovering_since`, so delivery can check for a post the
         crashed worker may already have made.
         """
+
         def mutate(jobs: dict[str, ScheduledPost]) -> list[ScheduledPost]:
             out = []
             for job_id, sp in jobs.items():
@@ -472,7 +481,7 @@ class BskyScheduler:
                 return found
         return self._send(sp)
 
-    def _find_existing_post(self, sp: ScheduledPost, since: datetime) -> Optional[PostResult]:
+    def _find_existing_post(self, sp: ScheduledPost, since: datetime) -> PostResult | None:
         """
         Outbox verification: did a crashed worker already publish this post?
         Looks for the same text on the account's own repo, created at or
@@ -489,21 +498,24 @@ class BskyScheduler:
                 except ValueError:
                     continue
                 if post.get("text") == sp.text and created_at >= since - skew:
-                    return PostResult(account=sp.account, uri=post["uri"], cid=post.get("cid", ""), url=post.get("url", ""))
+                    return PostResult(
+                        account=sp.account, uri=post["uri"], cid=post.get("cid", ""), url=post.get("url", "")
+                    )
         except Exception as e:
             print(f"[scheduler] Job {sp.id}: could not verify a previous send ({e}); sending.")
         return None
 
-    def _complete(self, owner: str, claimed: ScheduledPost, result: PostResult, now: datetime) -> Optional[float]:
+    def _complete(self, owner: str, claimed: ScheduledPost, result: PostResult, now: datetime) -> float | None:
         """
         Record the outcome, fenced by the claim: if another worker has since
         re-claimed the job (ours went stale), our result is discarded rather
         than overwriting theirs. Returns the retry delay, if any.
         """
-        def mutate(jobs: dict[str, ScheduledPost]) -> Optional[float]:
+
+        def mutate(jobs: dict[str, ScheduledPost]) -> float | None:
             sp = jobs.get(claimed.id)
             if sp is None or sp.claimed_by != owner:
-                return None                       # cancelled, or fenced out
+                return None  # cancelled, or fenced out
             sp.status = "recurring" if sp.cron else ("retrying" if sp.attempts else "pending")
             sp.claimed_by = sp.claimed_at = sp.claimed_until = None
             delay = self._apply_result(sp, result, now)
@@ -539,10 +551,10 @@ class BskyScheduler:
 
     def tick(
         self,
-        now: Optional[datetime] = None,
+        now: datetime | None = None,
         grace: timedelta = timedelta(days=1),
         lease_seconds: int = 120,
-        owner: Optional[str] = None,
+        owner: str | None = None,
     ) -> TickResult:
         """
         One reconciliation pass: claim every due (or stale) job, send, record.
@@ -567,7 +579,7 @@ class BskyScheduler:
         self._sync_from_disk()
         return result
 
-    def send_now(self, job_id: str, owner: Optional[str] = None) -> Optional[PostResult]:
+    def send_now(self, job_id: str, owner: str | None = None) -> PostResult | None:
         """
         Deliver one job if it is due: the handler for a native delayed
         delivery (`post.send`). Duplicate or early deliveries are no-ops.
@@ -597,7 +609,7 @@ class BskyScheduler:
     # Queue persistence
     # ------------------------------------------------------------------
 
-    def _read_queue_file(self) -> Optional[dict[str, ScheduledPost]]:
+    def _read_queue_file(self) -> dict[str, ScheduledPost] | None:
         try:
             return self.job_store.load()
         except Exception as e:
@@ -622,8 +634,11 @@ class BskyScheduler:
                 self._queue[job_id] = sp
                 self._register(sp)
             else:
-                result = mine.result if (mine.result is not None and sp.result is not None
-                                         and mine.result.uri == sp.result.uri) else sp.result
+                result = (
+                    mine.result
+                    if (mine.result is not None and sp.result is not None and mine.result.uri == sp.result.uri)
+                    else sp.result
+                )
                 for name in sp.__dataclass_fields__:
                     setattr(mine, name, getattr(sp, name))
                 mine.result = result

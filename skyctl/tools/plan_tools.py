@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.tools.plan_tools
 =======================
@@ -17,7 +32,7 @@ the human through elicitation and reports progress (skyctl.mcp_server).
 
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated
 
 from pydantic import Field
 
@@ -88,13 +103,19 @@ def plan_create(ctx: ToolContext, plan: Annotated[Plan, Field(description=_PLAN_
     plan = Plan.model_validate(plan)
     check = check_plan(plan, ctx, registry)
     if not check.ok:
-        raise ToolError("The plan is not valid:\n" + "\n".join(
-            f"- [{f.step}] {f.message}" if f.step else f"- {f.message}" for f in check.errors))
-    record = _store(ctx).create(plan, check, created_by=ctx.principal, approval_mode=ctx.plan_approval,
-                                run_id=ctx.run_id or None)
+        raise ToolError(
+            "The plan is not valid:\n"
+            + "\n".join(f"- [{f.step}] {f.message}" if f.step else f"- {f.message}" for f in check.errors)
+        )
+    record = _store(ctx).create(
+        plan, check, created_by=ctx.principal, approval_mode=ctx.plan_approval, run_id=ctx.run_id or None
+    )
     return {
-        "plan_id": record["id"], "plan_hash": record["plan_hash"], "status": record["status"],
-        "approval": record["approval"], "summary": check.summary,
+        "plan_id": record["id"],
+        "plan_hash": record["plan_hash"],
+        "status": record["status"],
+        "approval": record["approval"],
+        "summary": check.summary,
         "warnings": [f.to_dict() for f in check.findings if f.level == "warning"],
         "preview_text": render_preview(check, plan),
     }
@@ -125,7 +146,9 @@ def plan_status(ctx: ToolContext, plan_id: PlanId) -> dict:
 @registry.tool(account_param=None, tags=("plan",))
 def plan_list(
     ctx: ToolContext,
-    status: Annotated[Optional[str], Field(description="Filter: awaiting_approval, approved, executing, completed, failed, cancelled.")] = None,
+    status: Annotated[
+        str | None, Field(description="Filter: awaiting_approval, approved, executing, completed, failed, cancelled.")
+    ] = None,
     limit: Annotated[int, Field(ge=1, le=100)] = 20,
 ) -> dict:
     """Recent plans, newest first."""

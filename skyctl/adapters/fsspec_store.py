@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters.fsspec_store
 ============================
@@ -22,7 +37,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import Optional
 from urllib.parse import urlparse
 
 from ..ports import PreconditionFailed, Versioned
@@ -90,17 +104,17 @@ class FsspecObjectStore:
         for p in found:
             p = self.fs._strip_protocol(p).lstrip("/") if hasattr(self.fs, "_strip_protocol") else p.lstrip("/")
             if p.startswith(base):
-                out.append(p[len(base):])
+                out.append(p[len(base) :])
         return sorted(out)
 
-    def get(self, key: str) -> Optional[Versioned]:
+    def get(self, key: str) -> Versioned | None:
         try:
             data = self.read(key)
         except FileNotFoundError:
             return None
         return Versioned(data, hashlib.sha256(data).hexdigest()[:32])
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         # NOT atomic: another writer can slip in between the check and the write.
         if if_absent or if_version is not None:
             current = self.get(key)

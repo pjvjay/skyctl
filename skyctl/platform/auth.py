@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.auth
 ====================
@@ -32,8 +47,9 @@ import base64
 import hmac
 import json
 import os
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Any
 
 from .base import _header
 
@@ -46,19 +62,19 @@ class AuthError(Exception):
 class Principal:
     subject: str
     method: str
-    issuer: Optional[str] = None
+    issuer: str | None = None
     claims: dict = field(default_factory=dict)
 
 
 class Authenticator:
     name = "base"
 
-    def authenticate(self, headers: Mapping[str, str]) -> Optional[Principal]:
+    def authenticate(self, headers: Mapping[str, str]) -> Principal | None:
         """A Principal, None if this method does not apply, or raise AuthError."""
         raise NotImplementedError
 
 
-def _bearer(headers: Mapping[str, str]) -> Optional[str]:
+def _bearer(headers: Mapping[str, str]) -> str | None:
     scheme, _, token = _header(headers, "authorization").partition(" ")
     return token.strip() if scheme.lower() == "bearer" and token.strip() else None
 
@@ -86,7 +102,7 @@ class StaticBearer(Authenticator):
     def authenticate(self, headers):
         presented = _bearer(headers)
         if presented is None or _looks_like_jwt(presented):
-            return None                     # leave JWTs to the OIDC methods
+            return None  # leave JWTs to the OIDC methods
         for token, subject in self.tokens.items():
             if hmac.compare_digest(presented, token):
                 return Principal(subject, self.name)
@@ -102,24 +118,24 @@ class OidcJwt(Authenticator):
         self,
         issuers: Sequence[str],
         audience,
-        jwks_url: Optional[str] = None,
-        allowed: Optional[Sequence[str]] = None,
+        jwks_url: str | None = None,
+        allowed: Sequence[str] | None = None,
         algorithms: Sequence[str] = ("RS256",),
         leeway: int = 60,
-        key_resolver: Optional[Callable[[str], object]] = None,
-        name: Optional[str] = None,
+        key_resolver: Callable[[str], object] | None = None,
+        name: str | None = None,
     ):
         audiences = [a.strip() for a in (audience.split(",") if isinstance(audience, str) else audience) if a.strip()]
         if not audiences:
             raise ValueError("OIDC auth needs SKYCTL_OIDC_AUDIENCE")
         self.issuers = tuple(issuers)
-        self.audience = audiences        # any of them (e.g. the service URL and its /invoke URL)
+        self.audience = audiences  # any of them (e.g. the service URL and its /invoke URL)
         self.jwks_url = jwks_url
         self.allowed = {a.strip().lower() for a in (allowed or []) if a.strip()}
         self.algorithms = list(algorithms)
         self.leeway = leeway
         self._key_resolver = key_resolver
-        self._jwks_client = None
+        self._jwks_client: Any = None
         if name:
             self.name = name
 
@@ -152,11 +168,15 @@ class OidcJwt(Authenticator):
         except jwt.PyJWTError as e:
             raise AuthError(f"malformed token: {e}") from e
         if unverified.get("iss") not in self.issuers:
-            return None                     # another method's issuer; let the chain continue
+            return None  # another method's issuer; let the chain continue
         try:
             claims = jwt.decode(
-                token, self._key_for(token), algorithms=self.algorithms, audience=self.audience,
-                leeway=self.leeway, options={"require": ["exp", "iss", "aud"]},
+                token,
+                self._key_for(token),
+                algorithms=self.algorithms,
+                audience=self.audience,
+                leeway=self.leeway,
+                options={"require": ["exp", "iss", "aud"]},
             )
         except jwt.PyJWTError as e:
             raise AuthError(f"invalid token: {e}") from e
@@ -169,8 +189,12 @@ class OidcJwt(Authenticator):
 
 def google_oidc(audience: str, allowed=None, **kw) -> OidcJwt:
     return OidcJwt(
-        ("https://accounts.google.com", "accounts.google.com"), audience,
-        jwks_url="https://www.googleapis.com/oauth2/v3/certs", allowed=allowed, name="google-oidc", **kw,
+        ("https://accounts.google.com", "accounts.google.com"),
+        audience,
+        jwks_url="https://www.googleapis.com/oauth2/v3/certs",
+        allowed=allowed,
+        name="google-oidc",
+        **kw,
     )
 
 
@@ -178,9 +202,12 @@ def entra_oidc(tenant: str, audience: str, allowed=None, **kw) -> OidcJwt:
     if not tenant:
         raise ValueError("entra-oidc needs AZURE_TENANT_ID")
     return OidcJwt(
-        (f"https://login.microsoftonline.com/{tenant}/v2.0", f"https://sts.windows.net/{tenant}/"), audience,
-        jwks_url=f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys", allowed=allowed,
-        name="entra-oidc", **kw,
+        (f"https://login.microsoftonline.com/{tenant}/v2.0", f"https://sts.windows.net/{tenant}/"),
+        audience,
+        jwks_url=f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys",
+        allowed=allowed,
+        name="entra-oidc",
+        **kw,
     )
 
 
@@ -193,7 +220,7 @@ class AwsAlbOidc(Authenticator):
 
     name = "aws-alb"
 
-    def __init__(self, region: str, alb_arn: str, key_resolver: Optional[Callable[[str], object]] = None):
+    def __init__(self, region: str, alb_arn: str, key_resolver: Callable[[str], object] | None = None):
         if not region or not alb_arn:
             raise ValueError("aws-alb auth needs AWS_REGION and SKYCTL_ALB_ARN")
         self.region, self.alb_arn = region, alb_arn
@@ -264,7 +291,7 @@ class AuthChain:
         return [m.name for m in self.methods]
 
 
-def build_auth_chain(spec: Optional[str] = None, env: Optional[Mapping[str, str]] = None) -> AuthChain:
+def build_auth_chain(spec: str | None = None, env: Mapping[str, str] | None = None) -> AuthChain:
     env = os.environ if env is None else env
     raw = spec if spec is not None else env.get("SKYCTL_AUTH", "")
     names = [n.strip().lower() for n in raw.split(",") if n.strip()]
@@ -285,8 +312,14 @@ def build_auth_chain(spec: Optional[str] = None, env: Optional[Mapping[str, str]
         elif name == "entra-oidc":
             methods.append(entra_oidc(env.get("AZURE_TENANT_ID", ""), audience, allowed))
         elif name == "oidc":
-            methods.append(OidcJwt([env.get("SKYCTL_OIDC_ISSUER", "")], audience,
-                                   jwks_url=env.get("SKYCTL_OIDC_JWKS_URL") or None, allowed=allowed))
+            methods.append(
+                OidcJwt(
+                    [env.get("SKYCTL_OIDC_ISSUER", "")],
+                    audience,
+                    jwks_url=env.get("SKYCTL_OIDC_JWKS_URL") or None,
+                    allowed=allowed,
+                )
+            )
         elif name == "aws-alb":
             methods.append(AwsAlbOidc(env.get("AWS_REGION", ""), env.get("SKYCTL_ALB_ARN", "")))
         elif name == "easyauth":
@@ -298,7 +331,7 @@ def build_auth_chain(spec: Optional[str] = None, env: Optional[Mapping[str, str]
     return AuthChain(methods)
 
 
-def plan_approvers(env: Optional[Mapping[str, str]] = None) -> set[str]:
+def plan_approvers(env: Mapping[str, str] | None = None) -> set[str]:
     """Principals allowed to approve plans: the approver token plus SKYCTL_PLAN_APPROVERS (subjects/emails)."""
     env = os.environ if env is None else env
     approvers = {a.strip().lower() for a in env.get("SKYCTL_PLAN_APPROVERS", "").split(",") if a.strip()}

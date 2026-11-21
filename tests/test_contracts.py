@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Port contracts run against every ObjectStore / JobStore implementation.
 S3 runs against moto (an in-process AWS emulator); Azure Blob and GCS run
@@ -6,6 +21,7 @@ against SDK-faithful fakes (skyctl.testing.fakes).
 
 import pytest
 
+from conftest import require
 from skyctl.adapters import FileObjectStore, MemoryObjectStore, ObjectJobStore
 from skyctl.adapters.azure_blob import AzureBlobObjectStore
 from skyctl.adapters.gcs import GcsObjectStore
@@ -19,8 +35,8 @@ from skyctl.testing.fakes import FakeAzureContainer, FakeGcsBucket
 
 @pytest.fixture
 def s3_store():
-    moto = pytest.importorskip("moto")
-    boto3 = pytest.importorskip("boto3")
+    moto = require("moto")
+    boto3 = require("boto3")
     from skyctl.adapters.s3 import S3ObjectStore
 
     with moto.mock_aws():
@@ -52,7 +68,7 @@ def test_s3_object_store_contract(s3_store):
 
 
 def test_fsspec_store_contract_is_explicitly_non_atomic():
-    pytest.importorskip("fsspec")
+    require("fsspec")
     from skyctl.adapters.fsspec_store import FsspecObjectStore
 
     check_object_store(FsspecObjectStore("memory://contract"), atomic=False)
@@ -75,7 +91,7 @@ def test_s3_conditional_put_on_deleted_key_is_a_lost_race(s3_store):
 @pytest.mark.skipif(
     not __import__("os").getenv("SKYCTL_IT_S3_BUCKET"),
     reason="moto checks S3 preconditions without a lock, so contention needs real S3 "
-           "(set SKYCTL_IT_S3_BUCKET; integration tier, see CLOUD_FRAMEWORK.md §9)",
+    "(set SKYCTL_IT_S3_BUCKET; integration tier, see CLOUD_FRAMEWORK.md §9)",
 )
 def test_s3_cas_has_no_lost_updates_under_contention_real_bucket():
     import os
@@ -106,7 +122,9 @@ def test_job_store_update_is_atomic_across_writers(tmp_path):
 
     def add(prefix):
         for i in range(15):
-            store.update(lambda jobs, i=i: jobs.__setitem__(f"{prefix}{i}", ScheduledPost(f"{prefix}{i}", "a", "t", now)))
+            store.update(
+                lambda jobs, i=i: jobs.__setitem__(f"{prefix}{i}", ScheduledPost(f"{prefix}{i}", "a", "t", now))
+            )
 
     threads = [threading.Thread(target=add, args=(p,)) for p in "abcd"]
     for t in threads:

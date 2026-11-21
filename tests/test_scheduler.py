@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -35,7 +50,7 @@ def test_failing_job_is_retried_then_succeeds(scheduler, manager):
     assert retry is not None
     assert retry.trigger.run_date >= before + timedelta(seconds=59)
 
-    scheduler._execute(sp.id)          # the retry fires
+    scheduler._execute(sp.id)  # the retry fires
     assert sp.status == "sent"
     assert sp.attempts == 0
     assert len(fake.sent) == 1
@@ -54,7 +69,7 @@ def test_job_fails_for_good_after_max_retries(manager, tmp_path):
     scheduler = BskyScheduler(manager, queue_file=tmp_path / "q.json", max_retries=2)
     sp = scheduler.schedule("personal", "hello", future())
     manager.client("personal").login()._client.fail_sends = 99
-    for _ in range(3):                 # first try + 2 retries
+    for _ in range(3):  # first try + 2 retries
         scheduler._execute(sp.id)
     assert sp.status == "failed"
 

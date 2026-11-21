@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Executable port contracts. Each check_* function raises AssertionError with
 a message naming the violated clause. Use them from pytest:
@@ -9,11 +24,7 @@ a message naming the violated clause. Use them from pytest:
 
 from __future__ import annotations
 
-import json
 import threading
-import time
-from datetime import datetime, timedelta, timezone
-from typing import Callable
 
 from ..ports import PreconditionFailed, cas_update
 
@@ -26,7 +37,9 @@ def check_object_store(store, *, atomic: bool = True) -> None:
     v1 = store.put("c/a.txt", b"one", if_absent=True)
     assert isinstance(v1, str) and v1, "put() must return a non-empty version token"
     got = store.get("c/a.txt")
-    assert got is not None and got.data == b"one" and got.version == v1, "get() must return data and the version put() returned"
+    assert got is not None and got.data == b"one" and got.version == v1, (
+        "get() must return data and the version put() returned"
+    )
 
     try:
         store.put("c/a.txt", b"two", if_absent=True)
@@ -50,7 +63,9 @@ def check_object_store(store, *, atomic: bool = True) -> None:
     assert set(store.list()) >= {"c/a.txt", "c/b.txt", "other.txt"}
     store.append_line("c/log.jsonl", '{"n": 1}')
     store.append_line("c/log.jsonl", '{"n": 2}\n')
-    assert store.read("c/log.jsonl") == b'{"n": 1}\n{"n": 2}\n', "append_line must add exactly one newline-terminated line"
+    assert store.read("c/log.jsonl") == b'{"n": 1}\n{"n": 2}\n', (
+        "append_line must add exactly one newline-terminated line"
+    )
 
     store.delete("c/a.txt")
     store.delete("c/a.txt")
@@ -104,7 +119,8 @@ def check_work_queue(queue, *, supports_delay: bool = True) -> None:
     """At-least-once semantics: receive hides, ack removes, nack redelivers."""
     queue.send({"n": 1})
     [m] = queue.receive(max_messages=1, visibility_seconds=30)
-    assert m.body == {"n": 1} and m.attempt >= 1
+    assert m.body == {"n": 1}
+    assert m.attempt >= 1
     assert queue.receive(max_messages=1, visibility_seconds=30) == [], "an in-flight message must be invisible"
     queue.nack(m, delay_seconds=0)
     [again] = queue.receive(max_messages=1, visibility_seconds=30)

@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.base
 ====================
@@ -20,8 +35,8 @@ Third-party platforms register through the `skyctl.platforms` entry point:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 from .capabilities import ComputeProfile
 
@@ -43,9 +58,9 @@ class Toolset:
 
 @dataclass(frozen=True)
 class TraceContext:
-    trace_id: Optional[str] = None
-    span_id: Optional[str] = None
-    sampled: Optional[bool] = None
+    trace_id: str | None = None
+    span_id: str | None = None
+    sampled: bool | None = None
 
 
 class Platform:
@@ -55,29 +70,28 @@ class Platform:
     display_name: str = "Base"
     compute_profiles: Mapping[str, ComputeProfile] = {}
     default_compute: str = ""
-    caps: frozenset = frozenset()          # platform-wide capabilities
+    caps: frozenset = frozenset()  # platform-wide capabilities
     toolset: Toolset = Toolset()
     service_schemes: tuple[str, ...] = ()  # URL schemes native to this provider (for docs/defaults)
 
     # -- detection -------------------------------------------------------
 
-    def detect(self, env: Mapping[str, str]) -> Optional[str]:
+    def detect(self, env: Mapping[str, str]) -> str | None:
         """Return the compute profile name if running here, else None."""
         return None
 
     # -- compute ---------------------------------------------------------
 
-    def profile(self, name: Optional[str] = None) -> ComputeProfile:
+    def profile(self, name: str | None = None) -> ComputeProfile:
         name = name or self.default_compute
         try:
             return self.compute_profiles[name]
         except KeyError:
             raise ValueError(
-                f"Platform {self.name!r} has no compute profile {name!r}. "
-                f"Available: {', '.join(self.compute_profiles)}"
+                f"Platform {self.name!r} has no compute profile {name!r}. Available: {', '.join(self.compute_profiles)}"
             ) from None
 
-    def capabilities(self, compute: Optional[str] = None) -> frozenset:
+    def capabilities(self, compute: str | None = None) -> frozenset:
         return self.caps | self.profile(compute).caps
 
     # -- observability -----------------------------------------------------
@@ -164,7 +178,7 @@ def get_platform(name: str) -> Platform:
     return available[key]
 
 
-def detect_platform(env: Optional[Mapping[str, str]] = None) -> tuple[Platform, str]:
+def detect_platform(env: Mapping[str, str] | None = None) -> tuple[Platform, str]:
     """
     (platform, compute profile) for this process. SKYCTL_PLATFORM (or the
     older SKYCTL_CLOUD) and SKYCTL_COMPUTE override detection.

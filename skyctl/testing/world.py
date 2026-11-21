@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.testing.world
 ====================
@@ -18,10 +33,9 @@ evaluation proposed plans but executed nothing.
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Optional
 
 
 @dataclass
@@ -32,20 +46,22 @@ class _Post:
     handle: str
     text: str
     created_at: str
-    reply_parent: Optional[str] = None
-    reply_root: Optional[str] = None
+    reply_parent: str | None = None
+    reply_root: str | None = None
     likes: int = 0
 
 
 class World:
-    def __init__(self, now: Optional[datetime] = None):
+    def __init__(self, now: datetime | None = None):
         self.now = now or datetime.now(timezone.utc)
-        self.dids: dict[str, str] = {}                 # handle -> did
+        self.dids: dict[str, str] = {}  # handle -> did
         self.posts: dict[str, _Post] = {}
         self.notifications: dict[str, list[dict]] = {}  # did -> notifications (newest first)
-        self.timelines: dict[str, list[str]] = {}       # did -> post uris (newest first)
-        self.keys: dict[str, str] = {}                  # scenario key -> uri
+        self.timelines: dict[str, list[str]] = {}  # did -> post uris (newest first)
+        self.keys: dict[str, str] = {}  # scenario key -> uri
         self.writes: list[dict] = []
+        self.news: list = []  # SearchHit-like dicts for web_search
+        self.pages: dict[str, dict] = {}  # url -> {"title", "text"} for fetch_page
         self._n = itertools.count(1)
 
     # -- building -----------------------------------------------------------
@@ -57,8 +73,9 @@ class World:
             self.timelines[self.dids[handle]] = []
         return self.dids[handle]
 
-    def add_post(self, handle: str, text: str, key: Optional[str] = None, reply_to: Optional[str] = None,
-                 minutes_ago: int = 30) -> str:
+    def add_post(
+        self, handle: str, text: str, key: str | None = None, reply_to: str | None = None, minutes_ago: int = 30
+    ) -> str:
         did = self.add_account(handle)
         n = next(self._n)
         uri = f"at://{did}/app.bsky.feed.post/{n:05d}"
@@ -70,8 +87,15 @@ class World:
             self.keys[key] = uri
         return uri
 
-    def mention(self, to_handle: str, from_handle: str, text: str, key: Optional[str] = None,
-                reason: str = "mention", minutes_ago: int = 30) -> str:
+    def mention(
+        self,
+        to_handle: str,
+        from_handle: str,
+        text: str,
+        key: str | None = None,
+        reason: str = "mention",
+        minutes_ago: int = 30,
+    ) -> str:
         if f"@{to_handle}" not in text and reason == "mention":
             text = f"@{to_handle} {text}"
         uri = self.add_post(from_handle, text, key=key, minutes_ago=minutes_ago)
@@ -85,7 +109,31 @@ class World:
     def uri(self, key: str) -> str:
         return self.keys[key]
 
-    def client_factory(self, base_url: Optional[str] = None) -> "WorldClient":
+    def reply(self, to_key_or_uri: str, handle: str, text: str, key: str | None = None, minutes_ago: int = 20) -> str:
+        parent = self.keys.get(to_key_or_uri, to_key_or_uri)
+        return self.add_post(handle, text, key=key, reply_to=parent, minutes_ago=minutes_ago)
+
+    def add_article(self, url: str, title: str, text: str, source: str = "", published_at: str | None = None) -> None:
+        from urllib.parse import urlparse
+
+        self.news.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": text[:200],
+                "source": source or (urlparse(url).hostname or ""),
+                "published_at": published_at or self.now.isoformat(),
+            }
+        )
+        self.pages[url] = {"title": title, "text": text}
+
+    def research(self):
+        """(WebSearch, PageFetcher) backed by this world's articles."""
+        from ..research import SearchHit, StaticFetcher, StaticSearch
+
+        return StaticSearch([SearchHit(**a) for a in self.news]), StaticFetcher(self.pages)
+
+    def client_factory(self, base_url: str | None = None) -> WorldClient:
         return WorldClient(self)
 
     # -- views --------------------------------------------------------------------
@@ -94,13 +142,17 @@ class World:
         p = self.posts[uri]
         reply = None
         if p.reply_parent:
-            parent, root = self.posts[p.reply_parent], self.posts[p.reply_root]
-            reply = SimpleNamespace(parent=SimpleNamespace(uri=parent.uri, cid=parent.cid),
-                                    root=SimpleNamespace(uri=root.uri, cid=root.cid))
+            parent, root = self.posts[p.reply_parent], self.posts[p.reply_root or p.reply_parent]
+            reply = SimpleNamespace(
+                parent=SimpleNamespace(uri=parent.uri, cid=parent.cid), root=SimpleNamespace(uri=root.uri, cid=root.cid)
+            )
         return SimpleNamespace(
-            uri=p.uri, cid=p.cid, author=SimpleNamespace(handle=p.handle, did=p.did),
+            uri=p.uri,
+            cid=p.cid,
+            author=SimpleNamespace(handle=p.handle, did=p.did),
             record=SimpleNamespace(text=p.text, created_at=p.created_at, reply=reply),
-            like_count=p.likes, repost_count=0,
+            like_count=p.likes,
+            repost_count=0,
             reply_count=sum(1 for q in self.posts.values() if q.reply_parent == uri),
         )
 
@@ -133,7 +185,9 @@ class WorldClient:
 
     def upload_blob(self, data):
         self.world.writes.append({"op": "upload", "by": self.me.handle, "bytes": len(data)})
-        return SimpleNamespace(blob={"$type": "blob", "ref": {"$link": "bafkreiworld"}, "mimeType": "image/png", "size": len(data)})
+        return SimpleNamespace(
+            blob={"$type": "blob", "ref": {"$link": "bafkreiworld"}, "mimeType": "image/png", "size": len(data)}
+        )
 
     def like(self, uri, cid):
         self.world.posts[uri].likes += 1
@@ -158,6 +212,18 @@ class WorldClient:
             raise RuntimeError(f"unknown handle {handle}")
         return SimpleNamespace(did=self.world.dids[handle])
 
+    def get_post_thread(self, uri, depth=None, parent_height=None):
+        world = self.world
+        if uri not in world.posts:
+            raise RuntimeError(f"Post not found: {uri}")
+
+        def node(u, level):
+            children = sorted((p for p in world.posts.values() if p.reply_parent == u), key=lambda p: p.created_at)
+            replies = [node(c.uri, level + 1) for c in children] if level < (depth or 6) else []
+            return SimpleNamespace(post=world.view(u), replies=replies)
+
+        return SimpleNamespace(thread=node(uri, 0))
+
     def get_timeline(self, limit=20):
         uris = [u for u in self.world.timelines.get(self.me.did, []) if u in self.world.posts][:limit]
         return SimpleNamespace(feed=[SimpleNamespace(post=self.world.view(u)) for u in uris])
@@ -165,9 +231,17 @@ class WorldClient:
     def get_profile(self, handle):
         did = self.world.add_account(handle)
         n_posts = sum(1 for p in self.world.posts.values() if p.did == did)
-        return SimpleNamespace(model_dump=lambda: {"did": did, "handle": handle, "display_name": handle.split(".")[0].title(),
-                                                   "description": "", "followers_count": 0, "follows_count": 0,
-                                                   "posts_count": n_posts})
+        return SimpleNamespace(
+            model_dump=lambda: {
+                "did": did,
+                "handle": handle,
+                "display_name": handle.split(".")[0].title(),
+                "description": "",
+                "followers_count": 0,
+                "follows_count": 0,
+                "posts_count": n_posts,
+            }
+        )
 
     @property
     def app(self):
@@ -175,8 +249,11 @@ class WorldClient:
 
         def search_posts(params):
             q = params["q"].lower()
-            hits = [p.uri for p in sorted(world.posts.values(), key=lambda p: p.created_at, reverse=True)
-                    if any(w in p.text.lower() for w in q.split())]
+            hits = [
+                p.uri
+                for p in sorted(world.posts.values(), key=lambda p: p.created_at, reverse=True)
+                if any(w in p.text.lower() for w in q.split())
+            ]
             return SimpleNamespace(posts=[world.view(u) for u in hits[: params.get("limit", 25)]])
 
         def list_notifications(params):
@@ -185,13 +262,25 @@ class WorldClient:
                 p = world.posts.get(n["uri"])
                 if p is None:
                     continue
-                doc = {"reason": n["reason"], "author": {"handle": p.handle}, "record": {"text": p.text},
-                       "uri": p.uri, "cid": p.cid, "reason_subject": None, "indexed_at": p.created_at, "is_read": False}
+                doc = {
+                    "reason": n["reason"],
+                    "author": {"handle": p.handle},
+                    "record": {"text": p.text},
+                    "uri": p.uri,
+                    "cid": p.cid,
+                    "reason_subject": None,
+                    "indexed_at": p.created_at,
+                    "is_read": False,
+                }
                 items.append(SimpleNamespace(model_dump=lambda d=doc: d))
             return SimpleNamespace(notifications=items)
 
-        return SimpleNamespace(bsky=SimpleNamespace(feed=SimpleNamespace(search_posts=search_posts),
-                                                    notification=SimpleNamespace(list_notifications=list_notifications)))
+        return SimpleNamespace(
+            bsky=SimpleNamespace(
+                feed=SimpleNamespace(search_posts=search_posts),
+                notification=SimpleNamespace(list_notifications=list_notifications),
+            )
+        )
 
     @property
     def com(self):
@@ -200,8 +289,10 @@ class WorldClient:
         def list_records(params):
             did = params["repo"] if params["repo"].startswith("did:") else world.dids.get(params["repo"])
             mine = sorted((p for p in world.posts.values() if p.did == did), key=lambda p: p.created_at, reverse=True)
-            recs = [SimpleNamespace(uri=p.uri, cid=p.cid, value={"text": p.text, "created_at": p.created_at,
-                                                                 "reply": None}) for p in mine[: params.get("limit", 30)]]
+            recs = [
+                SimpleNamespace(uri=p.uri, cid=p.cid, value={"text": p.text, "created_at": p.created_at, "reply": None})
+                for p in mine[: params.get("limit", 30)]
+            ]
             return SimpleNamespace(records=recs)
 
         return SimpleNamespace(atproto=SimpleNamespace(repo=SimpleNamespace(list_records=list_records)))

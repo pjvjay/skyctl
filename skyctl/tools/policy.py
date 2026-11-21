@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.tools.policy
 ===================
@@ -24,22 +39,21 @@ which is how an agent can propose `post` without being able to call it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .registry import ToolDenied, ToolSpec
 
 
 @dataclass
 class ToolPolicy:
-    accounts: Optional[list[str]] = None      # None → every configured alias
+    accounts: list[str] | None = None  # None → every configured alias
     allow_writes: bool = False
     allow_delete: bool = False
     max_writes: int = 5
     allow_public_writes: bool = True
     deny_tools: list[str] = field(default_factory=list)
-    allow_tools: Optional[list[str]] = None   # None → everything not denied
-    approval: str = "none"                    # "writes": record mutating calls for a human instead of sending
-    expose_tags: Optional[set] = None         # None → every permitted tool is directly callable
+    allow_tools: list[str] | None = None  # None → everything not denied
+    approval: str = "none"  # "writes": record mutating calls for a human instead of sending
+    expose_tags: set | None = None  # None → every permitted tool is directly callable
 
     def __post_init__(self):
         self.accounts = [a.lower() for a in self.accounts] if self.accounts is not None else None
@@ -55,17 +69,13 @@ class ToolPolicy:
             return False
         if self.allow_tools is not None and spec.name not in self.allow_tools:
             return False
-        if spec.destructive and not self.allow_delete:
-            return False
-        return True
+        return not (spec.destructive and not self.allow_delete)
 
     def visible(self, spec: ToolSpec) -> bool:
         """Whether a session may call (and be shown) this tool directly."""
         if not self.permits(spec):
             return False
-        if self.expose_tags is not None and not (set(spec.tags) & set(self.expose_tags)):
-            return False
-        return True
+        return not (self.expose_tags is not None and not set(spec.tags) & set(self.expose_tags))
 
     def account_allowed(self, alias: str) -> bool:
         return self.accounts is None or alias.lower() in self.accounts
@@ -85,8 +95,7 @@ class ToolPolicy:
             alias = str(args[spec.account_param] or "").lower()
             if not self.account_allowed(alias):
                 raise ToolDenied(
-                    f"Account {alias!r} is outside this run's scope. "
-                    f"Allowed: {', '.join(self.accounts or [])}"
+                    f"Account {alias!r} is outside this run's scope. Allowed: {', '.join(self.accounts or [])}"
                 )
             if spec.mutating and self.allow_writes and not self.allow_public_writes:
                 client = ctx.manager.client(alias)
@@ -98,9 +107,7 @@ class ToolPolicy:
                         "network and allow_public_writes is off."
                     )
         if spec.mutating and self.allow_writes and ctx.writes_done >= self.max_writes:
-            raise ToolDenied(
-                f"Write budget exhausted ({self.max_writes}). Finish with a summary."
-            )
+            raise ToolDenied(f"Write budget exhausted ({self.max_writes}). Finish with a summary.")
 
     def write_mode(self, ctx) -> str:
         """How a mutating call is handled: execute | dry_run | approval."""
@@ -117,7 +124,10 @@ class ToolPolicy:
         ctx.writes_done += 1
 
     def describe(self) -> str:
-        scope = ", ".join(self.accounts) if self.accounts else "all configured accounts"
+        if self.accounts is None:
+            scope = "all configured accounts"
+        else:
+            scope = ", ".join(self.accounts) or "no accounts (the request named none that this deployment allows)"
         mode = (
             f"writes ENABLED (max {self.max_writes} per run)"
             if self.allow_writes

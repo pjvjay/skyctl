@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.tools.registry
 =====================
@@ -22,22 +37,51 @@ import inspect
 import json
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from pydantic import ValidationError, create_model
 
-
 _AT_URI = re.compile(r"at://[A-Za-z0-9:._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._~-]+")
+_HTTP_URL = re.compile(r"https?://[^\s\"'<>\\]+")
 MAX_SEEN_URIS = 10_000
 
 
-def _remember_uris(ctx, result) -> None:
-    """Grounding: note every at:// URI a tool returned, so plans can be checked against what was observed."""
+def _remember_uris(ctx, result, spec=None) -> None:
+    """
+    Grounding: note every at:// URI a tool returned, and every http(s) URL a
+    *research* tool returned, so plans can be checked against what was observed.
+    """
+    blob = json.dumps(result, default=str)
     seen = getattr(ctx, "seen_uris", None)
-    if seen is None or len(seen) >= MAX_SEEN_URIS:
+    if seen is not None and len(seen) < MAX_SEEN_URIS:
+        seen.update(_AT_URI.findall(blob))
+    urls = getattr(ctx, "seen_urls", None)
+    if urls is not None and spec is not None and "research" in spec.tags and len(urls) < MAX_SEEN_URIS:
+        urls.update(u.rstrip(".,;:)]}") for u in _HTTP_URL.findall(blob))
+    posts = getattr(ctx, "seen_posts", None)
+    if isinstance(posts, dict):
+        _remember_posts(result, posts)
+
+
+def _remember_posts(node, posts: dict, depth: int = 0) -> None:
+    """Author and text of posts a tool returned, so a plan preview can show what a reply answers."""
+    if depth > 12 or len(posts) >= MAX_SEEN_URIS:
         return
-    seen.update(_AT_URI.findall(json.dumps(result, default=str)))
+    if isinstance(node, dict):
+        uri, text = node.get("uri"), node.get("text")
+        if isinstance(uri, str) and uri.startswith("at://") and isinstance(text, str):
+            author = node.get("author")
+            if isinstance(author, dict):
+                author = author.get("handle") or author.get("did")
+            posts.setdefault(uri, {"author": author if isinstance(author, str) else None, "text": text[:500]})
+        for value in node.values():
+            if isinstance(value, dict | list):
+                _remember_posts(value, posts, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            _remember_posts(value, posts, depth + 1)
 
 
 class ToolError(Exception):
@@ -53,10 +97,10 @@ class ToolSpec:
     name: str
     description: str
     fn: Callable[..., Any]
-    input_model: Any                      # pydantic model class for the arguments
-    mutating: bool = False                # changes state on Bluesky or in the queue
-    destructive: bool = False             # deletes something
-    account_param: Optional[str] = "account"   # arg that names the account (policy scoping)
+    input_model: Any  # pydantic model class for the arguments
+    mutating: bool = False  # changes state on Bluesky or in the queue
+    destructive: bool = False  # deletes something
+    account_param: str | None = "account"  # arg that names the account (policy scoping)
     tags: tuple[str, ...] = ()
 
     @property
@@ -71,14 +115,14 @@ class ToolSpec:
         """The tool as a plain function with the context baked in (for MCP)."""
         fn = self.fn
         sig = inspect.signature(fn)
-        hints = inspect.get_annotations(fn, eval_str=True)   # real types, not strings
+        hints = inspect.get_annotations(fn, eval_str=True)  # real types, not strings
         ctx_name, *params = sig.parameters.values()
         params = [p.replace(annotation=hints.get(p.name, p.annotation)) for p in params]
 
         def wrapper(*args, **kwargs):
             return fn(ctx, *args, **kwargs)
 
-        wrapper.__signature__ = sig.replace(
+        wrapper.__signature__ = sig.replace(  # type: ignore[attr-defined]
             parameters=params, return_annotation=hints.get("return", sig.return_annotation)
         )
         wrapper.__annotations__ = {k: v for k, v in hints.items() if k != ctx_name.name}
@@ -127,11 +171,12 @@ def _model_from_signature(fn: Callable, name: str):
 @dataclass
 class CallRecord:
     """What happened on one tool call; appended to the run transcript."""
+
     name: str
     args: dict
     ok: bool
     result: Any = None
-    error: Optional[str] = None
+    error: str | None = None
     duration_ms: int = 0
     dry_run: bool = False
     denied: bool = False
@@ -161,11 +206,11 @@ class ToolRegistry:
 
     def tool(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         *,
         mutating: bool = False,
         destructive: bool = False,
-        account_param: Optional[str] = "account",
+        account_param: str | None = "account",
         tags: tuple[str, ...] = (),
     ):
         """Decorator: register `fn(ctx, ...)` as a tool."""
@@ -216,7 +261,7 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
-    def select(self, names: Optional[list[str]] = None, policy=None) -> list[ToolSpec]:
+    def select(self, names: list[str] | None = None, policy=None) -> list[ToolSpec]:
         """The specs a consumer should see: filtered by name and by policy visibility."""
         specs = [self._tools[n] for n in (names or self._tools)]
         if policy is not None:
@@ -225,13 +270,13 @@ class ToolRegistry:
 
     # -- schemas -------------------------------------------------------
 
-    def to_anthropic(self, names: Optional[list[str]] = None, policy=None) -> list[dict]:
+    def to_anthropic(self, names: list[str] | None = None, policy=None) -> list[dict]:
         return [
             {"name": s.name, "description": s.description, "input_schema": s.input_schema}
             for s in self.select(names, policy)
         ]
 
-    def to_openai(self, names: Optional[list[str]] = None, policy=None) -> list[dict]:
+    def to_openai(self, names: list[str] | None = None, policy=None) -> list[dict]:
         return [
             {
                 "type": "function",
@@ -262,7 +307,7 @@ class ToolRegistry:
             clean = validated.model_dump()
             policy = getattr(ctx, "policy", None)
             if policy is not None:
-                policy.check(spec, clean, ctx)          # raises ToolDenied
+                policy.check(spec, clean, ctx)  # raises ToolDenied
                 if spec.mutating:
                     mode = policy.write_mode(ctx)
                     if mode == "dry_run":
@@ -298,7 +343,7 @@ class ToolRegistry:
                     return record
             record.result = spec.fn(ctx, **clean)
             record.ok = True
-            _remember_uris(ctx, record.result)
+            _remember_uris(ctx, record.result, spec)
             if spec.mutating:
                 if policy is not None:
                     policy.count_write(ctx)
@@ -306,7 +351,9 @@ class ToolRegistry:
                 # would make a retry skip it and report success for a post that never went out.
                 took_effect = not (isinstance(record.result, dict) and record.result.get("success") is False)
                 if ledger is not None and took_effect:
-                    ledger.record(ledger.key_for(name, clean), {"run_id": getattr(ctx, "run_id", ""), "result": record.result})
+                    ledger.record(
+                        ledger.key_for(name, clean), {"run_id": getattr(ctx, "run_id", ""), "result": record.result}
+                    )
             return record
         except ToolDenied as e:
             record.denied = True

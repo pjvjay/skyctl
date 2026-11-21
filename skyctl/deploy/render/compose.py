@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.deploy.render.compose
 ============================
@@ -20,30 +35,54 @@ from __future__ import annotations
 
 import json
 
-from ..spec import DeploySpec
+from ..spec import DeploySpec, required
 from .base import Artifact, RenderedSchedule, Workload, common_env
 
 
 def render_compose(spec: DeploySpec) -> Artifact:
-    c = spec.targets.compose
+    c = required(spec.targets.compose, "compose")
     app = spec.app.name
     art = Artifact("compose")
-    env = common_env(spec, "compose", platform="compose", compute="compose", secrets="env", state_url="file:///data",
-                     queue_url="none", delayed_url="none")
+    env = common_env(
+        spec,
+        "compose",
+        platform="compose",
+        compute="compose",
+        secrets="env",
+        state_url="file:///data",
+        queue_url="none",
+        delayed_url="none",
+    )
     art.env = env
-    schedules = [{"name": s.name, "cron": s.cron, "timezone": s.timezone, "invoke": s.payload()} for s in spec.schedules]
+    schedules = [
+        {"name": s.name, "cron": s.cron, "timezone": s.timezone, "invoke": s.payload()} for s in spec.schedules
+    ]
     base = {
-        "image": spec.app.image, "env_file": [".env"], "environment": dict(env),
-        "volumes": ["state:/data"], "read_only": True, "tmpfs": ["/tmp"], "user": "10001",
+        "image": spec.app.image,
+        "env_file": [".env"],
+        "environment": dict(env),
+        "volumes": ["state:/data"],
+        "read_only": True,
+        "tmpfs": ["/tmp"],
+        "user": "10001",
         "restart": "unless-stopped",
     }
-    services = {"daemon": {**base, "command": ["daemon"],
-                           "environment": {**env, "SKYCTL_SCHEDULES_JSON": json.dumps(schedules, separators=(",", ":"))}}}
+    services = {
+        "daemon": {
+            **base,
+            "command": ["daemon"],
+            "environment": {**env, "SKYCTL_SCHEDULES_JSON": json.dumps(schedules, separators=(",", ":"))},
+        }
+    }
     art.workloads.append(Workload("daemon", "job", "compose", ["daemon"]))
     if spec.service.enabled:
         bind = "0.0.0.0" if spec.service.public else "127.0.0.1"
-        services["http"] = {**base, "command": ["serve"], "ports": [f"{bind}:{c.port}:8080"],
-                            "environment": {**env, "PORT": "8080"}}
+        services["http"] = {
+            **base,
+            "command": ["serve"],
+            "ports": [f"{bind}:{c.port}:8080"],
+            "environment": {**env, "PORT": "8080"},
+        }
         art.workloads.append(Workload("http", "service", "compose", ["serve"]))
         if spec.service.public:
             art.public_endpoints.append(f"host:{c.port}")

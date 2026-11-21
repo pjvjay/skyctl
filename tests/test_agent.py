@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The task agent: runner loop, budgets, approval, idempotency, providers, CLI."""
 
 import json
@@ -7,13 +22,12 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
+from conftest import make_post_view, require
 from skyctl.adapters import MemoryObjectStore
 from skyctl.agent import AgentRunner, RunLog, TaskConfigError, TaskSpec, load_tasks
 from skyctl.agent.chat import AnthropicChat, OpenAIChat, get_chat_provider, register_chat_provider
 from skyctl.llm import LLMError, LLMRefusal
 from skyctl.ports import ChatTurn, Message, ToolCall, ToolResult
-
-from conftest import make_post_view
 
 
 class Scripted:
@@ -58,6 +72,7 @@ def last_tool_results(provider):
 # TaskSpec
 # ----------------------------------------------------------------------
 
+
 def test_task_spec_validation_and_policy():
     with pytest.raises(TaskConfigError):
         TaskSpec(goal="  ")
@@ -92,15 +107,29 @@ def test_load_tasks(tmp_path):
 # Runner
 # ----------------------------------------------------------------------
 
+
 def test_run_reads_then_writes_then_reports(manager, fake_atproto):
-    provider = Scripted([
-        tool_turn(("list_accounts", {}), ("get_notifications", {"account": "work", "limit": 5})),
-        tool_turn(("reply", {"account": "work", "parent_uri": "at://did:plc:fan/app.bsky.feed.post/n1", "text": "Yes, 20% off with a .edu address."})),
-        final("Replied to one question about discounts."),
-    ])
+    provider = Scripted(
+        [
+            tool_turn(("list_accounts", {}), ("get_notifications", {"account": "work", "limit": 5})),
+            tool_turn(
+                (
+                    "reply",
+                    {
+                        "account": "work",
+                        "parent_uri": "at://did:plc:fan/app.bsky.feed.post/n1",
+                        "text": "Yes, 20% off with a .edu address.",
+                    },
+                )
+            ),
+            final("Replied to one question about discounts."),
+        ]
+    )
     state = MemoryObjectStore()
     work_pds = manager.client("work")._client
-    work_pds.posts["at://did:plc:fan/app.bsky.feed.post/n1"] = make_post_view("at://did:plc:fan/app.bsky.feed.post/n1", "cid-n1")
+    work_pds.posts["at://did:plc:fan/app.bsky.feed.post/n1"] = make_post_view(
+        "at://did:plc:fan/app.bsky.feed.post/n1", "cid-n1"
+    )
     runner = AgentRunner(manager, provider=provider, state=state)
     task = TaskSpec(goal="Answer questions in mentions", accounts=["work"], allow_writes=True, name="answer")
     result = runner.run(task)
@@ -144,10 +173,14 @@ def test_dry_run_previews_writes(manager, fake_atproto):
 
 
 def test_denied_calls_are_reported_to_the_model_not_raised(manager):
-    provider = Scripted([
-        tool_turn(("post", {"account": "personal", "text": "x"}), ("nonexistent_tool", {}), ("post", {"account": "work"})),
-        final(),
-    ])
+    provider = Scripted(
+        [
+            tool_turn(
+                ("post", {"account": "personal", "text": "x"}), ("nonexistent_tool", {}), ("post", {"account": "work"})
+            ),
+            final(),
+        ]
+    )
     result = AgentRunner(manager, provider=provider).run(TaskSpec(goal="g", accounts=["work"], allow_writes=True))
     assert result.status == "completed" and result.writes == 0
     msg = provider.calls[1]["messages"][-1]
@@ -199,10 +232,14 @@ def test_missing_provider_is_a_clean_error(manager):
 
 def test_approval_workflow(manager, fake_atproto):
     state = MemoryObjectStore()
-    provider = Scripted([
-        tool_turn(("post", {"account": "work", "text": "draft A"}), ("post", {"account": "work", "text": "draft B"})),
-        final("Two posts queued."),
-    ])
+    provider = Scripted(
+        [
+            tool_turn(
+                ("post", {"account": "work", "text": "draft A"}), ("post", {"account": "work", "text": "draft B"})
+            ),
+            final("Two posts queued."),
+        ]
+    )
     runner = AgentRunner(manager, provider=provider, state=state)
     result = runner.run(TaskSpec(goal="g", allow_writes=True, approval="writes"))
     assert result.status == "needs_approval" and result.ok
@@ -225,7 +262,9 @@ def test_retried_run_does_not_repeat_writes(manager, fake_atproto):
     """Same idempotency key (a retry of one logical run) → the write is skipped."""
     state = MemoryObjectStore()
     script = lambda: [tool_turn(("post", {"account": "work", "text": "once"})), final()]
-    task = lambda: TaskSpec(goal="g", allow_writes=True, name="nightly", idempotency_key="nightly@2026-03-02T09:00:00+00:00")
+    task = lambda: TaskSpec(
+        goal="g", allow_writes=True, name="nightly", idempotency_key="nightly@2026-03-02T09:00:00+00:00"
+    )
     first = AgentRunner(manager, provider=Scripted(script()), state=state).run(task())
     second_provider = Scripted(script())
     second = AgentRunner(manager, provider=second_provider, state=state).run(task())
@@ -242,12 +281,17 @@ def test_same_task_name_on_a_new_day_may_repeat_a_write(manager, fake_atproto):
     script = lambda: [tool_turn(("post", {"account": "work", "text": "Good morning"})), final()]
     for day in ("2026-03-02", "2026-03-03"):
         r = AgentRunner(manager, provider=Scripted(script()), state=state).run(
-            TaskSpec(goal="g", allow_writes=True, name="daily", idempotency_key=f"daily@{day}T09:00:00+00:00"))
+            TaskSpec(goal="g", allow_writes=True, name="daily", idempotency_key=f"daily@{day}T09:00:00+00:00")
+        )
         assert r.writes == 1
     # Two manual runs without a key are two runs, too.
     for _ in range(2):
-        assert AgentRunner(manager, provider=Scripted(script()), state=state).run(
-            TaskSpec(goal="g", allow_writes=True, name="daily")).writes == 1
+        assert (
+            AgentRunner(manager, provider=Scripted(script()), state=state)
+            .run(TaskSpec(goal="g", allow_writes=True, name="daily"))
+            .writes
+            == 1
+        )
 
 
 def test_tool_schema_format_follows_the_provider(manager):
@@ -277,6 +321,7 @@ def test_on_event_streams_transcript(manager):
 # Chat providers: message conversion and response parsing
 # ----------------------------------------------------------------------
 
+
 def _conversation():
     return [
         Message(role="user", text="Task: go"),
@@ -286,7 +331,7 @@ def _conversation():
 
 
 def test_anthropic_chat_conversion_and_parsing():
-    pytest.importorskip("anthropic")
+    require("anthropic")
 
     class Block(SimpleNamespace):
         def model_dump(self, exclude_none=True):
@@ -323,7 +368,7 @@ def test_anthropic_chat_conversion_and_parsing():
     assert req["messages"][2]["content"][0]["tool_use_id"] == "c1"
 
     # A prior assistant turn with raw blocks is echoed back verbatim.
-    msgs = _conversation() + [Message(role="assistant", text="x", raw=turn.raw)]
+    msgs = [*_conversation(), Message(role="assistant", text="x", raw=turn.raw)]
     chat.chat("SYS", msgs, [])
     assert fake.messages.requests[1]["messages"][3]["content"] == turn.raw
 
@@ -339,13 +384,21 @@ def test_openai_chat_conversion_and_parsing(monkeypatch):
             status_code=200,
             text="",
             json=lambda: {
-                "choices": [{
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "content": None,
-                        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "post", "arguments": '{"account": "work", "text": "hi"}'}}],
-                    },
-                }],
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "post", "arguments": '{"account": "work", "text": "hi"}'},
+                                }
+                            ],
+                        },
+                    }
+                ],
                 "usage": {"prompt_tokens": 7, "completion_tokens": 2},
             },
         )
@@ -404,6 +457,7 @@ def test_persona_llm_registry_knows_cloud_specs():
 # CLI
 # ----------------------------------------------------------------------
 
+
 @pytest.fixture
 def cli_env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -417,9 +471,7 @@ def test_cli_task_run_and_show(cli_env, fake_atproto, monkeypatch):
     import skyctl.agent.runner as runner_mod
 
     script = [tool_turn(("post", {"account": "work", "text": "cli post"})), final("Posted.")]
-    monkeypatch.setattr(
-        runner_mod.AgentRunner, "_provider_for", lambda self, task: Scripted(list(script))
-    )
+    monkeypatch.setattr(runner_mod.AgentRunner, "_provider_for", lambda self, task: Scripted(list(script)))
     from skyctl.cli import cli
 
     runner = CliRunner()
@@ -476,26 +528,32 @@ def test_a_failed_write_is_not_recorded_in_the_ledger(manager, fake_atproto):
     state = MemoryObjectStore()
     fake = manager.client("work").login()._client
     fake.fail_sends = 1
-    script = lambda: [tool_turn(("post", {"account": "work", "text": "important"})), final()]   # noqa: E731
-    task = lambda: TaskSpec(goal="g", allow_writes=True, idempotency_key="k1")                   # noqa: E731
+    script = lambda: [tool_turn(("post", {"account": "work", "text": "important"})), final()]
+    task = lambda: TaskSpec(goal="g", allow_writes=True, idempotency_key="k1")
     first = AgentRunner(manager, provider=Scripted(script()), state=state).run(task())
-    assert fake.sent == [] and first.writes == 1       # attempted, failed
+    assert fake.sent == [] and first.writes == 1  # attempted, failed
     AgentRunner(manager, provider=Scripted(script()), state=state).run(task())
     assert [s["text"] for s in fake.sent] == ["important"]
 
 
 def test_cli_plan_review_flow(cli_env, fake_atproto):
+    from skyctl import BskyManager
     from skyctl.adapters import object_store_for
     from skyctl.cli import cli
     from skyctl.planning import Plan, PlanStore, check_plan
     from skyctl.tools import ToolContext, ToolPolicy, registry
-    from skyctl import BskyManager
 
     manager = BskyManager.from_env()
     state = object_store_for("file://./.skyctl")
     ctx = ToolContext(manager, policy=ToolPolicy(allow_writes=True))
-    p = Plan.model_validate({"goal": "Say hi", "steps": [
-        {"id": "a", "tool": "post", "args": {"account": "work", "text": "hi from a plan"}, "why": "greeting"}]})
+    p = Plan.model_validate(
+        {
+            "goal": "Say hi",
+            "steps": [
+                {"id": "a", "tool": "post", "args": {"account": "work", "text": "hi from a plan"}, "why": "greeting"}
+            ],
+        }
+    )
     rec = PlanStore(state).create(p, check_plan(p, ctx, registry), created_by="agent", approval_mode="out_of_band")
     runner = CliRunner()
     listed = runner.invoke(cli, ["plan", "list", "--json"])
@@ -507,4 +565,4 @@ def test_cli_plan_review_flow(cli_env, fake_atproto):
     approved = runner.invoke(cli, ["plan", "approve", rec["id"], "--execute"], input="y\n")
     assert approved.exit_code == 0, approved.output
     assert "approved by cli:" in approved.output and "completed" in approved.output
-    assert runner.invoke(cli, ["plan", "cancel", rec["id"]]).exit_code == 1        # already completed
+    assert runner.invoke(cli, ["plan", "cancel", rec["id"]]).exit_code == 1  # already completed

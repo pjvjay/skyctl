@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The platform framework: detection, capabilities, runtime strategies, invocation, auth, logging, cron."""
 
 import base64
@@ -8,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from conftest import require
 from skyctl.adapters import MemoryObjectStore, ObjectJobStore
 from skyctl.adapters.queues import MemoryQueue
 from skyctl.platform import Cap, CapabilityError, Runtime, detect_platform, get_platform, platforms
@@ -25,25 +41,28 @@ from skyctl.platform.invocation import (
 from skyctl.scheduler import BskyScheduler
 from skyctl.settings import AgentDefaults, Settings
 
-
 # ----------------------------------------------------------------------
 # Detection and capabilities
 # ----------------------------------------------------------------------
 
-@pytest.mark.parametrize("env,expected", [
-    ({}, ("local", "local")),
-    ({"AWS_LAMBDA_FUNCTION_NAME": "f"}, ("aws", "lambda")),
-    ({"ECS_CONTAINER_METADATA_URI_V4": "http://x"}, ("aws", "ecs")),
-    ({"CONTAINER_APP_NAME": "a"}, ("azure", "container-apps")),
-    ({"CONTAINER_APP_NAME": "a", "CONTAINER_APP_JOB_NAME": "j"}, ("azure", "container-apps-job")),
-    ({"K_SERVICE": "s"}, ("gcp", "cloud-run")),
-    ({"CLOUD_RUN_JOB": "j", "K_SERVICE": "s"}, ("gcp", "cloud-run-job")),
-    ({"KUBERNETES_SERVICE_HOST": "10.0.0.1"}, ("kubernetes", "deployment")),
-    # A managed cloud runtime wins over generic Kubernetes markers.
-    ({"KUBERNETES_SERVICE_HOST": "10.0.0.1", "K_SERVICE": "s"}, ("gcp", "cloud-run")),
-    ({"SKYCTL_PLATFORM": "compose"}, ("compose", "compose")),
-    ({"SKYCTL_CLOUD": "gcp", "SKYCTL_COMPUTE": "cloud-run-instance"}, ("gcp", "cloud-run-instance")),
-])
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, ("local", "local")),
+        ({"AWS_LAMBDA_FUNCTION_NAME": "f"}, ("aws", "lambda")),
+        ({"ECS_CONTAINER_METADATA_URI_V4": "http://x"}, ("aws", "ecs")),
+        ({"CONTAINER_APP_NAME": "a"}, ("azure", "container-apps")),
+        ({"CONTAINER_APP_NAME": "a", "CONTAINER_APP_JOB_NAME": "j"}, ("azure", "container-apps-job")),
+        ({"K_SERVICE": "s"}, ("gcp", "cloud-run")),
+        ({"CLOUD_RUN_JOB": "j", "K_SERVICE": "s"}, ("gcp", "cloud-run-job")),
+        ({"KUBERNETES_SERVICE_HOST": "10.0.0.1"}, ("kubernetes", "deployment")),
+        # A managed cloud runtime wins over generic Kubernetes markers.
+        ({"KUBERNETES_SERVICE_HOST": "10.0.0.1", "K_SERVICE": "s"}, ("gcp", "cloud-run")),
+        ({"SKYCTL_PLATFORM": "compose"}, ("compose", "compose")),
+        ({"SKYCTL_CLOUD": "gcp", "SKYCTL_COMPUTE": "cloud-run-instance"}, ("gcp", "cloud-run-instance")),
+    ],
+)
 def test_detection(env, expected):
     platform, compute = detect_platform(env)
     assert (platform.name, compute) == expected
@@ -93,7 +112,7 @@ def test_run_strategy_is_a_capability_decision():
 
 def test_runtime_reports_and_requires():
     rt = _runtime("azure", "container-apps-job")
-    assert rt.has(Cap.STATE_ATOMIC_CAS)           # memory store is atomic
+    assert rt.has(Cap.STATE_ATOMIC_CAS)  # memory store is atomic
     rt.require(Cap.SCHEDULED_JOBS, "tick")
     with pytest.raises(CapabilityError) as e:
         rt.require(Cap.SCHEDULE_TIMEZONE, "Europe/London schedules", "Use UTC.")
@@ -104,7 +123,7 @@ def test_runtime_reports_and_requires():
 
 
 def test_non_atomic_state_drops_the_capability_and_warns():
-    pytest.importorskip("fsspec")
+    require("fsspec")
     from skyctl.adapters.fsspec_store import FsspecObjectStore
 
     rt = Runtime(Settings(state_url="memory://x"), platform=get_platform("local"))
@@ -137,6 +156,7 @@ def test_service_registry_routes_bucket_schemes_to_native_cas_stores():
 # Invocation decoding
 # ----------------------------------------------------------------------
 
+
 def b64(obj) -> str:
     return base64.b64encode(json.dumps(obj).encode()).decode()
 
@@ -153,8 +173,13 @@ def test_decode_plain_and_errors():
 def test_decode_cloudevents_binary_and_structured():
     [inv] = decode_http({"ce-specversion": "1.0", "ce-type": "skyctl.tick", "ce-id": "e1"}, b'{"kind": "tick"}')
     assert inv.kind == "tick" and inv.id == "e1" and inv.source == "cloudevents:skyctl.tick"
-    structured = {"specversion": "1.0", "type": "skyctl.post", "id": "e2", "source": "/x",
-                  "data": {"kind": "post.send", "job_id": "j1"}}
+    structured = {
+        "specversion": "1.0",
+        "type": "skyctl.post",
+        "id": "e2",
+        "source": "/x",
+        "data": {"kind": "post.send", "job_id": "j1"},
+    }
     [inv] = decode_http({"content-type": "application/cloudevents+json"}, json.dumps(structured).encode())
     assert inv.payload == {"kind": "post.send", "job_id": "j1"}
     batch = [structured, {**structured, "id": "e3", "data": None, "data_base64": b64({"kind": "tick"})}]
@@ -163,13 +188,17 @@ def test_decode_cloudevents_binary_and_structured():
 
 
 def test_decode_pubsub_push_and_eventarc():
-    push = {"message": {"data": b64({"kind": "post.send", "job_id": "j9"}), "messageId": "m1"},
-            "subscription": "projects/p/subscriptions/s", "deliveryAttempt": 3}
+    push = {
+        "message": {"data": b64({"kind": "post.send", "job_id": "j9"}), "messageId": "m1"},
+        "subscription": "projects/p/subscriptions/s",
+        "deliveryAttempt": 3,
+    }
     [inv] = decode_http({"content-type": "application/json"}, json.dumps(push).encode())
     assert (inv.kind, inv.id, inv.attempt, inv.source) == ("post.send", "m1", 3, "pubsub-push")
     # Eventarc wraps the same envelope in a binary-mode CloudEvent.
-    [inv] = decode_http({"ce-specversion": "1.0", "ce-type": "google.cloud.pubsub.topic.v1.messagePublished"},
-                        json.dumps(push).encode())
+    [inv] = decode_http(
+        {"ce-specversion": "1.0", "ce-type": "google.cloud.pubsub.topic.v1.messagePublished"}, json.dumps(push).encode()
+    )
     assert inv.source == "eventarc-pubsub" and inv.payload["job_id"] == "j9"
 
 
@@ -177,43 +206,73 @@ def test_decode_event_grid_schema_and_validation():
     events = [{"id": "g1", "eventType": "skyctl.tick", "data": {"kind": "tick"}, "subject": "s", "dataVersion": "1"}]
     [inv] = decode_http({}, json.dumps(events).encode())
     assert inv.kind == "tick" and inv.source == "eventgrid:skyctl.tick"
-    validation = [{"id": "v", "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
-                   "data": {"validationCode": "abc123"}}]
+    validation = [
+        {
+            "id": "v",
+            "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+            "data": {"validationCode": "abc123"},
+        }
+    ]
     [inv] = decode_http({}, json.dumps(validation).encode())
     assert inv.kind == "eventgrid.validate"
     assert default_dispatcher().dispatch(inv).result == {"validationResponse": "abc123"}
 
 
 def test_decode_lambda_shapes():
-    sqs_event = {"Records": [
-        {"eventSource": "aws:sqs", "messageId": "a", "body": '{"kind": "tick"}', "attributes": {"ApproximateReceiveCount": "2"}},
-        {"eventSource": "aws:sqs", "messageId": "b", "body": '{"kind": "post.send", "job_id": "x"}', "attributes": {}},
-    ]}
+    sqs_event = {
+        "Records": [
+            {
+                "eventSource": "aws:sqs",
+                "messageId": "a",
+                "body": '{"kind": "tick"}',
+                "attributes": {"ApproximateReceiveCount": "2"},
+            },
+            {
+                "eventSource": "aws:sqs",
+                "messageId": "b",
+                "body": '{"kind": "post.send", "job_id": "x"}',
+                "attributes": {},
+            },
+        ]
+    }
     shape, items = decode_lambda_event(sqs_event)
-    assert shape == "sqs" and [(i, inv.kind, inv.attempt) for i, inv in items] == [("a", "tick", 2), ("b", "post.send", 1)]
+    assert shape == "sqs" and [(i, inv.kind, inv.attempt) for i, inv in items] == [
+        ("a", "tick", 2),
+        ("b", "post.send", 1),
+    ]
     shape, [(_, inv)] = decode_lambda_event({"kind": "tick"})
     assert shape == "direct" and inv.source == "lambda"
-    shape, [(_, inv)] = decode_lambda_event({"detail-type": "Scheduled Event", "source": "aws.events", "detail": {"kind": "tick"}})
+    shape, [(_, inv)] = decode_lambda_event(
+        {"detail-type": "Scheduled Event", "source": "aws.events", "detail": {"kind": "tick"}}
+    )
     assert inv.source == "eventbridge:aws.events"
-    url_event = {"requestContext": {}, "isBase64Encoded": True, "headers": {"content-type": "application/json"},
-                 "body": b64({"kind": "tick"})}
+    url_event = {
+        "requestContext": {},
+        "isBase64Encoded": True,
+        "headers": {"content-type": "application/json"},
+        "body": b64({"kind": "tick"}),
+    }
     shape, [(_, inv)] = decode_lambda_event(url_event)
     assert shape == "http" and inv.kind == "tick"
 
 
 def test_trace_context_per_platform():
     aws = get_platform("aws").trace_from_headers(
-        {"X-Amzn-Trace-Id": "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1"})
+        {"X-Amzn-Trace-Id": "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1"}
+    )
     assert aws.trace_id == "1-5759e988-bd862e3fe1be46a994272793" and aws.sampled
     gcp = get_platform("gcp").trace_from_headers({"X-Cloud-Trace-Context": "105445aa7843bc8bf206b12000100000/1;o=1"})
     assert (gcp.trace_id, gcp.span_id, gcp.sampled) == ("105445aa7843bc8bf206b12000100000", "1", True)
-    w3c = get_platform("azure").trace_from_headers({"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"})
+    w3c = get_platform("azure").trace_from_headers(
+        {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+    )
     assert w3c.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736" and w3c.sampled
 
 
 # ----------------------------------------------------------------------
 # Dispatch, worker, Lambda handler
 # ----------------------------------------------------------------------
+
 
 def test_dispatcher_classifies_failures():
     def boom(inv):
@@ -242,7 +301,7 @@ def test_default_dispatcher_end_to_end(manager, fake_atproto):
     first = d.dispatch(Invocation("post.send", {"kind": "post.send", "job_id": sp.id}))
     assert first.ok and first.result["sent"] is True
     dup = d.dispatch(Invocation("post.send", {"kind": "post.send", "job_id": sp.id}))
-    assert dup.ok and dup.result["noop"] is True                 # at-least-once delivery is harmless
+    assert dup.ok and dup.result["noop"] is True  # at-least-once delivery is harmless
     assert d.dispatch(Invocation("tick", {"kind": "tick"})).result["sent"] == []
     assert not d.dispatch(Invocation("post.send", {"kind": "post.send"})).ok
 
@@ -266,7 +325,7 @@ def test_task_run_invocation_enforces_ceilings_and_idempotency(manager, fake_atp
     payload = {"kind": "task.run", "run_id": "r1", "task": {"goal": "say hi", "allow_writes": True, "max_writes": 50}}
     out = d.dispatch(Invocation("task.run", payload))
     assert out.ok and out.result["writes"] == 1 and out.result["task"]["max_writes"] == 1
-    again = d.dispatch(Invocation("task.run", payload))              # redelivered message
+    again = d.dispatch(Invocation("task.run", payload))  # redelivered message
     assert again.ok and again.result["writes"] == 0
     assert len(manager.client("work")._client.sent) == 1
     denied = d.dispatch(Invocation("task.run", {"kind": "task.run", "task": {"goal": "x", "allow_delete": True}}))
@@ -295,21 +354,29 @@ def test_worker_acks_retries_and_drops():
 def test_lambda_handler_reports_partial_batch_failures():
     from skyctl.platform.lambda_handler import handler
 
-    d = Dispatcher({"ok": lambda inv: 1, "flaky": lambda inv: (_ for _ in ()).throw(RuntimeError("x")),
-                    "bad": lambda inv: (_ for _ in ()).throw(ValueError("y"))})
-    event = {"Records": [
-        {"eventSource": "aws:sqs", "messageId": m, "body": json.dumps({"kind": k}), "attributes": {}}
-        for m, k in (("1", "ok"), ("2", "flaky"), ("3", "bad"))
-    ]}
+    d = Dispatcher(
+        {
+            "ok": lambda inv: 1,
+            "flaky": lambda inv: (_ for _ in ()).throw(RuntimeError("x")),
+            "bad": lambda inv: (_ for _ in ()).throw(ValueError("y")),
+        }
+    )
+    event = {
+        "Records": [
+            {"eventSource": "aws:sqs", "messageId": m, "body": json.dumps({"kind": k}), "attributes": {}}
+            for m, k in (("1", "ok"), ("2", "flaky"), ("3", "bad"))
+        ]
+    }
     assert handler(event, None, dispatcher=d) == {"batchItemFailures": [{"itemIdentifier": "2"}]}
     assert handler({"kind": "ok"}, None, dispatcher=d)["ok"] is True
     with pytest.raises(RuntimeError):
-        handler({"kind": "flaky"}, None, dispatcher=d)     # async invoke → Lambda retries
+        handler({"kind": "flaky"}, None, dispatcher=d)  # async invoke → Lambda retries
 
 
 # ----------------------------------------------------------------------
 # Auth
 # ----------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def rsa_key():
@@ -321,8 +388,13 @@ def rsa_key():
 def _token(key, **claims):
     import jwt
 
-    base = {"iss": "https://accounts.google.com", "aud": "https://svc.run.app", "sub": "123",
-            "email": "scheduler@proj.iam.gserviceaccount.com", "exp": int(time.time()) + 300}
+    base = {
+        "iss": "https://accounts.google.com",
+        "aud": "https://svc.run.app",
+        "sub": "123",
+        "email": "scheduler@proj.iam.gserviceaccount.com",
+        "exp": int(time.time()) + 300,
+    }
     base.update(claims)
     return jwt.encode(base, key, algorithm="RS256")
 
@@ -330,11 +402,16 @@ def _token(key, **claims):
 def test_auth_chain_bearer_and_google_oidc(rsa_key):
     from skyctl.platform.auth import AuthChain, AuthError, StaticBearer, build_auth_chain, google_oidc
 
-    chain = AuthChain([
-        StaticBearer("s3cret"),
-        google_oidc("https://svc.run.app", allowed=["scheduler@proj.iam.gserviceaccount.com"],
-                    key_resolver=lambda token: rsa_key.public_key()),
-    ])
+    chain = AuthChain(
+        [
+            StaticBearer("s3cret"),
+            google_oidc(
+                "https://svc.run.app",
+                allowed=["scheduler@proj.iam.gserviceaccount.com"],
+                key_resolver=lambda token: rsa_key.public_key(),
+            ),
+        ]
+    )
     assert chain.authenticate({"Authorization": "Bearer s3cret"}).method == "bearer"
     p = chain.authenticate({"Authorization": f"Bearer {_token(rsa_key)}"})
     assert p.method == "google-oidc" and p.subject == "scheduler@proj.iam.gserviceaccount.com"
@@ -354,7 +431,7 @@ def test_auth_chain_bearer_and_google_oidc(rsa_key):
     assert build_auth_chain(env={"SKYCTL_HTTP_ALLOW_ANON": "true"}).names == ["platform"]
     assert build_auth_chain(env={}).names == []
     with pytest.raises(ValueError):
-        build_auth_chain("google-oidc", env={})          # audience required
+        build_auth_chain("google-oidc", env={})  # audience required
     with pytest.raises(ValueError):
         build_auth_chain("kerberos", env={})
 
@@ -379,8 +456,12 @@ def test_auth_aws_alb_signer_check():
     m = AwsAlbOidc("us-east-1", arn, key_resolver=lambda kid: key.public_key())
 
     def alb_token(signer):
-        return jwt.encode({"sub": "u1", "email": "me@example.com", "exp": int(time.time()) + 60}, key,
-                          algorithm="ES256", headers={"kid": "k1", "signer": signer, "iss": "https://idp"})
+        return jwt.encode(
+            {"sub": "u1", "email": "me@example.com", "exp": int(time.time()) + 60},
+            key,
+            algorithm="ES256",
+            headers={"kid": "k1", "signer": signer, "iss": "https://idp"},
+        )
 
     assert m.authenticate({"x-amzn-oidc-data": alb_token(arn)}).subject == "me@example.com"
     with pytest.raises(AuthError):
@@ -391,6 +472,7 @@ def test_auth_aws_alb_signer_check():
 # ----------------------------------------------------------------------
 # Logging and cron
 # ----------------------------------------------------------------------
+
 
 def test_log_shapes_per_platform(monkeypatch):
     from skyctl.platform import logging as plog
@@ -419,15 +501,18 @@ def test_log_shapes_per_platform(monkeypatch):
         plog.set_platform(None)
 
 
-@pytest.mark.parametrize("unix,eventbridge", [
-    ("*/5 * * * *", "cron(0/5 * * * ? *)"),
-    ("0 9 * * *", "cron(0 9 * * ? *)"),
-    ("0 9 * * mon-fri", "cron(0 9 ? * MON-FRI *)"),
-    ("0 9 * * 1-5", "cron(0 9 ? * 2-6 *)"),
-    ("30 8 * * 0,6", "cron(30 8 ? * 1,7 *)"),
-    ("0 0 1 * *", "cron(0 0 1 * ? *)"),
-    ("15 */2 * * 7", "cron(15 0/2 ? * 1 *)"),
-])
+@pytest.mark.parametrize(
+    ("unix", "eventbridge"),
+    [
+        ("*/5 * * * *", "cron(0/5 * * * ? *)"),
+        ("0 9 * * *", "cron(0 9 * * ? *)"),
+        ("0 9 * * mon-fri", "cron(0 9 ? * MON-FRI *)"),
+        ("0 9 * * 1-5", "cron(0 9 ? * 2-6 *)"),
+        ("30 8 * * 0,6", "cron(30 8 ? * 1,7 *)"),
+        ("0 0 1 * *", "cron(0 0 1 * ? *)"),
+        ("15 */2 * * 7", "cron(15 0/2 ? * 1 *)"),
+    ],
+)
 def test_cron_to_eventbridge(unix, eventbridge):
     from skyctl.platform.cron import CronSpec, to_eventbridge
 
@@ -453,7 +538,9 @@ def test_daemon_schedules_dispatch(monkeypatch):
         load_schedules('[{"name": "x"}]')
     fired = []
     d = Dispatcher({"tick": lambda inv: fired.append(inv.source)})
-    sched = build_scheduler(d, [{"name": "t", "cron": "* * * * *", "timezone": "Europe/London", "invoke": {"kind": "tick"}}], blocking=False)
+    sched = build_scheduler(
+        d, [{"name": "t", "cron": "* * * * *", "timezone": "Europe/London", "invoke": {"kind": "tick"}}], blocking=False
+    )
     job = sched.get_jobs()[0]
     assert str(job.trigger.timezone) == "Europe/London"
     job.func()
@@ -469,11 +556,17 @@ def test_worker_heartbeat_keeps_long_handlers_exclusive():
     def slow(inv):
         for _ in range(6):
             time.sleep(0.1)
-            seen_by_other.extend(q.receive(visibility_seconds=1))   # a second worker polling
+            seen_by_other.extend(q.receive(visibility_seconds=1))  # a second worker polling
         return "done"
 
-    stats = run_worker(q, Dispatcher({"slow": slow}), visibility_seconds=0.25, heartbeat_seconds=0.05,
-                       idle_exit_seconds=0.1, wait_seconds=0)
+    stats = run_worker(
+        q,
+        Dispatcher({"slow": slow}),
+        visibility_seconds=0.25,
+        heartbeat_seconds=0.05,
+        idle_exit_seconds=0.1,
+        wait_seconds=0,
+    )
     assert stats.succeeded == 1 and seen_by_other == []
 
 
@@ -488,6 +581,7 @@ def test_run_time_ceiling_clamps_deadline():
 # Extensibility: a fourth platform / service arrives as a plugin
 # ----------------------------------------------------------------------
 
+
 def test_third_party_platform_and_service_plugins(monkeypatch):
     import importlib.metadata as md
 
@@ -498,8 +592,9 @@ def test_third_party_platform_and_service_plugins(monkeypatch):
     class OciPlatform(base.Platform):
         name = "oci"
         default_compute = "container-instances"
-        compute_profiles = {"container-instances": ComputeProfile("container-instances", "job",
-                                                                  frozenset({Cap.SCHEDULED_JOBS}))}
+        compute_profiles = {
+            "container-instances": ComputeProfile("container-instances", "job", frozenset({Cap.SCHEDULED_JOBS}))
+        }
 
         def detect(self, env):
             return "container-instances" if env.get("OCI_RESOURCE_PRINCIPAL_VERSION") else None
@@ -512,8 +607,10 @@ def test_third_party_platform_and_service_plugins(monkeypatch):
             return self._obj
 
     def fake_entry_points(group):
-        return {"skyctl.platforms": [EP("oci", OciPlatform)],
-                "skyctl.services": [EP("state:ocios", lambda url, **kw: ("oci-store", url))]}.get(group, [])
+        return {
+            "skyctl.platforms": [EP("oci", OciPlatform)],
+            "skyctl.services": [EP("state:ocios", lambda url, **kw: ("oci-store", url))],
+        }.get(group, [])
 
     monkeypatch.setattr(md, "entry_points", fake_entry_points)
     monkeypatch.setattr(base, "_ENTRY_POINTS_LOADED", False)
@@ -549,33 +646,45 @@ def test_worker_stops_between_messages_when_asked():
     for _ in range(5):
         q.send({"kind": "ok"})
     handled = []
-    stop_after_two = lambda: len(handled) >= 2          # noqa: E731
-    run_worker(q, Dispatcher({"ok": lambda inv: handled.append(1)}), idle_exit_seconds=None,
-               stop=stop_after_two, wait_seconds=0)
-    assert len(handled) == 2 and len(q) == 3             # the rest stays queued for the next worker
+    stop_after_two = lambda: len(handled) >= 2
+    run_worker(
+        q,
+        Dispatcher({"ok": lambda inv: handled.append(1)}),
+        idle_exit_seconds=None,
+        stop=stop_after_two,
+        wait_seconds=0,
+    )
+    assert len(handled) == 2 and len(q) == 3  # the rest stays queued for the next worker
 
 
 # ----------------------------------------------------------------------
 # Schedule slots: the portable idempotency key for scheduled runs
 # ----------------------------------------------------------------------
 
+
 def test_previous_fire_finds_the_slot():
     from skyctl.platform.cron import previous_fire
 
     utc = timezone.utc
-    assert previous_fire("0 9 * * mon-fri", now=datetime(2026, 3, 3, 9, 0, 30, tzinfo=utc)) == datetime(2026, 3, 3, 9, 0, tzinfo=utc)
+    assert previous_fire("0 9 * * mon-fri", now=datetime(2026, 3, 3, 9, 0, 30, tzinfo=utc)) == datetime(
+        2026, 3, 3, 9, 0, tzinfo=utc
+    )
     # Saturday: the slot is still Friday's run.
-    assert previous_fire("0 9 * * mon-fri", now=datetime(2026, 3, 7, 12, 0, tzinfo=utc)) == datetime(2026, 3, 6, 9, 0, tzinfo=utc)
-    assert previous_fire("*/5 * * * *", now=datetime(2026, 3, 3, 9, 7, tzinfo=utc)) == datetime(2026, 3, 3, 9, 5, tzinfo=utc)
+    assert previous_fire("0 9 * * mon-fri", now=datetime(2026, 3, 7, 12, 0, tzinfo=utc)) == datetime(
+        2026, 3, 6, 9, 0, tzinfo=utc
+    )
+    assert previous_fire("*/5 * * * *", now=datetime(2026, 3, 3, 9, 7, tzinfo=utc)) == datetime(
+        2026, 3, 3, 9, 5, tzinfo=utc
+    )
     assert previous_fire("0 0 1 * *", now=datetime(2026, 3, 20, tzinfo=utc)) == datetime(2026, 3, 1, tzinfo=utc)
     london = previous_fire("0 9 * * *", "Europe/London", now=datetime(2026, 7, 1, 8, 30, tzinfo=utc))
     assert london.isoformat() == "2026-07-01T09:00:00+01:00"
 
 
 def test_scheduled_task_runs_key_the_ledger_by_slot(manager, fake_atproto, monkeypatch):
+    import skyctl.platform.cron as cron_mod
     from skyctl.agent import AgentRunner
     from skyctl.ports import ChatTurn, ToolCall
-    import skyctl.platform.cron as cron_mod
 
     class Script:
         model, tool_format = "s", "anthropic"
@@ -588,16 +697,19 @@ def test_scheduled_task_runs_key_the_ledger_by_slot(manager, fake_atproto, monke
     state = MemoryObjectStore()
     runner = AgentRunner(manager, provider=Script(), state=state)
     d = default_dispatcher(_runtime(agent=AgentDefaults(allow_writes=True)), manager=manager, runner=runner)
-    payload = {"kind": "task.run", "task": {"goal": "greet", "name": "greet", "allow_writes": True},
-               "slot": {"cron": "0 9 * * *", "timezone": "UTC"}}
+    payload = {
+        "kind": "task.run",
+        "task": {"goal": "greet", "name": "greet", "allow_writes": True},
+        "slot": {"cron": "0 9 * * *", "timezone": "UTC"},
+    }
     monday = datetime(2026, 3, 2, 9, 0, 20, tzinfo=timezone.utc)
     real = cron_mod.previous_fire
     monkeypatch.setattr(cron_mod, "previous_fire", lambda c, tz="UTC", now=None: real(c, tz, now or clock["now"]))
     clock = {"now": monday}
     assert d.dispatch(Invocation("task.run", payload)).result["writes"] == 1
-    clock["now"] = monday + timedelta(minutes=3)          # platform retry / overlapping execution, same slot
+    clock["now"] = monday + timedelta(minutes=3)  # platform retry / overlapping execution, same slot
     assert d.dispatch(Invocation("task.run", payload)).result["writes"] == 0
-    clock["now"] = monday + timedelta(days=1)             # next day's slot
+    clock["now"] = monday + timedelta(days=1)  # next day's slot
     assert d.dispatch(Invocation("task.run", payload)).result["writes"] == 1
     assert len(manager.client("work")._client.sent) == 2
 
@@ -611,9 +723,24 @@ def test_multiple_secret_urls_merge_in_order(monkeypatch):
 
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.setenv("SKYCTL_SECRETS", "aws-sm://app/config, aws-sm://app/http-token")
-    maps = {"aws-sm://app/config": {"BSKY_ACCOUNTS": "work", "SKYCTL_HTTP_TOKEN": "from-config"},
-            "aws-sm://app/http-token": {"SKYCTL_HTTP_TOKEN": "from-token-secret", "OTHER": "x"}}
+    maps = {
+        "aws-sm://app/config": {"BSKY_ACCOUNTS": "work", "SKYCTL_HTTP_TOKEN": "from-config"},
+        "aws-sm://app/http-token": {"SKYCTL_HTTP_TOKEN": "from-token-secret", "OTHER": "x"},
+    }
     monkeypatch.setattr(adapters_mod, "secret_store_for", lambda url, env_file=".env": StaticSecretStore(maps[url]))
     settings = load_settings(force=True)
     assert settings.secret_urls == ["aws-sm://app/config", "aws-sm://app/http-token"]
     assert settings.http_token == "from-config" and os.environ["OTHER"] == "x"
+
+
+def test_ceilings_never_widen_accounts_to_all():
+    """A task naming only accounts outside the deployment's scope gets *no* accounts, not every account."""
+    from skyctl.agent import TaskSpec, apply_deployment_ceilings
+    from skyctl.settings import AgentDefaults
+
+    task = apply_deployment_ceilings(TaskSpec(goal="g", accounts=["personal"]), AgentDefaults(accounts=["work"]))
+    policy = task.policy()
+    assert task.accounts == [] and not policy.account_allowed("work") and not policy.account_allowed("personal")
+    assert "no accounts" in policy.describe()
+    unscoped = apply_deployment_ceilings(TaskSpec(goal="g"), AgentDefaults(accounts=["work"]))
+    assert unscoped.accounts == ["work"]

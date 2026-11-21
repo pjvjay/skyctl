@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters.gcs
 ===================
@@ -17,15 +32,13 @@ GKE Workload Identity). Needs `skyctl[gcp]`.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from ..ports import PreconditionFailed, Versioned
 
 
 class GcsObjectStore:
     atomic_cas = True
 
-    def __init__(self, bucket: str, prefix: str = "", bucket_client=None, project: Optional[str] = None):
+    def __init__(self, bucket: str, prefix: str = "", bucket_client=None, project: str | None = None):
         self.bucket_name = bucket
         self.prefix = prefix.strip("/")
         self._bucket = bucket_client
@@ -47,8 +60,9 @@ class GcsObjectStore:
             raise ValueError(f"Key escapes the store root: {key}")
         return f"{self.prefix}/{key}" if self.prefix else key
 
-    def get(self, key: str) -> Optional[Versioned]:
-        from google.api_core.exceptions import NotFound, PreconditionFailed as GcsPrecondition
+    def get(self, key: str) -> Versioned | None:
+        from google.api_core.exceptions import NotFound
+        from google.api_core.exceptions import PreconditionFailed as GcsPrecondition
 
         for _ in range(3):
             blob = self.bucket.get_blob(self._k(key))
@@ -59,11 +73,11 @@ class GcsObjectStore:
             except NotFound:
                 return None
             except GcsPrecondition:
-                continue        # overwritten between metadata and data reads; try again
+                continue  # overwritten between metadata and data reads; try again
             return Versioned(data, str(blob.generation))
         raise PreconditionFailed(key)
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         from google.api_core.exceptions import PreconditionFailed as GcsPrecondition
 
         blob = self.bucket.blob(self._k(key))

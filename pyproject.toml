@@ -1,32 +1,79 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "skyctl"
-version = "0.1.0"
-description = "Multi-account Bluesky automation library and CLI"
+dynamic = ["version"]
+description = "Multi-account Bluesky automation: CLI, SDK, MCP server and plan-then-execute agents, deployable to AWS, Azure, Google Cloud and Kubernetes."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "AUTHORS"]
+authors = [{ name = "The skyctl Authors" }]
+maintainers = [{ name = "Paul Vijayakumar" }]
 requires-python = ">=3.10"
+keywords = ["bluesky", "atproto", "mcp", "model-context-protocol", "agents", "llm", "automation", "aws", "azure", "gcp", "kubernetes"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: Internet",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
     "atproto>=0.0.55",
-    "apscheduler>=3.10",
-    "click>=8.1",
+    "apscheduler>=3.10.2,<4",  # 3.10.0/3.10.1 import pkg_resources, absent from modern environments
+    "click>=8.1,<9",
     "python-dotenv>=1.0",
     "rich>=13.0",
-    "httpx>=0.24",
-    "pydantic>=2.0",
+    "httpx>=0.24,<1",
+    "pydantic>=2.0,<3",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
+[project.urls]
+Homepage = "https://github.com/OWNER/skyctl"
+Documentation = "https://github.com/OWNER/skyctl/tree/main/docs"
+Repository = "https://github.com/OWNER/skyctl"
+Issues = "https://github.com/OWNER/skyctl/issues"
+Changelog = "https://github.com/OWNER/skyctl/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
-agents = ["anthropic>=0.40"]
+agents = ["anthropic>=0.40,<1"]
 # MCP server (stdio and streamable HTTP), the HTTP service and inbound OIDC auth.
-# mcp 2.x renamed FastMCP → MCPServer (breaking); stay on 1.x until migrated. Elicitation needs ≥ 1.10.
-mcp = ["mcp>=1.12,<2", "starlette>=0.40", "uvicorn>=0.30", "anyio>=4", "pyjwt[crypto]>=2.7"]
+# mcp 2.x renamed FastMCP → MCPServer (breaking); stay on 1.x until migrated. Below 1.21.1 the SDK
+# does not import with current pydantic releases (verified with a lowest-direct resolution).
+mcp = ["mcp>=1.21.1,<2", "starlette>=0.40", "uvicorn>=0.30", "anyio>=4", "pyjwt[crypto]>=2.7"]
 server = ["skyctl[mcp]"]
 # Cloud adapters: each installs only the native SDKs its ports need
 # (state with real compare-and-swap, secrets, queue, delayed delivery).
-aws = ["boto3>=1.34", "awslambdaric>=2.0"]
+# boto3 ≥ 1.35.69: S3 conditional writes (If-None-Match / If-Match on PutObject) that the state store needs.
+aws = ["boto3>=1.35.69", "awslambdaric>=2.0"]
 azure = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.8", "azure-storage-blob>=12.19", "azure-storage-queue>=12.9"]
 # Only for bring-your-own Service Bus queues (servicebus://); rendered Azure deployments use Storage Queues.
 servicebus = ["azure-identity>=1.15", "azure-servicebus>=7.11"]
@@ -36,9 +83,16 @@ fsspec = ["fsspec>=2024.0"]
 # Everything a cloud image needs.
 all = ["skyctl[agents,mcp,aws,azure,gcp]"]
 otel = ["opentelemetry-sdk>=1.25", "opentelemetry-exporter-otlp>=1.25"]
+# Everything needed to develop skyctl: tests, linters, type checker, packaging.
+# ruff is pinned to one minor version: its formatter style changes between minors (keep in step with .pre-commit-config.yaml).
+dev = [
+    "skyctl[all,test]",
+    "ruff>=0.17,<0.18", "mypy>=1.10", "pytest-cov>=5", "build>=1.2", "twine>=5", "pip-licenses>=4.4",
+    "types-toml",
+]
 test = [
-    "pytest>=7", "fsspec>=2024.0", "mcp>=1.12,<2", "starlette>=0.40", "anyio>=4", "pyjwt[crypto]>=2.7",
-    "moto[s3,sqs,scheduler]>=5.0", "boto3>=1.34",
+    "pytest>=7", "fsspec>=2024.0", "mcp>=1.21.1,<2", "starlette>=0.40", "anyio>=4", "pyjwt[crypto]>=2.7",
+    "moto[s3,sqs,scheduler]>=5.1.5", "boto3>=1.35.69",  # moto < 5.1.5 ignores S3 If-Match
     "azure-storage-blob>=12.19", "azure-storage-queue>=12.9", "azure-servicebus>=7.11",
     "google-cloud-storage>=2.14", "google-cloud-tasks>=2.16",
 ]
@@ -49,9 +103,63 @@ test = [
 [project.scripts]
 skyctl = "skyctl.cli:cli"
 
+[tool.setuptools.dynamic]
+version = { attr = "skyctl.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["skyctl*"]
+
+[tool.setuptools.package-data]
+skyctl = ["py.typed"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["deploy/generated"]
+src = [".", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF", "PIE", "PT", "T10", "ISC", "LOG"]
+ignore = [
+    "E501",    # long lines: the formatter handles code; long strings/tables in messages are intentional
+    "SIM105",  # contextlib.suppress is not clearer than try/except/pass in this codebase
+    "SIM108",  # ternaries are not always clearer
+    "RUF001", "RUF002", "RUF003",  # intentional typographic characters (→ “ ” …) in user-facing text
+    "PT011",   # pytest.raises(ValueError) without match is fine for validation errors
+    "B008",    # function calls in defaults (click/pydantic idioms)
+    "RUF012",  # mutable class attributes are declarative tables here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "PT018", "E731", "SIM117", "RUF015", "E402"]  # E402: imports after require("optional-sdk")
+"skyctl/testing/contracts.py" = ["PT018"]  # each compound assertion states one contract clause with its message
+
+[tool.ruff.lint.isort]
+known-first-party = ["skyctl"]
+
+[tool.mypy]
+python_version = "3.10"
+plugins = ["pydantic.mypy"]
+packages = ["skyctl"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
+check_untyped_defs = false
+show_error_codes = true
+
+[tool.coverage.run]
+source = ["skyctl"]
+branch = true
+omit = ["skyctl/adapters/aws.py", "skyctl/adapters/azure.py", "skyctl/adapters/gcp.py"]  # thin SDK shims, tested via fakes
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = false
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

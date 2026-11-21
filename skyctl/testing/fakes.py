@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 In-memory stand-ins for cloud SDK clients, faithful to the calls skyctl
 makes and raising the SDKs' own exception types. Used where no in-process
@@ -13,7 +28,6 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Optional
 
 # ----------------------------------------------------------------------
 # Azure Blob (azure-storage-blob ContainerClient)
@@ -26,7 +40,7 @@ class FakeAzureContainer:
         self.lock = threading.Lock()
         self._n = itertools.count(1)
 
-    def get_blob_client(self, name: str) -> "FakeAzureBlob":
+    def get_blob_client(self, name: str) -> FakeAzureBlob:
         return FakeAzureBlob(self, name)
 
     def list_blobs(self, name_starts_with: str = ""):
@@ -83,10 +97,10 @@ class FakeGcsBucket:
         self.lock = threading.Lock()
         self._gen = itertools.count(1_700_000_000_000_000)
 
-    def blob(self, name: str) -> "FakeGcsBlob":
+    def blob(self, name: str) -> FakeGcsBlob:
         return FakeGcsBlob(self, name)
 
-    def get_blob(self, name: str) -> Optional["FakeGcsBlob"]:
+    def get_blob(self, name: str) -> FakeGcsBlob | None:
         with self.lock:
             if name not in self.objects:
                 return None
@@ -100,7 +114,8 @@ class FakeGcsBucket:
 
 class FakeGcsBlob:
     def __init__(self, bucket: FakeGcsBucket, name: str):
-        self.b, self.name, self.generation = bucket, name, None
+        self.b, self.name = bucket, name
+        self.generation: int | None = None
 
     def download_as_bytes(self, if_generation_match=None):
         from google.api_core.exceptions import NotFound, PreconditionFailed
@@ -147,7 +162,7 @@ class FakeServiceBus:
         self.lock_seconds = lock_seconds
         self.clock = clock
         self.lock = threading.Lock()
-        self.messages: dict[str, dict] = {}   # id -> {body, visible_at, delivery_count, locked_until}
+        self.messages: dict[str, dict] = {}  # id -> {body, visible_at, delivery_count, locked_until}
 
     def get_queue_sender(self, queue_name: str):
         return SimpleNamespace(send_messages=self._send)
@@ -168,7 +183,10 @@ class FakeServiceBus:
             visible_at += max(0.0, (msg.scheduled_enqueue_time_utc - datetime.now(timezone.utc)).total_seconds())
         with self.lock:
             self.messages[msg.message_id or uuid.uuid4().hex] = {
-                "body": str(msg).encode("utf-8"), "visible_at": visible_at, "delivery_count": 0, "locked_until": 0.0,
+                "body": str(msg).encode("utf-8"),
+                "visible_at": visible_at,
+                "delivery_count": 0,
+                "locked_until": 0.0,
             }
 
     def _receive(self, max_message_count=1, max_wait_time=None):
@@ -180,7 +198,9 @@ class FakeServiceBus:
                     break
                 if m["visible_at"] <= now and m["locked_until"] <= now:
                     m["locked_until"] = now + self.lock_seconds
-                    out.append(SimpleNamespace(message_id=msg_id, body=iter([m["body"]]), delivery_count=m["delivery_count"]))
+                    out.append(
+                        SimpleNamespace(message_id=msg_id, body=iter([m["body"]]), delivery_count=m["delivery_count"])
+                    )
                     m["delivery_count"] += 1
         return out
 
@@ -209,7 +229,7 @@ class FakePubSub:
         self.ack_deadline = ack_deadline
         self.clock = clock
         self.lock = threading.Lock()
-        self.messages: dict[str, dict] = {}   # message_id -> {data, visible_at, attempts, ack_id}
+        self.messages: dict[str, dict] = {}  # message_id -> {data, visible_at, attempts, ack_id}
         self._ids = itertools.count(1)
 
     # publisher side
@@ -231,11 +251,13 @@ class FakePubSub:
                     m["attempts"] += 1
                     m["ack_id"] = f"ack-{msg_id}-{m['attempts']}"
                     m["visible_at"] = now + self.ack_deadline
-                    out.append(SimpleNamespace(
-                        ack_id=m["ack_id"],
-                        message=SimpleNamespace(message_id=msg_id, data=m["data"]),
-                        delivery_attempt=0,        # 0 unless a dead-letter policy is set
-                    ))
+                    out.append(
+                        SimpleNamespace(
+                            ack_id=m["ack_id"],
+                            message=SimpleNamespace(message_id=msg_id, data=m["data"]),
+                            delivery_attempt=0,  # 0 unless a dead-letter policy is set
+                        )
+                    )
         return SimpleNamespace(received_messages=out)
 
     def _by_ack(self, ack_id):
@@ -306,8 +328,13 @@ class FakeStorageQueue:
             raise ValueError("visibility must be earlier than expiry")
         msg_id = uuid.uuid4().hex
         with self.lock:
-            self.messages[msg_id] = {"content": content, "visible_at": self.clock() + (visibility_timeout or 0),
-                                     "dequeue_count": 0, "pop_receipt": None, "ttl": time_to_live}
+            self.messages[msg_id] = {
+                "content": content,
+                "visible_at": self.clock() + (visibility_timeout or 0),
+                "dequeue_count": 0,
+                "pop_receipt": None,
+                "ttl": time_to_live,
+            }
         return SimpleNamespace(id=msg_id)
 
     def receive_messages(self, max_messages=1, visibility_timeout=30, **_):
@@ -321,8 +348,14 @@ class FakeStorageQueue:
                     m["dequeue_count"] += 1
                     m["pop_receipt"] = uuid.uuid4().hex
                     m["visible_at"] = now + visibility_timeout
-                    out.append(SimpleNamespace(id=msg_id, content=m["content"], pop_receipt=m["pop_receipt"],
-                                               dequeue_count=m["dequeue_count"]))
+                    out.append(
+                        SimpleNamespace(
+                            id=msg_id,
+                            content=m["content"],
+                            pop_receipt=m["pop_receipt"],
+                            dequeue_count=m["dequeue_count"],
+                        )
+                    )
         return iter(out)
 
     def _check(self, msg_id, pop_receipt):

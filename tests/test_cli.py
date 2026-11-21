@@ -1,10 +1,24 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 
 import pytest
 from click.testing import CliRunner
 
 from skyctl.cli import cli
-from conftest import make_post_view
 
 ROOT = "at://did:plc:alice/app.bsky.feed.post/root"
 
@@ -55,9 +69,7 @@ def test_post_dry_run_json(run):
     data = json.loads(result.output)
     assert data["dry_run"] is True
     assert data["graphemes"] == 23
-    assert data["facets"] == [
-        {"type": "link", "text": "https://example.com", "value": "https://example.com"}
-    ]
+    assert data["facets"] == [{"type": "link", "text": "https://example.com", "value": "https://example.com"}]
 
 
 def test_over_long_post_is_rejected_with_clear_error(run, fake_atproto):
@@ -68,7 +80,7 @@ def test_over_long_post_is_rejected_with_clear_error(run, fake_atproto):
 
 
 def test_thread_dry_run_splits_long_text(run, fake_atproto):
-    text = " ".join(["word"] * 61)          # 304 graphemes
+    text = " ".join(["word"] * 61)  # 304 graphemes
     result = run("thread", "personal", text, "--dry-run", "--json")
     data = json.loads(result.output)
     assert len(data["posts"]) == 2

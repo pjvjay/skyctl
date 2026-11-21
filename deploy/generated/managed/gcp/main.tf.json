@@ -380,6 +380,10 @@
                   "value": "true"
                 },
                 {
+                  "name": "SKYCTL_SEARCH_URL",
+                  "value": "gdelt://"
+                },
+                {
                   "name": "GOOGLE_CLOUD_PROJECT",
                   "value": "my-skyctl-project"
                 },
@@ -520,6 +524,10 @@
                     "value": "true"
                   },
                   {
+                    "name": "SKYCTL_SEARCH_URL",
+                    "value": "gdelt://"
+                  },
+                  {
                     "name": "GOOGLE_CLOUD_PROJECT",
                     "value": "my-skyctl-project"
                   },
@@ -631,6 +639,10 @@
                   {
                     "name": "SKYCTL_HTTP_MCP",
                     "value": "true"
+                  },
+                  {
+                    "name": "SKYCTL_SEARCH_URL",
+                    "value": "gdelt://"
                   },
                   {
                     "name": "GOOGLE_CLOUD_PROJECT",
@@ -749,6 +761,7 @@
         "SKYCTL_LOG_FORMAT": "json",
         "SKYCTL_AUTH": "google-oidc,bearer",
         "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
         "GOOGLE_CLOUD_PROJECT": "my-skyctl-project",
         "CLOUD_ML_REGION": "europe-west1",
         "SKYCTL_OIDC_AUDIENCE": "https://skyctl-svc-${data.google_project.this.number}.europe-west1.run.app,https://skyctl-svc-${data.google_project.this.number}.europe-west1.run.app/invoke",
@@ -757,6 +770,16 @@
     },
     "state_url": {
       "value": "gs://${google_storage_bucket.state.name}/skyctl"
+    },
+    "skyctl_connection": {
+      "value": {
+        "platform": "gcp",
+        "state_url": "gs://${google_storage_bucket.state.name}/skyctl",
+        "queue_url": "pubsub://my-skyctl-project/skyctl-work?subscription=skyctl-work-push",
+        "env": {
+          "GOOGLE_CLOUD_PROJECT": "my-skyctl-project"
+        }
+      }
     }
   }
 }

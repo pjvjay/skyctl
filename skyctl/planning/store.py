@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.planning.store
 =====================
@@ -17,8 +32,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any
 
 from ..ports import ObjectStore, cas_update
 from .check import PlanCheck
@@ -56,27 +72,44 @@ class PlanStore:
 
     # -- create / read ---------------------------------------------------------
 
-    def create(self, plan: Plan, check: PlanCheck, *, created_by: str, approval_mode: str,
-               source: str = "mcp", run_id: Optional[str] = None) -> dict:
+    def create(
+        self,
+        plan: Plan,
+        check: PlanCheck,
+        *,
+        created_by: str,
+        approval_mode: str,
+        source: str = "mcp",
+        run_id: str | None = None,
+    ) -> dict:
         if approval_mode not in APPROVAL_MODES:
             raise PlanError(f"approval mode must be one of {APPROVAL_MODES}")
         plan_id = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
         required = approval_mode != "none" and check.summary.get("writes", 0) > 0
         record = {
-            "id": plan_id, "plan": plan.model_dump(mode="json"), "plan_hash": check.plan_hash,
+            "id": plan_id,
+            "plan": plan.model_dump(mode="json"),
+            "plan_hash": check.plan_hash,
             "status": "awaiting_approval" if required else "approved",
-            "created_at": _now(), "created_by": created_by, "source": source, "run_id": run_id,
+            "created_at": _now(),
+            "created_by": created_by,
+            "source": source,
+            "run_id": run_id,
             "approval": {"required": required, "mode": approval_mode, "by": None, "at": None, "via": None},
-            "check": {"summary": check.summary, "preview": check.preview,
-                      "warnings": [f.to_dict() for f in check.findings if f.level == "warning"]},
+            "check": {
+                "summary": check.summary,
+                "preview": check.preview,
+                "warnings": [f.to_dict() for f in check.findings if f.level == "warning"],
+            },
             "steps": {s.id: {"status": "pending"} for s in plan.steps},
-            "claimed_by": None, "claimed_until": None,
+            "claimed_by": None,
+            "claimed_until": None,
             "events": [{"at": _now(), "type": "created", "by": created_by}],
         }
         self.store.put(self._key(plan_id), json.dumps(record).encode("utf-8"), if_absent=True)
         return record
 
-    def get(self, plan_id: str) -> Optional[dict]:
+    def get(self, plan_id: str) -> dict | None:
         found = self.store.get(self._key(plan_id))
         return json.loads(found.data) if found else None
 
@@ -90,7 +123,7 @@ class PlanStore:
         """Atomically apply mutate(record) (in place). Returns the record as written."""
         out: dict = {}
 
-        def apply(raw: Optional[bytes]) -> Optional[bytes]:
+        def apply(raw: bytes | None) -> bytes | None:
             if raw is None:
                 raise PlanError(f"no plan {plan_id!r}")
             record = json.loads(raw)
@@ -101,7 +134,7 @@ class PlanStore:
         cas_update(self.store, self._key(plan_id), apply)
         return out["record"]
 
-    def list(self, status: Optional[str] = None, limit: int = 20) -> list[dict]:
+    def list(self, status: str | None = None, limit: int = 20) -> list[dict]:
         records = []
         for key in self.store.list(PREFIX):
             if not key.endswith(".json"):
@@ -143,8 +176,15 @@ class PlanStore:
 def summarise(r: dict) -> dict:
     done = sum(1 for s in r["steps"].values() if s["status"] in ("done", "dry_run"))
     return {
-        "id": r["id"], "status": r["status"], "goal": r["plan"]["goal"], "intent": r["plan"].get("intent"),
-        "created_at": r["created_at"], "created_by": r["created_by"], "plan_hash": r["plan_hash"],
-        "writes": r["check"]["summary"].get("writes", 0), "steps": len(r["steps"]), "steps_done": done,
+        "id": r["id"],
+        "status": r["status"],
+        "goal": r["plan"]["goal"],
+        "intent": r["plan"].get("intent"),
+        "created_at": r["created_at"],
+        "created_by": r["created_by"],
+        "plan_hash": r["plan_hash"],
+        "writes": r["check"]["summary"].get("writes", 0),
+        "steps": len(r["steps"]),
+        "steps_done": done,
         "approval": r["approval"],
     }

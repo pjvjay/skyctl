@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Contract tests against real emulators or real cloud accounts.
 
@@ -18,6 +33,7 @@ import uuid
 
 import pytest
 
+from conftest import require
 from skyctl.adapters import ObjectJobStore
 from skyctl.testing.contracts import (
     check_cas_under_contention,
@@ -34,11 +50,12 @@ def s3_store():
     bucket = os.getenv("SKYCTL_IT_S3_BUCKET")
     if not bucket:
         pytest.skip("SKYCTL_IT_S3_BUCKET not set")
-    boto3 = pytest.importorskip("boto3")
+    boto3 = require("boto3")
     from skyctl.adapters.s3 import S3ObjectStore
 
-    client = boto3.client("s3", endpoint_url=os.getenv("SKYCTL_IT_S3_ENDPOINT") or None,
-                          region_name=os.getenv("AWS_REGION", "us-east-1"))
+    client = boto3.client(
+        "s3", endpoint_url=os.getenv("SKYCTL_IT_S3_ENDPOINT") or None, region_name=os.getenv("AWS_REGION", "us-east-1")
+    )
     try:
         client.create_bucket(Bucket=bucket)
     except Exception:

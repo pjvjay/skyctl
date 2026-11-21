@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters.s3
 ==================
@@ -22,8 +37,6 @@ Identity / IRSA, instance profile, local profile). Needs `skyctl[aws]`.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from ..ports import PreconditionFailed, Versioned
 
 _CONFLICT_CODES = {"PreconditionFailed", "ConditionalRequestConflict", "412", "409"}
@@ -32,7 +45,7 @@ _CONFLICT_CODES = {"PreconditionFailed", "ConditionalRequestConflict", "412", "4
 class S3ObjectStore:
     atomic_cas = True
 
-    def __init__(self, bucket: str, prefix: str = "", client=None, region: Optional[str] = None):
+    def __init__(self, bucket: str, prefix: str = "", client=None, region: str | None = None):
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self._client = client
@@ -64,7 +77,7 @@ class S3ObjectStore:
 
     # -- CAS -------------------------------------------------------------
 
-    def get(self, key: str) -> Optional[Versioned]:
+    def get(self, key: str) -> Versioned | None:
         try:
             resp = self.client.get_object(Bucket=self.bucket, Key=self._k(key))
         except Exception as e:
@@ -73,7 +86,7 @@ class S3ObjectStore:
             raise
         return Versioned(resp["Body"].read(), resp["ETag"])
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         kwargs = {"Bucket": self.bucket, "Key": self._k(key), "Body": data}
         if if_absent:
             kwargs["IfNoneMatch"] = "*"
@@ -85,7 +98,7 @@ class S3ObjectStore:
             if self._code(e) in _CONFLICT_CODES:
                 raise PreconditionFailed(key) from e
             if if_version is not None and self._is_missing(e):
-                raise PreconditionFailed(key) from e   # deleted since we read it: a lost race
+                raise PreconditionFailed(key) from e  # deleted since we read it: a lost race
             raise
 
     # -- plain operations ------------------------------------------------

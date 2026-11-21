@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.cron
 ====================
@@ -52,6 +67,7 @@ class CronSpec:
 
 def _dow_to_eventbridge(token: str) -> str:
     """Unix 0-7 (0/7 = SUN) → EventBridge 1-7 (1 = SUN); names pass through."""
+
     def one(v: str) -> str:
         if v.isdigit():
             n = int(v) % 7
@@ -101,7 +117,8 @@ def previous_fire(cron: str, timezone_name: str = "UTC", now=None):
     on every platform, which makes it a portable idempotency key (no need
     for EventBridge's scheduled-time or any other platform-specific context).
     """
-    from datetime import datetime, timedelta, timezone as tz
+    from datetime import datetime, timedelta
+    from datetime import timezone as tz
 
     from apscheduler.triggers.cron import CronTrigger
 
@@ -111,7 +128,7 @@ def previous_fire(cron: str, timezone_name: str = "UTC", now=None):
         fire = trigger.get_next_fire_time(None, now - lookback)
         if fire is None or fire > now:
             continue
-        while True:                     # walk forward to the last fire <= now
+        while True:  # walk forward to the last fire <= now
             nxt = trigger.get_next_fire_time(fire, fire)
             if nxt is None or nxt > now:
                 return fire

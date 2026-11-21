@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.settings
 ===============
@@ -37,7 +52,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
 
 DEFAULT_STATE_URL = "file://./.skyctl"
 DEFAULT_PORT = 8080
@@ -68,8 +82,8 @@ class AgentDefaults:
     allow_delete: bool = False
     max_writes: int = 5
     max_turns: int = 25
-    max_run_seconds: int = 600              # keep below the platform's delivery deadline
-    accounts: Optional[list[str]] = None    # None → every configured alias
+    max_run_seconds: int = 600  # keep below the platform's delivery deadline
+    accounts: list[str] | None = None  # None → every configured alias
 
 
 @dataclass
@@ -77,16 +91,16 @@ class Settings:
     cloud: str = "local"
     secrets_url: str = "env"
     state_url: str = DEFAULT_STATE_URL
-    agent_model: Optional[str] = None
-    http_token: Optional[str] = None
+    agent_model: str | None = None
+    http_token: str | None = None
     port: int = DEFAULT_PORT
-    queue_url: Optional[str] = None
-    delayed_url: Optional[str] = None
+    queue_url: str | None = None
+    delayed_url: str | None = None
     env_file: str = ".env"
     agent: AgentDefaults = field(default_factory=AgentDefaults)
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         accounts_raw = os.getenv("SKYCTL_AGENT_ACCOUNTS", "").strip()
         return cls(
             cloud=detect_cloud(),
@@ -117,7 +131,7 @@ class Settings:
         return any(u != "env" for u in self.secret_urls)
 
 
-_loaded: Optional[Settings] = None
+_loaded: Settings | None = None
 
 
 def load_settings(force: bool = False) -> Settings:

@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.llm
 ==========
@@ -27,7 +42,8 @@ own backend with register_provider().
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol
 
 DEFAULT_MODEL = "anthropic:claude-opus-5-5"
 
@@ -58,15 +74,14 @@ class LLMProvider(Protocol):
     # Set supports_web_search = True on a backend that searches the web
     # itself when complete() is called with web_search=True.
 
-    def complete(self, system: str, prompt: str, web_search: bool = False) -> str:
-        ...
+    def complete(self, system: str, prompt: str, web_search: bool = False) -> str: ...
 
 
 def default_model() -> str:
     return os.getenv("SKYCTL_AGENT_MODEL", "").strip() or DEFAULT_MODEL
 
 
-def parse_model_spec(spec: Optional[str]) -> tuple[str, str]:
+def parse_model_spec(spec: str | None) -> tuple[str, str]:
     """Split "provider:model" into its parts. A bare model means Anthropic."""
     spec = (spec or "").strip() or default_model()
     provider, sep, model = spec.partition(":")
@@ -81,6 +96,7 @@ def parse_model_spec(spec: Optional[str]) -> tuple[str, str]:
 # Anthropic
 # ----------------------------------------------------------------------
 
+
 def make_anthropic_client(provider: str = "anthropic"):
     """
     An Anthropic SDK client for the given hosting provider. Every variant
@@ -90,20 +106,16 @@ def make_anthropic_client(provider: str = "anthropic"):
     try:
         import anthropic
     except ImportError as e:
-        raise LLMError(
-            "The Anthropic SDK is not installed. Run: pip install 'skyctl[agents]'"
-        ) from e
+        raise LLMError("The Anthropic SDK is not installed. Run: pip install 'skyctl[agents]'") from e
     if provider == "bedrock":
         # Credentials and region from the AWS default chain (task role etc.).
-        return anthropic.AnthropicBedrock(
-            aws_region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None
-        )
+        return anthropic.AnthropicBedrock(aws_region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None)
     if provider == "vertex":
+        region = os.getenv("CLOUD_ML_REGION")
+        project = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
+        # Unset values are NOT_GIVEN, so the SDK applies its own discovery rather than receiving None.
         return anthropic.AnthropicVertex(
-            region=os.getenv("CLOUD_ML_REGION") or None,
-            project_id=os.getenv("ANTHROPIC_VERTEX_PROJECT_ID")
-            or os.getenv("GOOGLE_CLOUD_PROJECT")
-            or None,
+            region=region or anthropic.NOT_GIVEN, project_id=project or anthropic.NOT_GIVEN
         )
     if provider == "foundry":
         base_url = _require_env("FOUNDRY_BASE_URL", "foundry")
@@ -112,13 +124,11 @@ def make_anthropic_client(provider: str = "anthropic"):
         if foundry_cls is not None:  # newer SDKs ship a dedicated client
             return foundry_cls(base_url=base_url, api_key=api_key)
         # Fallback: the Messages API route with the key in both header styles.
-        return anthropic.Anthropic(
-            base_url=base_url, api_key=api_key, default_headers={"api-key": api_key}
-        )
+        return anthropic.Anthropic(base_url=base_url, api_key=api_key, default_headers={"api-key": api_key})
     return anthropic.Anthropic()
 
 
-def _azure_entra_token() -> Optional[str]:
+def _azure_entra_token() -> str | None:
     """An Entra ID token for Azure OpenAI from the workload's managed identity, if available."""
     try:
         from azure.identity import DefaultAzureCredential
@@ -130,7 +140,7 @@ def _azure_entra_token() -> Optional[str]:
         return None
 
 
-def openai_compat_settings(provider: str) -> tuple[str, Optional[str], dict[str, str]]:
+def openai_compat_settings(provider: str) -> tuple[str, str | None, dict[str, str]]:
     """(base_url, api_key, extra headers) for an OpenAI-protocol provider."""
     if provider == "openai":
         base = os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
@@ -170,16 +180,14 @@ class AnthropicProvider:
     def __init__(
         self,
         model: str,
-        effort: Optional[str] = None,
+        effort: str | None = None,
         max_tokens: int = 16000,
         client=None,
     ):
         try:
             import anthropic
         except ImportError as e:
-            raise LLMError(
-                "The Anthropic SDK is not installed. Run: pip install 'skyctl[agents]'"
-            ) from e
+            raise LLMError("The Anthropic SDK is not installed. Run: pip install 'skyctl[agents]'") from e
         self._anthropic = anthropic
         self.model = model
         self.effort = effort
@@ -188,7 +196,7 @@ class AnthropicProvider:
         self._client = client or anthropic.Anthropic()
 
     def _create(self, messages: list, system: str, web_search: bool):
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "system": system,
@@ -201,8 +209,9 @@ class AnthropicProvider:
         if self.model in _FALLBACK_MODELS:
             # If a safety classifier declines, the API retries the request
             # on a fallback model within the same call.
+            # Sent as extra_body so SDK versions without a typed `fallbacks` argument still work.
             return self._client.beta.messages.create(
-                betas=[_FALLBACK_BETA], fallbacks="default", **kwargs
+                betas=[_FALLBACK_BETA], extra_body={"fallbacks": "default"}, **kwargs
             )
         return self._client.messages.create(**kwargs)
 
@@ -218,9 +227,7 @@ class AnthropicProvider:
                 messages.append({"role": "assistant", "content": response.content})
                 response = self._create(messages, system, web_search)
         except anthropic.AuthenticationError as e:
-            raise LLMError(
-                "Anthropic rejected the credentials. Check ANTHROPIC_API_KEY."
-            ) from e
+            raise LLMError("Anthropic rejected the credentials. Check ANTHROPIC_API_KEY.") from e
         except anthropic.NotFoundError as e:
             raise LLMError(f"Unknown Anthropic model '{self.model}'.") from e
         except anthropic.RateLimitError as e:
@@ -241,6 +248,7 @@ class AnthropicProvider:
 # OpenAI-compatible servers (OpenAI, OpenRouter, Ollama, vLLM, LM Studio…)
 # ----------------------------------------------------------------------
 
+
 class OpenAICompatProvider:
     """Any server that speaks the OpenAI chat-completions protocol."""
 
@@ -250,9 +258,9 @@ class OpenAICompatProvider:
         self,
         model: str,
         base_url: str,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         timeout: float = 300.0,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -284,9 +292,7 @@ class OpenAICompatProvider:
         except httpx.HTTPError as e:
             raise LLMError(f"Could not reach {self.base_url}: {e}") from e
         if resp.status_code >= 400:
-            raise LLMError(
-                f"{self.base_url} returned HTTP {resp.status_code}: {resp.text[:300]}"
-            )
+            raise LLMError(f"{self.base_url} returned HTTP {resp.status_code}: {resp.text[:300]}")
         try:
             content = resp.json()["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError) as e:
@@ -371,7 +377,7 @@ def register_provider(name: str, factory: Callable[..., LLMProvider]) -> None:
     _PROVIDERS[name.lower()] = factory
 
 
-def get_provider(spec: Optional[str] = None, **options) -> LLMProvider:
+def get_provider(spec: str | None = None, **options) -> LLMProvider:
     """Build the backend for a "provider:model" spec."""
     provider, model = parse_model_spec(spec)
     return _PROVIDERS[provider](model, **options)

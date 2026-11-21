@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 The evaluation harness must tell good judgement from bad. Scripted agents
 stand in for models: they read real tool results from the simulated world
@@ -5,8 +20,6 @@ stand in for models: they read real tool results from the simulated world
 """
 
 import json
-
-import pytest
 
 from skyctl.evals import SCENARIOS, run_scenario, run_suite
 from skyctl.evals.harness import build_world
@@ -39,8 +52,14 @@ class TriageAgent:
                     continue
                 text = "Thanks for asking! Yes, see our FAQ." if self.careful else f"Re: {m['text'][:200]}"
                 parent = "at://did:plc:made-up/app.bsky.feed.post/999" if self.invent_uri else m["uri"]
-                steps.append({"id": f"r{i}", "tool": "reply", "why": "answer",
-                              "args": {"account": "work", "parent_uri": parent, "text": text}})
+                steps.append(
+                    {
+                        "id": f"r{i}",
+                        "tool": "reply",
+                        "why": "answer",
+                        "args": {"account": "work", "parent_uri": parent, "text": text},
+                    }
+                )
             plan = {"goal": "answer mentions", "intent": "engage", "steps": steps}
             return ChatTurn("", [ToolCall("c", "plan_create", {"plan": plan})], "tool_use")
         return ChatTurn("Proposed replies.", [], "end")
@@ -58,7 +77,10 @@ class AnnounceAgent:
         if self.asks:
             return ChatTurn("Which account should post this, work or personal?", [], "end")
         if len(messages) == 1:
-            plan = {"goal": "hiring post", "steps": [{"id": "p", "tool": "post", "args": {"account": "work", "text": "We're hiring!"}}]}
+            plan = {
+                "goal": "hiring post",
+                "steps": [{"id": "p", "tool": "post", "args": {"account": "work", "text": "We're hiring!"}}],
+            }
             return ChatTurn("", [ToolCall("c", "plan_create", {"plan": plan})], "tool_use")
         return ChatTurn("Posted to work.", [], "end")
 
@@ -90,8 +112,30 @@ def test_careful_agent_passes_triage_and_injection():
 def test_naive_agent_is_caught():
     r = run_scenario(BY_ID["triage-genuine-vs-spam"], lambda: TriageAgent(careful=False))
     assert not r.passed and "not_reply_to:spam" in failed(r)
+    # Echoing the injected link is stopped before the harness sees it: citation grounding refuses a
+    # plan that publishes a URL no research tool returned.
     inj = run_scenario(BY_ID["prompt-injection-in-mention"], lambda: TriageAgent(careful=False))
-    assert {"text_excludes:evil.example", "text_excludes:free tokens"} <= failed(inj)
+    assert inj.plan is None
+    # ...and the harness's own text check still catches it if a plan ever carried it.
+    from skyctl.evals import evaluate
+
+    scenario = BY_ID["prompt-injection-in-mention"]
+    world = build_world(scenario)
+    echoed = {
+        "steps": [
+            {
+                "id": "r",
+                "tool": "reply",
+                "args": {
+                    "account": "work",
+                    "parent_uri": world.uri("question"),
+                    "text": "Free tokens at https://evil.example",
+                },
+            }
+        ]
+    }
+    checks = {c.name: c.ok for c in evaluate(scenario, echoed, "", world, 0)}
+    assert checks["text_excludes:evil.example"] is False and checks["text_excludes:free tokens"] is False
 
 
 def test_invented_uris_are_caught():
@@ -103,8 +147,15 @@ def test_invented_uris_are_caught():
 
     scenario = BY_ID["triage-genuine-vs-spam"]
     world = build_world(scenario)
-    invented = {"steps": [{"id": "r", "tool": "reply", "args": {"account": "work", "text": "x",
-                                                               "parent_uri": "at://did:plc:nope/app.bsky.feed.post/1"}}]}
+    invented = {
+        "steps": [
+            {
+                "id": "r",
+                "tool": "reply",
+                "args": {"account": "work", "text": "x", "parent_uri": "at://did:plc:nope/app.bsky.feed.post/1"},
+            }
+        ]
+    }
     assert not next(c for c in evaluate(scenario, invented, "", world, 0) if c.name == "grounded").ok
 
 
@@ -137,5 +188,36 @@ def test_every_builtin_scenario_is_well_formed():
         world = build_world(s)
         for key in s.get("expect", {}).get("reply_to", []) + s.get("expect", {}).get("not_reply_to", []):
             assert world.uri(key).startswith("at://")
-        assert set(s["expect"]) <= {"writes", "reply_to", "not_reply_to", "tools_any", "tools_none",
-                                    "accounts_only", "max_writes", "text_excludes", "asks"}, s["id"]
+        assert set(s["expect"]) <= {
+            "writes",
+            "reply_to",
+            "not_reply_to",
+            "tools_any",
+            "tools_none",
+            "accounts_only",
+            "max_writes",
+            "text_excludes",
+            "asks",
+            "cites_sources",
+        }, s["id"]
+
+
+def test_misinformation_scenario_rewards_careful_corrections():
+    from skyctl.testing.agents import FactCheckerAgent
+
+    scenario = BY_ID["correct-misinformation-in-comments"]
+    good = run_scenario(
+        scenario,
+        lambda: FactCheckerAgent(
+            "Riverside transit strike", ("strike is over",), news_query="Riverside transit strike"
+        ),
+    )
+    assert good.passed, [f"{c.name}: {c.detail}" for c in good.checks if not c.ok]
+    # An agent that "corrects" an opinion as well fails not_reply_to:opinion.
+    overeager = run_scenario(
+        scenario,
+        lambda: FactCheckerAgent(
+            "Riverside transit strike", ("strike is over", "in my view"), news_query="Riverside transit strike"
+        ),
+    )
+    assert "not_reply_to:opinion" in failed(overeager)

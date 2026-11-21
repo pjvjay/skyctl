@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.adapters.local
 =====================
@@ -14,20 +29,21 @@ import json
 import os
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from dotenv import dotenv_values
 
 from ..models import PostResult, ScheduledPost
 from ..ports import PreconditionFailed, Versioned, cas_update
 
-
 # ----------------------------------------------------------------------
 # Secrets
 # ----------------------------------------------------------------------
+
 
 def parse_secret_payload(text: str) -> dict[str, str]:
     """
@@ -69,6 +85,7 @@ class StaticSecretStore:
 # Object stores
 # ----------------------------------------------------------------------
 
+
 class FileObjectStore:
     """
     Keys map to files under a root directory. Secret-ish files are 0600.
@@ -97,12 +114,12 @@ class FileObjectStore:
             except FileExistsError:
                 try:
                     if time.time() - lock.stat().st_mtime > self.LOCK_STALE_SECONDS:
-                        lock.unlink(missing_ok=True)   # holder died
+                        lock.unlink(missing_ok=True)  # holder died
                         continue
                 except FileNotFoundError:
                     continue
                 if time.monotonic() > deadline:
-                    raise TimeoutError(f"Could not lock {path}")
+                    raise TimeoutError(f"Could not lock {path}") from None
                 time.sleep(0.005)
         try:
             yield
@@ -113,7 +130,7 @@ class FileObjectStore:
     def _version(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()[:32]
 
-    def get(self, key: str) -> Optional[Versioned]:
+    def get(self, key: str) -> Versioned | None:
         path = self._path(key)
         try:
             data = path.read_bytes()
@@ -121,7 +138,7 @@ class FileObjectStore:
             return None
         return Versioned(data, self._version(data))
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         path = self._path(key)
         if if_version is None and not if_absent:
             self.write(key, data)
@@ -167,7 +184,7 @@ class FileObjectStore:
             path.unlink()
 
     def list(self, prefix: str = "") -> list[str]:
-        root = self.root.resolve()               # _path() resolves; compare like with like
+        root = self.root.resolve()  # _path() resolves; compare like with like
         base = self._path(prefix) if prefix else root
         if not base.exists():
             return []
@@ -181,9 +198,8 @@ class FileObjectStore:
 
     def append_line(self, key: str, line: str) -> None:
         path = self._path(key)
-        with self._locked(path):
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line.rstrip("\n") + "\n")
+        with self._locked(path), path.open("a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
 
 
 def append_line_cas(store, key: str, line: str) -> None:
@@ -214,14 +230,14 @@ class MemoryObjectStore:
         self._versions[key] = self._counter
         return str(self._counter)
 
-    def get(self, key: str) -> Optional[Versioned]:
+    def get(self, key: str) -> Versioned | None:
         with self._lock:
             key = _check_key(key)
             if key not in self._data:
                 return None
             return Versioned(self._data[key], str(self._versions[key]))
 
-    def put(self, key: str, data: bytes, *, if_version: Optional[str] = None, if_absent: bool = False) -> str:
+    def put(self, key: str, data: bytes, *, if_version: str | None = None, if_absent: bool = False) -> str:
         with self._lock:
             key = _check_key(key)
             exists = key in self._data
@@ -260,6 +276,7 @@ class MemoryObjectStore:
 # Sessions
 # ----------------------------------------------------------------------
 
+
 class ObjectSessionStore:
     """Session strings under <prefix><alias>.session in any ObjectStore."""
 
@@ -270,7 +287,7 @@ class ObjectSessionStore:
     def _key(self, alias: str) -> str:
         return f"{self.prefix}{alias}.session"
 
-    def get(self, alias: str) -> Optional[str]:
+    def get(self, alias: str) -> str | None:
         key = self._key(alias)
         if not self.store.exists(key):
             return None
@@ -296,6 +313,7 @@ class FileSessionStore(ObjectSessionStore):
 # ----------------------------------------------------------------------
 # Jobs
 # ----------------------------------------------------------------------
+
 
 def job_to_dict(sp: ScheduledPost) -> dict:
     return {
@@ -335,10 +353,7 @@ def job_from_dict(d: dict) -> ScheduledPost:
         claimed_by=d.get("claimed_by"),
         claimed_at=datetime.fromisoformat(d["claimed_at"]) if d.get("claimed_at") else None,
         claimed_until=datetime.fromisoformat(d["claimed_until"]) if d.get("claimed_until") else None,
-        result=(
-            PostResult(account=d["account"], uri=d["sent_uri"], cid="", url="")
-            if d.get("sent_uri") else None
-        ),
+        result=(PostResult(account=d["account"], uri=d["sent_uri"], cid="", url="") if d.get("sent_uri") else None),
     )
 
 
@@ -352,14 +367,14 @@ class ObjectJobStore:
     its version is a fencing token (see docs/CLOUD_FRAMEWORK.md §5).
     """
 
-    def __init__(self, store, key: str = "queue.json", lease_key: Optional[str] = None):
+    def __init__(self, store, key: str = "queue.json", lease_key: str | None = None):
         self.store = store
         self.key = key
         self.lease_key = lease_key or f"{key}.lease"
-        self.fencing_token: Optional[str] = None
+        self.fencing_token: str | None = None
 
     @staticmethod
-    def _decode(raw: Optional[bytes]) -> dict[str, ScheduledPost]:
+    def _decode(raw: bytes | None) -> dict[str, ScheduledPost]:
         if not raw:
             return {}
         data = json.loads(raw.decode("utf-8") or "{}")
@@ -380,7 +395,7 @@ class ObjectJobStore:
     def update(self, mutate: Callable[[dict[str, ScheduledPost]], Any]) -> Any:
         result: dict[str, Any] = {}
 
-        def apply(raw: Optional[bytes]) -> Optional[bytes]:
+        def apply(raw: bytes | None) -> bytes | None:
             jobs = self._decode(raw)
             before = self._encode(jobs)
             result["value"] = mutate(jobs)
@@ -394,7 +409,9 @@ class ObjectJobStore:
 
     def lease(self, owner: str, seconds: int) -> bool:
         now = datetime.now(timezone.utc)
-        payload = json.dumps({"owner": owner, "expires": (now + timedelta(seconds=seconds)).isoformat()}).encode("utf-8")
+        payload = json.dumps({"owner": owner, "expires": (now + timedelta(seconds=seconds)).isoformat()}).encode(
+            "utf-8"
+        )
         current = self.store.get(self.lease_key)
         try:
             if current is None:
@@ -405,13 +422,13 @@ class ObjectJobStore:
                 expired = datetime.fromisoformat(held["expires"]) <= now
                 mine = held.get("owner") == owner
             except Exception:
-                expired, mine = True, False            # corrupt lease: take it
+                expired, mine = True, False  # corrupt lease: take it
             if not (expired or mine):
                 return False
             self.fencing_token = self.store.put(self.lease_key, payload, if_version=current.version)
             return True
         except PreconditionFailed:
-            return False                               # someone else won the race
+            return False  # someone else won the race
 
     def release(self, owner: str) -> None:
         current = self.store.get(self.lease_key)

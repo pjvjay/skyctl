@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.lambda_handler
 ==============================
@@ -17,7 +32,7 @@ secrets are loaded at init (Lambda has no native secret injection).
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 from .invocation import decode_lambda_event, default_dispatcher
 
@@ -48,9 +63,12 @@ def handler(event: Any, context: Any = None, dispatcher=None) -> Any:
         return {"batchItemFailures": [{"itemIdentifier": i} for i, o in outcomes if not o.ok and o.retry]}
     if shape == "http":
         status = 200 if all(o.ok for _, o in outcomes) else (500 if any(o.retry for _, o in outcomes) else 400)
-        return {"statusCode": status, "headers": {"Content-Type": "application/json"},
-                "body": json.dumps([o.to_dict() for _, o in outcomes], default=str)}
+        return {
+            "statusCode": status,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps([o.to_dict() for _, o in outcomes], default=str),
+        }
     [(_, only)] = outcomes
     if not only.ok and only.retry:
-        raise RuntimeError(only.error)        # async invokes (Scheduler) retry on exceptions
+        raise RuntimeError(only.error)  # async invokes (Scheduler) retry on exceptions
     return only.to_dict()

@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tick mode: one scheduler pass driven by a fake clock."""
 
 from datetime import datetime, timedelta, timezone
@@ -47,13 +62,13 @@ def test_cron_job_fires_once_per_slot_and_never_bursts(manager, fake_atproto):
     scheduler, store = make(manager, clock)
     job_id = scheduler.schedule_cron("work", "Daily", cron="0 9 * * *")
 
-    assert scheduler.tick().sent == []          # 08:59:30, slot not reached
-    clock.advance(seconds=30)                   # 09:00:00
+    assert scheduler.tick().sent == []  # 08:59:30, slot not reached
+    clock.advance(seconds=30)  # 09:00:00
     assert scheduler.tick().sent == [job_id]
-    assert scheduler.tick().sent == []          # same slot, already run
+    assert scheduler.tick().sent == []  # same slot, already run
     assert store.load()[job_id].status == "recurring"
 
-    clock.advance(days=3)                       # three slots missed: one catch-up send, not three
+    clock.advance(days=3)  # three slots missed: one catch-up send, not three
     assert scheduler.tick().sent == [job_id]
     assert scheduler.tick().sent == []
     work = [c for c in fake_atproto.instances if c.login_calls and c.login_calls[0]["login"] == "work.test"][0]
@@ -73,15 +88,15 @@ def test_failed_send_is_retried_with_backoff_then_marked_failed(manager, fake_at
     assert job.retry_at == T0 + timedelta(seconds=60)
 
     clock.advance(seconds=30)
-    assert scheduler.tick().failed == []        # not yet
+    assert scheduler.tick().failed == []  # not yet
     clock.advance(seconds=30)
-    assert scheduler.tick().failed == [sp.id]   # attempt 2, delay doubles
+    assert scheduler.tick().failed == [sp.id]  # attempt 2, delay doubles
     assert store.load()[sp.id].retry_at == clock.now + timedelta(seconds=120)
 
     clock.advance(seconds=120)
-    assert scheduler.tick().failed == [sp.id]   # attempt 3 > max_retries
+    assert scheduler.tick().failed == [sp.id]  # attempt 3 > max_retries
     assert store.load()[sp.id].status == "failed"
-    assert scheduler.tick().failed == []        # dead jobs stay dead
+    assert scheduler.tick().failed == []  # dead jobs stay dead
 
 
 def test_tick_respects_lease(manager):
@@ -115,6 +130,7 @@ def test_legacy_queue_file_still_used_by_default(manager, tmp_path, monkeypatch)
 # ----------------------------------------------------------------------
 # Claim protocol: the correctness core shared by tick, daemon and post.send
 # ----------------------------------------------------------------------
+
 
 def test_concurrent_claimers_never_get_the_same_job(manager):
     import threading
@@ -150,14 +166,22 @@ def test_crash_after_send_is_recovered_without_a_duplicate_post(manager, monkeyp
 
     # The repo now holds the post; list_posts is what recovery consults.
     monkeypatch.setattr(
-        manager.client("personal"), "list_posts",
-        lambda limit=25: [{"uri": sent.uri, "cid": sent.cid, "url": sent.url,
-                           "text": "exactly once please", "created_at": T0.isoformat()}],
+        manager.client("personal"),
+        "list_posts",
+        lambda limit=25: [
+            {
+                "uri": sent.uri,
+                "cid": sent.cid,
+                "url": sent.url,
+                "text": "exactly once please",
+                "created_at": T0.isoformat(),
+            }
+        ],
     )
     clock.advance(seconds=30)
-    assert scheduler.tick().sent == []                 # claim still fresh: hands off
+    assert scheduler.tick().sent == []  # claim still fresh: hands off
     clock.advance(seconds=60)
-    recovered = scheduler.tick()                       # claim stale: verify, don't resend
+    recovered = scheduler.tick()  # claim stale: verify, don't resend
     assert recovered.sent == [sp.id]
     assert store.load()[sp.id].status == "sent"
     assert store.load()[sp.id].result.uri == sent.uri
@@ -166,9 +190,9 @@ def test_crash_after_send_is_recovered_without_a_duplicate_post(manager, monkeyp
 
 def test_crash_before_send_is_retried(manager, monkeypatch):
     clock = Clock()
-    scheduler, store = make(manager, clock, claim_seconds=60)
+    scheduler, _store = make(manager, clock, claim_seconds=60)
     sp = scheduler.schedule("personal", "never sent", run_at=T0)
-    scheduler._claim("worker-a", T0)                   # crashes before sending
+    scheduler._claim("worker-a", T0)  # crashes before sending
     monkeypatch.setattr(manager.client("personal"), "list_posts", lambda limit=25: [])
     clock.advance(seconds=61)
     assert scheduler.tick().sent == [sp.id]
@@ -181,7 +205,7 @@ def test_stale_worker_result_is_fenced_out(manager):
     sp = scheduler.schedule("personal", "x", run_at=T0)
     [slow] = scheduler._claim("slow-worker", T0)
     clock.advance(seconds=61)
-    [fast] = scheduler._claim("fast-worker", clock.now)   # re-claims the stale job
+    [_fast] = scheduler._claim("fast-worker", clock.now)  # re-claims the stale job
     from skyctl.models import PostResult
 
     # The slow worker finally reports a failure; it must not clobber the new claim.
@@ -192,12 +216,12 @@ def test_stale_worker_result_is_fenced_out(manager):
 
 def test_send_now_is_idempotent_and_respects_due_time(manager):
     clock = Clock()
-    scheduler, store = make(manager, clock)
+    scheduler, _store = make(manager, clock)
     sp = scheduler.schedule("personal", "fast path", run_at=T0 + timedelta(minutes=5))
-    assert scheduler.send_now(sp.id) is None           # early delivery: no-op
+    assert scheduler.send_now(sp.id) is None  # early delivery: no-op
     clock.advance(minutes=5)
     assert scheduler.send_now(sp.id).success
-    assert scheduler.send_now(sp.id) is None           # duplicate delivery: no-op
+    assert scheduler.send_now(sp.id) is None  # duplicate delivery: no-op
     assert scheduler.send_now("unknown") is None
     assert len(manager.client("personal")._client.sent) == 1
 
@@ -221,7 +245,7 @@ def test_delayed_delivery_fast_path_is_registered_and_cancelled(manager):
     near = scheduler.schedule("personal", "soon", run_at=T0 + timedelta(minutes=10))
     far = scheduler.schedule("personal", "later", run_at=T0 + timedelta(days=3))
     assert delayed.scheduled[near.id][1] == {"kind": "post.send", "job_id": near.id}
-    assert far.id not in delayed.scheduled             # beyond the horizon: tick handles it
+    assert far.id not in delayed.scheduled  # beyond the horizon: tick handles it
     scheduler.cancel(near.id)
     assert delayed.cancelled == [near.id]
 

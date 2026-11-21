@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The HTTP service: auth, runs, tick, MCP over streamable HTTP."""
 
 import json
@@ -6,17 +21,19 @@ import time
 
 import pytest
 
-pytest.importorskip("starlette")
-pytest.importorskip("mcp")
+from conftest import require
 
-from starlette.testclient import TestClient  # noqa: E402
+require("starlette")
+require("mcp")
 
-from skyctl.adapters import MemoryObjectStore, ObjectJobStore  # noqa: E402
-from skyctl.agent import AgentRunner  # noqa: E402
-from skyctl.ports import ChatTurn, ToolCall  # noqa: E402
-from skyctl.scheduler import BskyScheduler  # noqa: E402
-from skyctl.server import create_app  # noqa: E402
-from skyctl.settings import AgentDefaults, Settings  # noqa: E402
+from starlette.testclient import TestClient
+
+from skyctl.adapters import MemoryObjectStore, ObjectJobStore
+from skyctl.agent import AgentRunner
+from skyctl.ports import ChatTurn, ToolCall
+from skyctl.scheduler import BskyScheduler
+from skyctl.server import create_app
+from skyctl.settings import AgentDefaults, Settings
 
 logging.disable(logging.CRITICAL)
 
@@ -29,7 +46,11 @@ class Scripted:
 
     def chat(self, system, messages, tools):
         if len(messages) == 1:
-            return ChatTurn(text="", tool_calls=[ToolCall("c1", "post", {"account": "work", "text": "via http"})], stop_reason="tool_use")
+            return ChatTurn(
+                text="",
+                tool_calls=[ToolCall("c1", "post", {"account": "work", "text": "via http"})],
+                stop_reason="tool_use",
+            )
         return ChatTurn(text="done", tool_calls=[], stop_reason="end")
 
 
@@ -83,14 +104,18 @@ def test_runs_respect_deployment_ceilings(app, fake_atproto):
         assert c.post("/runs", json={"goal": "x", "bogus": 1}, headers=h).status_code == 400
         assert c.post("/runs", json={"goal": "x", "allow_delete": True}, headers=h).status_code == 403
 
-        started = c.post("/runs", json={"goal": "post it", "allow_writes": True, "max_writes": 99, "accounts": ["work", "personal"]}, headers=h)
+        started = c.post(
+            "/runs",
+            json={"goal": "post it", "allow_writes": True, "max_writes": 99, "accounts": ["work", "personal"]},
+            headers=h,
+        )
         assert started.status_code == 202
         run_id = started.json()["run_id"]
         data = wait_for(c, run_id, h)
         assert data["status"] == "completed"
         assert data["result"]["writes"] == 1
-        assert data["result"]["task"]["max_writes"] == 3            # clamped to the deployment ceiling
-        assert data["result"]["task"]["accounts"] == ["work"]       # personal filtered out
+        assert data["result"]["task"]["max_writes"] == 3  # clamped to the deployment ceiling
+        assert data["result"]["task"]["accounts"] == ["work"]  # personal filtered out
         assert [e["type"] for e in data["events"]][:2] == ["task", "turn"]
         assert c.get("/runs/nope", headers=h).status_code == 404
 
@@ -105,28 +130,48 @@ def test_tick_endpoint(app):
 def test_mcp_over_streamable_http(app):
     h = {"Authorization": "Bearer tok", **MCP_HEADERS}
     with TestClient(app) as c:
-        init = c.post("/mcp/", headers=h, json={
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
-        })
+        init = c.post(
+            "/mcp/",
+            headers=h,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "0"},
+                },
+            },
+        )
         assert init.status_code == 200 and init.json()["result"]["serverInfo"]["name"] == "skyctl"
         listed = c.post("/mcp/", headers=h, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = [t["name"] for t in listed.json()["result"]["tools"]]
         # Remote sessions default to the "plan" profile: reads + plans, no direct writes.
         assert {"plan_create", "plan_execute", "get_notifications"} <= set(names)
         assert "post" not in names and "delete_post" not in names
-        called = c.post("/mcp/", headers=h, json={
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "list_accounts", "arguments": {}},
-        })
+        called = c.post(
+            "/mcp/",
+            headers=h,
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "list_accounts", "arguments": {}},
+            },
+        )
         payload = json.loads(called.json()["result"]["content"][0]["text"])
         assert payload == {"accounts": [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]}
-        assert c.post("/mcp/", headers=MCP_HEADERS, json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"}).status_code == 401
+        assert (
+            c.post("/mcp/", headers=MCP_HEADERS, json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"}).status_code
+            == 401
+        )
 
 
 # ----------------------------------------------------------------------
 # /invoke and capability-driven run strategy
 # ----------------------------------------------------------------------
+
 
 def test_invoke_endpoint_handles_push_envelopes(app):
     import base64
@@ -135,26 +180,37 @@ def test_invoke_endpoint_handles_push_envelopes(app):
     with TestClient(app) as c:
         r = c.post("/invoke", json={"kind": "tick"}, headers=h)
         assert r.status_code == 200 and r.json()["outcomes"][0]["kind"] == "tick"
-        push = {"message": {"data": base64.b64encode(b'{"kind": "tick"}').decode(), "messageId": "1"},
-                "subscription": "projects/p/subscriptions/s"}
+        push = {
+            "message": {"data": base64.b64encode(b'{"kind": "tick"}').decode(), "messageId": "1"},
+            "subscription": "projects/p/subscriptions/s",
+        }
         assert c.post("/invoke", json=push, headers=h).status_code == 200
-        assert c.post("/invoke", json={"kind": "nope"}, headers=h).status_code == 422     # permanent: no retry
+        assert c.post("/invoke", json={"kind": "nope"}, headers=h).status_code == 422  # permanent: no retry
         assert c.post("/invoke", content=b"garbage", headers=h).status_code == 400
         assert c.post("/invoke", json={"kind": "tick"}).status_code == 401
         # CloudEvents webhook validation handshake is public and echoes the origin.
         opt = c.options("/invoke", headers={"WebHook-Request-Origin": "eventgrid.azure.net"})
         assert opt.status_code == 200 and opt.headers["webhook-allowed-origin"] == "eventgrid.azure.net"
         # Event Grid subscription validation returns the code as the body.
-        validation = [{"id": "v", "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent", "data": {"validationCode": "xyz"}}]
+        validation = [
+            {
+                "id": "v",
+                "eventType": "Microsoft.EventGrid.SubscriptionValidationEvent",
+                "data": {"validationCode": "xyz"},
+            }
+        ]
         assert c.post("/invoke", json=validation, headers=h).json() == {"validationResponse": "xyz"}
 
 
 def test_runs_are_queued_where_background_threads_are_unsafe(manager, monkeypatch):
-    from skyctl.adapters.queues import MemoryQueue
     from skyctl.platform import Runtime, get_platform
 
-    settings = Settings(http_token="tok", state_url="memory://t", queue_url="memory://runs-test",
-                        agent=AgentDefaults(allow_writes=False))
+    settings = Settings(
+        http_token="tok",
+        state_url="memory://t",
+        queue_url="memory://runs-test",
+        agent=AgentDefaults(allow_writes=False),
+    )
     runtime = Runtime(settings, platform=get_platform("gcp"), compute="cloud-run")
     state = MemoryObjectStore()
     runner = AgentRunner(manager, provider=Scripted(), state=state)
@@ -169,7 +225,9 @@ def test_runs_are_queued_where_background_threads_are_unsafe(manager, monkeypatc
         assert c.get(f"/runs/{run_id}", headers=h).json()["status"] == "queued"
 
     # Without a queue, request-billed Cloud Run cannot run agents asynchronously at all.
-    no_queue = Runtime(Settings(http_token="tok", state_url="memory://t"), platform=get_platform("gcp"), compute="cloud-run")
+    no_queue = Runtime(
+        Settings(http_token="tok", state_url="memory://t"), platform=get_platform("gcp"), compute="cloud-run"
+    )
     app = create_app(no_queue.settings, manager=manager, runner=runner, runtime=no_queue, mcp_server=False)
     with TestClient(app) as c:
         r = c.post("/runs", json={"goal": "x"}, headers=h)
@@ -187,19 +245,24 @@ def test_readyz_describes_the_runtime(app):
 # Plans over HTTP: approval is separated from the agent's credential
 # ----------------------------------------------------------------------
 
+
 def _plan_app(manager, monkeypatch, state):
     from skyctl.platform import Runtime, get_platform
     from skyctl.platform.auth import build_auth_chain
 
     monkeypatch.setenv("SKYCTL_HTTP_TOKEN", "agent-tok")
     monkeypatch.setenv("SKYCTL_APPROVER_TOKEN", "human-tok")
-    settings = Settings(http_token="agent-tok", state_url="memory://plans",
-                        agent=AgentDefaults(allow_writes=True, max_writes=5, accounts=["work"]))
+    settings = Settings(
+        http_token="agent-tok",
+        state_url="memory://plans",
+        agent=AgentDefaults(allow_writes=True, max_writes=5, accounts=["work"]),
+    )
     runtime = Runtime(settings, platform=get_platform("local"))
     runtime._state = state
     runner = AgentRunner(manager, provider=Scripted(), state=state)
-    return create_app(settings, manager=manager, runner=runner, runtime=runtime, mcp_server=False,
-                      auth_chain=build_auth_chain())
+    return create_app(
+        settings, manager=manager, runner=runner, runtime=runtime, mcp_server=False, auth_chain=build_auth_chain()
+    )
 
 
 def test_agent_token_cannot_approve_its_own_plan(manager, monkeypatch, fake_atproto):
@@ -208,7 +271,9 @@ def test_agent_token_cannot_approve_its_own_plan(manager, monkeypatch, fake_atpr
 
     state = MemoryObjectStore()
     ctx = ToolContext(manager, policy=ToolPolicy(accounts=["work"], allow_writes=True))
-    p = Plan.model_validate({"goal": "g", "steps": [{"id": "a", "tool": "post", "args": {"account": "work", "text": "hello"}}]})
+    p = Plan.model_validate(
+        {"goal": "g", "steps": [{"id": "a", "tool": "post", "args": {"account": "work", "text": "hello"}}]}
+    )
     rec = PlanStore(state).create(p, check_plan(p, ctx, registry), created_by="mcp-http", approval_mode="out_of_band")
     agent, human = {"Authorization": "Bearer agent-tok"}, {"Authorization": "Bearer human-tok"}
     body = {"plan_hash": rec["plan_hash"]}

@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.cli
 ==========
@@ -35,6 +50,8 @@ Commands:
     skyctl platform info|list        What platform this is and what it can do
     skyctl plan list|show|approve|execute|cancel   Review agent-proposed plans
     skyctl eval list|run             Score how a model turns free text into plans
+    skyctl run-cloud-task --cloud aws --description "…"   Plan in the cloud, approve here, execute there
+    skyctl cloud add|import|list|status|approve             Profiles for deployments
     skyctl deploy render|check       Render one deployment spec for every target
 
 Most commands accept --json for machine-readable output.
@@ -49,12 +66,14 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from typing import NoReturn
 
 import click
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from . import __version__
 from .agents import (
     AgentConfigError,
     AgentGroup,
@@ -75,16 +94,14 @@ from .scheduler import BskyScheduler
 
 console = Console()
 
-json_option = click.option(
-    "--json", "as_json", is_flag=True, help="Print machine-readable JSON."
-)
+json_option = click.option("--json", "as_json", is_flag=True, help="Print machine-readable JSON.")
 
 
 def emit_json(data) -> None:
     click.echo(json.dumps(data, indent=2, default=str))
 
 
-def fail(message: str, as_json: bool = False):
+def fail(message: str, as_json: bool = False) -> NoReturn:
     if as_json:
         emit_json({"success": False, "error": message})
     else:
@@ -148,14 +165,8 @@ def describe_post(text, images=(), alts=(), quote=None, link_card=None) -> dict:
         "text": text,
         "graphemes": grapheme_len(text),
         "limit": MAX_GRAPHEMES,
-        "facets": [
-            {"type": f.kind, "text": f.text, "value": f.value}
-            for f in detect_facets(text)
-        ],
-        "images": [
-            {"path": path, "alt": alts[i] if i < len(alts) else None}
-            for i, path in enumerate(images)
-        ],
+        "facets": [{"type": f.kind, "text": f.text, "value": f.value} for f in detect_facets(text)],
+        "images": [{"path": path, "alt": alts[i] if i < len(alts) else None} for i, path in enumerate(images)],
         "quote": quote,
         "link_card": link_card,
     }
@@ -193,24 +204,30 @@ def check_post_args(text, image, alt, link_card, as_json):
 
 
 @click.group()
+@click.version_option(version=__version__, prog_name="skyctl", message="%(prog)s %(version)s")
 def cli():
-    """skyctl — Multi-account Bluesky automation tool."""
-    pass
+    """skyctl — Bluesky accounts, agents and MCP tools, locally or in AWS, Azure and Google Cloud.
+
+    \b
+    Start here:
+        skyctl accounts                                    your configured accounts
+        skyctl post work "Hello"                           post (see also thread, reply, schedule)
+        skyctl mcp                                         use skyctl from Claude Desktop / Claude Code
+        skyctl run-cloud-task --cloud aws -d "…"           plan a task in the cloud, approve it here
+    """
 
 
 # ------------------------------------------------------------------
 # Account info
 # ------------------------------------------------------------------
 
+
 @cli.command()
 @json_option
 def accounts(as_json):
     """List all configured accounts."""
     manager = get_manager()
-    rows = [
-        {"alias": alias, "handle": manager.client(alias).config.handle}
-        for alias in manager.aliases()
-    ]
+    rows = [{"alias": alias, "handle": manager.client(alias).config.handle} for alias in manager.aliases()]
     if as_json:
         emit_json(rows)
         return
@@ -236,6 +253,7 @@ def logout(alias):
 # ------------------------------------------------------------------
 # Posting
 # ------------------------------------------------------------------
+
 
 @cli.command()
 @click.argument("alias")
@@ -364,26 +382,23 @@ def thread(alias, text, image, alt, dry_run, as_json):
         if as_json:
             emit_json({"dry_run": True, "account": client.alias, "posts": posts})
         else:
-            console.print(
-                f"[yellow]Dry run[/yellow] — nothing was sent. "
-                f"{len(posts)} post(s) from {client.alias}."
-            )
+            console.print(f"[yellow]Dry run[/yellow] — nothing was sent. {len(posts)} post(s) from {client.alias}.")
             for n, info in enumerate(posts, 1):
                 print_preview(info, heading=f"Post {n}/{len(posts)}")
         return
 
     with status(f"Posting thread from [cyan]{alias}[/cyan]...", as_json):
-        results = client.thread(
-            parts, image_paths=list(image) or None, image_alts=list(alt) or None
-        )
+        results = client.thread(parts, image_paths=list(image) or None, image_alts=list(alt) or None)
 
     ok = len(results) == len(parts) and all(r.success for r in results)
     if as_json:
-        emit_json({
-            "success": ok,
-            "planned": len(parts),
-            "posts": [r.to_dict() for r in results],
-        })
+        emit_json(
+            {
+                "success": ok,
+                "planned": len(parts),
+                "posts": [r.to_dict() for r in results],
+            }
+        )
     else:
         for n, r in enumerate(results, 1):
             if r.success:
@@ -500,6 +515,7 @@ def delete(alias, uri, yes, as_json):
 # Scheduler
 # ------------------------------------------------------------------
 
+
 @cli.command()
 @click.argument("alias")
 @click.argument("text")
@@ -578,7 +594,11 @@ def jobs(as_json):
 
     for j in job_list:
         table.add_row(
-            j["id"], j["account"], j["schedule"], j["next_run"], j["status"],
+            j["id"],
+            j["account"],
+            j["schedule"],
+            j["next_run"],
+            j["status"],
             escape(j["text_preview"]),
         )
 
@@ -596,11 +616,14 @@ def cancel(job_id):
         console.print(f"[green]✓[/green] Cancelled job [cyan]{job_id}[/cyan]")
     else:
         console.print(f"[yellow]Job {job_id} not found.[/yellow]")
+        sys.exit(1)
 
 
 @cli.command("run-scheduler")
 @click.option("--max-retries", default=3, show_default=True, help="Retries for a failed send.")
-@click.option("--retry-delay", default=60.0, show_default=True, help="Seconds before the first retry (doubles each time).")
+@click.option(
+    "--retry-delay", default=60.0, show_default=True, help="Seconds before the first retry (doubles each time)."
+)
 def run_scheduler(max_retries, retry_delay):
     """Start the scheduler and process all queued jobs (blocking)."""
     manager = get_manager()
@@ -613,6 +636,7 @@ def run_scheduler(max_retries, retry_delay):
 # ------------------------------------------------------------------
 # Feeds
 # ------------------------------------------------------------------
+
 
 def print_posts(posts):
     for p in posts:
@@ -716,15 +740,13 @@ def profile(alias, handle, as_json):
 # ------------------------------------------------------------------
 
 config_option = click.option(
-    "--config", "config_file", default=None,
+    "--config",
+    "config_file",
+    default=None,
     help="Agents config file (default: agents.toml or $SKYCTL_AGENTS_FILE).",
 )
-agent_option = click.option(
-    "--agent", default=None, help="Only this agent acts (default: every member)."
-)
-dry_run_option = click.option(
-    "--dry-run", is_flag=True, help="Generate the text but post nothing."
-)
+agent_option = click.option("--agent", default=None, help="Only this agent acts (default: every member).")
+dry_run_option = click.option("--dry-run", is_flag=True, help="Generate the text but post nothing.")
 
 
 def get_group(name, config_file, as_json) -> AgentGroup:
@@ -745,10 +767,7 @@ def report_actions(actions, as_json):
             "failed": "[red]✗[/red]",
         }
         for a in actions:
-            console.print(
-                f"{marks[a.status]} [cyan]{a.agent}[/cyan] "
-                f"[dim]({a.status}, {escape(a.model)})[/dim]"
-            )
+            console.print(f"{marks[a.status]} [cyan]{a.agent}[/cyan] [dim]({a.status}, {escape(a.model)})[/dim]")
             if a.text:
                 console.print(f"  {escape(a.text)}")
             if a.source_url:
@@ -788,24 +807,26 @@ def agents_list(config_file, as_json):
     except AgentConfigError as e:
         fail(str(e), as_json)
     if as_json:
-        emit_json([
-            {
-                "group": g.name,
-                "topic": g.topic,
-                "members": [
-                    {
-                        "agent": p.alias,
-                        "account": p.account,
-                        "name": p.name,
-                        "mbti": p.personality.mbti,
-                        "interests": p.interests,
-                        "model": p.model or g.model or default_model(),
-                    }
-                    for p in g.members
-                ],
-            }
-            for g in groups.values()
-        ])
+        emit_json(
+            [
+                {
+                    "group": g.name,
+                    "topic": g.topic,
+                    "members": [
+                        {
+                            "agent": p.alias,
+                            "account": p.account,
+                            "name": p.name,
+                            "mbti": p.personality.mbti,
+                            "interests": p.interests,
+                            "model": p.model or g.model or default_model(),
+                        }
+                        for p in g.members
+                    ],
+                }
+                for g in groups.values()
+            ]
+        )
         return
     for g in groups.values():
         table = Table(title=f"{g.name} — {g.topic}" if g.topic else g.name)
@@ -817,8 +838,12 @@ def agents_list(config_file, as_json):
         table.add_column("Model", style="dim")
         for p in g.members:
             table.add_row(
-                p.alias, p.account, p.name, p.personality.mbti or "-",
-                escape(", ".join(p.interests)), p.model or g.model or default_model(),
+                p.alias,
+                p.account,
+                p.name,
+                p.personality.mbti or "-",
+                escape(", ".join(p.interests)),
+                p.model or g.model or default_model(),
             )
         console.print(table)
 
@@ -834,7 +859,8 @@ def agents_feed(group, agent, limit, config_file, as_json):
     g = get_group(group, config_file, as_json)
     names = [agent] if agent else list(g.personas)
     feeds = run_agents(
-        as_json, "Reading feeds...",
+        as_json,
+        "Reading feeds...",
         lambda: {name.lower(): g.feed(name, limit=limit) for name in names},
     )
     if as_json:
@@ -851,12 +877,9 @@ def agents_feed(group, agent, limit, config_file, as_json):
 @agents.command("research")
 @click.argument("group")
 @agent_option
-@click.option("--topic", default=None,
-              help="What to look for (default: the group's topic, or each agent's interests).")
-@click.option("--url", "urls", multiple=True,
-              help="A page to give the agents as source material. Repeatable.")
-@click.option("--max-posts", default=1, show_default=True,
-              help="Most posts each agent makes.")
+@click.option("--topic", default=None, help="What to look for (default: the group's topic, or each agent's interests).")
+@click.option("--url", "urls", multiple=True, help="A page to give the agents as source material. Repeatable.")
+@click.option("--max-posts", default=1, show_default=True, help="Most posts each agent makes.")
 @dry_run_option
 @config_option
 @json_option
@@ -872,10 +895,14 @@ def agents_research(group, agent, topic, urls, max_posts, dry_run, config_file, 
     """
     g = get_group(group, config_file, as_json)
     actions = run_agents(
-        as_json, "Agents are researching...",
+        as_json,
+        "Agents are researching...",
         lambda: g.research(
-            agent=agent, topic=topic, urls=list(urls),
-            max_posts=max_posts, dry_run=dry_run,
+            agent=agent,
+            topic=topic,
+            urls=list(urls),
+            max_posts=max_posts,
+            dry_run=dry_run,
         ),
     )
     report_actions(actions, as_json)
@@ -885,9 +912,12 @@ def agents_research(group, agent, topic, urls, max_posts, dry_run, config_file, 
 # Cloud entry points: tick, serve, mcp
 # ------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--max-retries", default=3, show_default=True, help="Retries for a failed send.")
-@click.option("--retry-delay", default=60.0, show_default=True, help="Seconds before the first retry (doubles each time).")
+@click.option(
+    "--retry-delay", default=60.0, show_default=True, help="Seconds before the first retry (doubles each time)."
+)
 @json_option
 def tick(max_retries, retry_delay, as_json):
     """Run one scheduler pass and exit: send every due job, record retries.
@@ -924,10 +954,20 @@ def serve(host, port):
 
 
 @cli.command()
-@click.option("--profile", type=click.Choice(["read", "plan", "direct", "admin"]), default="direct", show_default=True,
-              help="What the client may call directly. 'plan': reads + plans only (recommended for autonomous agents).")
-@click.option("--approval", type=click.Choice(["none", "client", "elicit", "out_of_band"]), default="client", show_default=True,
-              help="How plans that write are approved.")
+@click.option(
+    "--profile",
+    type=click.Choice(["read", "plan", "direct", "admin"]),
+    default="direct",
+    show_default=True,
+    help="What the client may call directly. 'plan': reads + plans only (recommended for autonomous agents).",
+)
+@click.option(
+    "--approval",
+    type=click.Choice(["none", "client", "elicit", "out_of_band"]),
+    default="client",
+    show_default=True,
+    help="How plans that write are approved.",
+)
 @click.option("--read-only", is_flag=True, help="Shortcut for --profile read.")
 @click.option("--dry-run", is_flag=True, help="Writes (direct or planned) only preview.")
 @click.option("--account", "accounts", multiple=True, help="Restrict to these aliases. Repeatable.")
@@ -951,13 +991,15 @@ def mcp(profile, approval, read_only, dry_run, accounts, no_agent):
         allow_delete=profile in ("direct", "admin"),
         max_writes=10_000,
     )
-    run_stdio(policy=policy, dry_run=dry_run, config=McpConfig(profile=profile, approval=approval),
-              with_agent=not no_agent)
+    run_stdio(
+        policy=policy, dry_run=dry_run, config=McpConfig(profile=profile, approval=approval), with_agent=not no_agent
+    )
 
 
 # ------------------------------------------------------------------
 # Task agent
 # ------------------------------------------------------------------
+
 
 @cli.group()
 def task():
@@ -1007,15 +1049,35 @@ def print_run(result, as_json):
 @click.option("--allow-delete", is_flag=True, help="Also allow delete_post and cancel_job.")
 @click.option("--max-writes", default=None, type=int, help="Cap on executed writes.")
 @click.option("--max-turns", default=None, type=int, help="Cap on model turns.")
-@click.option("--approval", type=click.Choice(["none", "writes"]), default=None,
-              help="writes: queue every write for `skyctl task approve` instead of sending.")
+@click.option(
+    "--approval",
+    type=click.Choice(["none", "writes"]),
+    default=None,
+    help="writes: queue every write for `skyctl task approve` instead of sending.",
+)
 @click.option("--model", default=None, help="provider:model, e.g. bedrock:anthropic.claude-opus-5-5")
-@click.option("--context", "context_items", multiple=True, metavar="KEY=VALUE", help="Extra facts for the prompt. Repeatable.")
+@click.option(
+    "--context", "context_items", multiple=True, metavar="KEY=VALUE", help="Extra facts for the prompt. Repeatable."
+)
 @click.option("--dry-run", is_flag=True, help="Plan only; writes are previewed, not sent.")
 @click.option("--verbose", "-v", is_flag=True, help="Show each tool call as it happens.")
 @json_option
-def task_run(goal, task_name, tasks_file, accounts, allow_writes, allow_delete, max_writes, max_turns,
-             approval, model, context_items, dry_run, verbose, as_json):
+def task_run(
+    goal,
+    task_name,
+    tasks_file,
+    accounts,
+    allow_writes,
+    allow_delete,
+    max_writes,
+    max_turns,
+    approval,
+    model,
+    context_items,
+    dry_run,
+    verbose,
+    as_json,
+):
     """Run the task agent on GOAL (or a named task from tasks.toml).
 
     \b
@@ -1073,12 +1135,22 @@ def task_run(goal, task_name, tasks_file, accounts, allow_writes, allow_delete, 
     runner = get_runner()
     show = None
     if verbose and not as_json:
+
         def show(entry):
             if entry["type"] == "tool_call":
-                mark = "[red]✗[/red]" if not entry["ok"] else ("[yellow]~[/yellow]" if entry.get("dry_run") or entry.get("pending_approval") else "[green]✓[/green]")
+                mark = (
+                    "[red]✗[/red]"
+                    if not entry["ok"]
+                    else (
+                        "[yellow]~[/yellow]"
+                        if entry.get("dry_run") or entry.get("pending_approval")
+                        else "[green]✓[/green]"
+                    )
+                )
                 console.print(f"  {mark} {entry['name']} {escape(json.dumps(entry['args'])[:100])}")
             elif entry["type"] == "turn" and entry.get("text"):
                 console.print(f"  [dim]{escape(entry['text'][:200])}[/dim]")
+
     with status("Agent is working...", as_json or verbose):
         result = runner.run(spec, on_event=show)
     print_run(result, as_json)
@@ -1124,8 +1196,8 @@ def task_show(run_id, as_json):
     runner = get_runner()
     try:
         events = RunLog.load(runner.state, run_id)
-    except FileNotFoundError as e:
-        fail(str(e), as_json)
+    except FileNotFoundError as missing:
+        fail(str(missing), as_json)
     if as_json:
         emit_json(events)
         return
@@ -1167,16 +1239,19 @@ def task_list(tasks_file, as_json):
     table.add_column("Goal")
     for name, t in tasks.items():
         table.add_row(
-            name, ", ".join(t.accounts or ["*"]),
-            f"max {t.max_writes}" if t.allow_writes else "off", t.approval, escape(t.goal[:70]),
+            name,
+            ", ".join(t.accounts or ["*"]),
+            f"max {t.max_writes}" if t.allow_writes else "off",
+            t.approval,
+            escape(t.goal[:70]),
         )
     console.print(table)
-
 
 
 # ------------------------------------------------------------------
 # Invocation plane: invoke, worker, daemon, platform
 # ------------------------------------------------------------------
+
 
 def _runtime_and_dispatcher():
     from .platform.invocation import default_dispatcher
@@ -1190,8 +1265,14 @@ def _runtime_and_dispatcher():
 
 @cli.command()
 @click.argument("payload", required=False)
-@click.option("--file", "-f", "event_file", type=click.File("r"), default=None,
-              help="Read the event from a file ('-' for stdin): a raw payload or any platform envelope.")
+@click.option(
+    "--file",
+    "-f",
+    "event_file",
+    type=click.File("r"),
+    default=None,
+    help="Read the event from a file ('-' for stdin): a raw payload or any platform envelope.",
+)
 def invoke(payload, event_file):
     """Run one Invocation, e.g. skyctl invoke '{"kind": "tick"}'.
 
@@ -1210,7 +1291,9 @@ def invoke(payload, event_file):
         if payload:
             invocations = [decode_json(payload, source="cli")]
         else:
-            invocations = decode_http({"content-type": "application/json"}, event_file.read().encode("utf-8"), runtime.platform)
+            invocations = decode_http(
+                {"content-type": "application/json"}, event_file.read().encode("utf-8"), runtime.platform
+            )
     except InvocationError as e:
         fail(str(e), True)
     failed = False
@@ -1224,9 +1307,16 @@ def invoke(payload, event_file):
 
 @cli.command()
 @click.option("--once", is_flag=True, help="Exit as soon as the queue is empty (event-driven jobs).")
-@click.option("--idle-exit", default=None, type=float, help="Exit after this many idle seconds (default: never, or 0 with --once).")
+@click.option(
+    "--idle-exit",
+    default=None,
+    type=float,
+    help="Exit after this many idle seconds (default: never, or 0 with --once).",
+)
 @click.option("--max-messages", default=1, show_default=True)
-@click.option("--visibility", default=900, show_default=True, help="Seconds a message stays hidden while being handled.")
+@click.option(
+    "--visibility", default=900, show_default=True, help="Seconds a message stays hidden while being handled."
+)
 def worker(once, idle_exit, max_messages, visibility):
     """Consume SKYCTL_QUEUE_URL: queued agent runs and delayed deliveries."""
     import signal
@@ -1245,8 +1335,15 @@ def worker(once, idle_exit, max_messages, visibility):
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
-    stats = run_worker(queue, dispatcher, max_messages=max_messages, visibility_seconds=visibility,
-                       idle_exit_seconds=idle_exit, wait_seconds=1 if once else 10, stop=stopping.is_set)
+    stats = run_worker(
+        queue,
+        dispatcher,
+        max_messages=max_messages,
+        visibility_seconds=visibility,
+        idle_exit_seconds=idle_exit,
+        wait_seconds=1 if once else 10,
+        stop=stopping.is_set,
+    )
     emit_json({"event": "worker.exit", **stats.to_dict()})
 
 
@@ -1282,7 +1379,9 @@ def platform_info(as_json):
     if as_json:
         emit_json(info)
         return
-    console.print(f"[bold]{rt.platform.display_name}[/bold] / compute [cyan]{rt.compute.name}[/cyan] ({rt.compute.kind})")
+    console.print(
+        f"[bold]{rt.platform.display_name}[/bold] / compute [cyan]{rt.compute.name}[/cyan] ({rt.compute.kind})"
+    )
     for key in ("state", "queue", "delayed", "run_strategy"):
         console.print(f"  {key:<13}: {escape(str(info.get(key)))}")
     console.print(f"  capabilities : {', '.join(info['capabilities'])}")
@@ -1299,9 +1398,16 @@ def platform_list(as_json):
     rows = []
     for p in platforms().values():
         for prof in p.compute_profiles.values():
-            rows.append({"platform": p.name, "compute": prof.name, "kind": prof.kind,
-                         "capabilities": sorted(p.capabilities(prof.name)),
-                         "job_timeout_s": prof.limits.job_timeout_s, "request_timeout_s": prof.limits.request_timeout_s})
+            rows.append(
+                {
+                    "platform": p.name,
+                    "compute": prof.name,
+                    "kind": prof.kind,
+                    "capabilities": sorted(p.capabilities(prof.name)),
+                    "job_timeout_s": prof.limits.job_timeout_s,
+                    "request_timeout_s": prof.limits.request_timeout_s,
+                }
+            )
     if as_json:
         emit_json(rows)
         return
@@ -1309,15 +1415,21 @@ def platform_list(as_json):
     for col in ("Platform", "Compute", "Kind", "Job limit", "Request limit", "Capabilities"):
         table.add_column(col)
     for r in rows:
-        table.add_row(r["platform"], r["compute"], r["kind"], str(r["job_timeout_s"] or "-"),
-                      str(r["request_timeout_s"] or "-"),
-                      ", ".join(c.split(".", 1)[1] for c in r["capabilities"]))
+        table.add_row(
+            r["platform"],
+            r["compute"],
+            r["kind"],
+            str(r["job_timeout_s"] or "-"),
+            str(r["request_timeout_s"] or "-"),
+            ", ".join(c.split(".", 1)[1] for c in r["capabilities"]),
+        )
     console.print(table)
 
 
 # ------------------------------------------------------------------
 # Provisioning plane: deploy
 # ------------------------------------------------------------------
+
 
 @cli.group()
 def deploy():
@@ -1366,7 +1478,13 @@ def deploy_validate(spec_file, targets, as_json):
 @click.argument("spec_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--target", "-t", "targets", multiple=True, help="Target(s) to render.")
 @click.option("--all", "all_targets", is_flag=True, help="Render every configured target.")
-@click.option("--out", "out_dir", required=True, type=click.Path(file_okay=False), help="Output directory (one subdirectory per target).")
+@click.option(
+    "--out",
+    "out_dir",
+    required=True,
+    type=click.Path(file_okay=False),
+    help="Output directory (one subdirectory per target).",
+)
 @click.option("--force", is_flag=True, help="Render even if validation reports errors.")
 def deploy_render(spec_file, targets, all_targets, out_dir, force):
     """Write Terraform JSON / manifests / compose files for the chosen targets."""
@@ -1418,7 +1536,9 @@ def deploy_check(spec_file, as_json):
                 row = [name]
                 for t in spec.targets.names():
                     cs = [c for c in results if c.name == name and c.target == t]
-                    row.append("-" if not cs else ("[green]pass[/green]" if all(c.ok for c in cs) else "[red]FAIL[/red]"))
+                    row.append(
+                        "-" if not cs else ("[green]pass[/green]" if all(c.ok for c in cs) else "[red]FAIL[/red]")
+                    )
                 table.add_row(*row)
             console.print(table)
             for c in results:
@@ -1432,6 +1552,7 @@ def deploy_check(spec_file, as_json):
 # Plans (the human side of out-of-band approval)
 # ------------------------------------------------------------------
 
+
 @cli.group()
 def plan():
     """Review, approve and execute plans proposed by agents (docs/MCP_AGENT.md)."""
@@ -1444,8 +1565,12 @@ def _plan_ctx():
 
     runner = get_runner()
     d = Settings.from_env().agent
-    ctx = ToolContext(runner.manager, policy=ToolPolicy(accounts=d.accounts, allow_writes=True,
-                                                        allow_delete=d.allow_delete, max_writes=max(d.max_writes, 50)))
+    ctx = ToolContext(
+        runner.manager,
+        policy=ToolPolicy(
+            accounts=d.accounts, allow_writes=True, allow_delete=d.allow_delete, max_writes=max(d.max_writes, 50)
+        ),
+    )
     ctx.plans = PlanStore(runner.state)
     ctx.principal = f"cli:{os.getenv('USER', 'operator')}"
     return ctx
@@ -1454,10 +1579,13 @@ def _plan_ctx():
 def _show_record(record: dict) -> None:
     from .planning import Plan, PlanCheck, render_preview
 
-    check = PlanCheck(ok=True, plan_hash=record["plan_hash"], summary=record["check"]["summary"],
-                      preview=record["check"]["preview"])
-    console.print(f"[bold]{record['id']}[/bold] [cyan]{record['status']}[/cyan] "
-                  f"[dim](by {escape(record['created_by'])}, approval {record['approval']['mode']})[/dim]")
+    check = PlanCheck(
+        ok=True, plan_hash=record["plan_hash"], summary=record["check"]["summary"], preview=record["check"]["preview"]
+    )
+    console.print(
+        f"[bold]{record['id']}[/bold] [cyan]{record['status']}[/cyan] "
+        f"[dim](by {escape(record['created_by'])}, approval {record['approval']['mode']})[/dim]"
+    )
     console.print(escape(render_preview(check, Plan.model_validate(record["plan"]))))
     for w in record["check"].get("warnings", []):
         console.print(f"[yellow]warning[/yellow] {escape(w['message'])}")
@@ -1559,6 +1687,7 @@ def plan_cancel_cmd(plan_id):
 # Evaluations
 # ------------------------------------------------------------------
 
+
 @cli.group("eval")
 def eval_group():
     """Evaluate how well a model turns free-text requests into plans (no network, nothing executed)."""
@@ -1577,8 +1706,13 @@ def eval_list():
 @click.option("--model", default=None, help="provider:model (default: SKYCTL_AGENT_MODEL).")
 @click.option("--scenario", "only", multiple=True, help="Run only these scenario ids.")
 @click.option("--repeat", default=1, show_default=True, help="Runs per scenario (reports pass@N and pass^N).")
-@click.option("--file", "scenario_file", type=click.Path(exists=True), default=None,
-              help="A TOML file with [[scenarios]] in the same format as the built-ins.")
+@click.option(
+    "--file",
+    "scenario_file",
+    type=click.Path(exists=True),
+    default=None,
+    help="A TOML file with [[scenarios]] in the same format as the built-ins.",
+)
 @json_option
 def eval_run(model, only, repeat, scenario_file, as_json):
     """Run scenarios against a model and score the plans it proposes."""
@@ -1612,6 +1746,338 @@ def eval_run(model, only, repeat, scenario_file, as_json):
         console.print(table)
     if data["pass_all_n"] < 1:
         sys.exit(1)
+
+
+# ------------------------------------------------------------------
+# Run a free-text task in a cloud deployment
+# ------------------------------------------------------------------
+
+
+@cli.command("run-cloud-task")
+@click.option(
+    "--cloud", required=True, help="aws | azure | gcp | kubernetes | local, or any profile from `skyctl cloud list`."
+)
+@click.option("--description", "-d", default=None, help="What to do, in plain language.")
+@click.argument("words", nargs=-1)
+@click.option("--account", "accounts", multiple=True, help="Account alias the agent may use. Repeatable.")
+@click.option("--max-writes", default=5, show_default=True, help="Most writes the plan may contain.")
+@click.option(
+    "--require-citations/--no-require-citations",
+    default=None,
+    help="Every post/reply must cite a source found with web_search. Default: on when the request mentions "
+    "news, facts, sources or misinformation.",
+)
+@click.option(
+    "--approve",
+    "approve_mode",
+    type=click.Choice(["ask", "auto", "never"]),
+    default="ask",
+    show_default=True,
+    help="ask: show the plan and ask; auto: approve without asking; never: leave it for `skyctl cloud approve`.",
+)
+@click.option("--wait/--no-wait", default=True, show_default=True, help="Follow the run until it finishes.")
+@click.option("--timeout", default=900, show_default=True, help="Seconds to wait.")
+@click.option("--model", default=None, help="Override the deployment's model, e.g. bedrock:anthropic.claude-opus-5-5.")
+@click.option("--dry-run", is_flag=True, help="Plan only; even an approved plan only previews.")
+@click.option("--poll", default=2.0, show_default=True, help="Seconds between status checks.")
+@json_option
+def run_cloud_task_cmd(
+    cloud,
+    description,
+    words,
+    accounts,
+    max_writes,
+    require_citations,
+    approve_mode,
+    wait,
+    timeout,
+    model,
+    dry_run,
+    poll,
+    as_json,
+):
+    """Run a free-text task in a cloud deployment: plan there, review here, execute there.
+
+    \b
+    Examples:
+        skyctl run-cloud-task --cloud aws --description "Find a post about the transit strike, read the comments and
+            reply to blatant misinformation with facts from the most recent news"
+        skyctl run_cloud_task --cloud aws -- description "Summarise today's mentions"
+        skyctl run-cloud-task --cloud local -d "Thank everyone who replied to my last post" --approve never
+
+    The agent works in plan mode: it reads, researches and proposes a plan; nothing is
+    posted until you approve the exact plan shown. Set up `--cloud` with `skyctl cloud import`.
+    """
+    from .remote import RemoteError, connect, parse_description, resolve_profile, run_cloud_task, wants_citations
+
+    try:
+        text = parse_description(description, words)
+        profile = resolve_profile(cloud)
+        conn = connect(profile)
+    except RemoteError as e:
+        fail(str(e), as_json)
+    except Exception as e:  # cloud SDK missing / credentials
+        fail(f"Could not connect to {cloud}: {e}", as_json)
+    citations = wants_citations(text) if require_citations is None else require_citations
+    task = _cloud_task_spec(text, accounts, max_writes, citations, model, dry_run)
+    if not as_json:
+        console.print(f"[bold]→ {escape(cloud)}[/bold] [dim]({profile.transport})[/dim] {escape(text)}")
+        if citations and require_citations is None:
+            console.print(
+                "[dim]  citations required: the request mentions news/facts (--no-require-citations to turn off)[/dim]"
+            )
+
+    interactive = sys.stdin.isatty() and not as_json
+    if approve_mode == "ask" and not interactive:
+        approve_mode = "never"  # never approve silently when nobody can be asked
+
+    def on_event(entry):
+        if as_json:
+            return
+        kind = entry.get("type")
+        if kind == "queued":
+            console.print(f"  [dim]queued as {entry.get('run_id')}; waiting for a worker…[/dim]")
+        elif kind == "turn" and entry.get("text"):
+            console.print(f"  [dim]{escape(entry['text'][:160])}[/dim]")
+        elif kind == "tool_call":
+            mark = "[green]·[/green]" if entry.get("ok") else "[red]✗[/red]"
+            console.print(f"  {mark} {entry['name']} {escape(json.dumps(entry.get('args', {}))[:90])}")
+
+    def on_plan(record):
+        if not as_json:
+            console.rule("proposed plan")
+            _show_record(record)
+
+    def confirm(record):
+        return click.confirm("Approve and execute this exact plan?", default=False)
+
+    try:
+        outcome = run_cloud_task(
+            conn,
+            task,
+            wait=wait,
+            approve=approve_mode,
+            confirm=confirm,
+            principal=f"cli:{os.getenv('USER', 'operator')}@{cloud}",
+            timeout=timeout,
+            poll=poll,
+            on_event=on_event,
+            on_plan=on_plan,
+        )
+    except RemoteError as e:
+        fail(str(e), as_json)
+    if as_json:
+        emit_json(outcome)
+    else:
+        status_word = outcome["status"]
+        colour = (
+            "green"
+            if status_word in ("completed", "queued")
+            else "yellow"
+            if status_word == "awaiting_approval"
+            else "red"
+        )
+        console.print(
+            f"[{colour}]{status_word}[/{colour}] run {outcome['run_id']}"
+            + (f", plan {outcome['plan_id']}" if outcome.get("plan_id") else "")
+        )
+        if outcome.get("summary"):
+            console.print(f"[dim]agent's report:[/dim] {escape(outcome['summary'])}")
+        for sid, st in (outcome.get("steps") or {}).items():
+            console.print(f"  {sid}: {st['status']} {escape(st.get('url') or st.get('error') or '')}")
+        if status_word == "awaiting_approval":
+            console.print(f"  approve later: skyctl cloud approve {outcome['plan_id']} --cloud {cloud}")
+        if status_word == "queued":
+            console.print(f"  follow it: skyctl cloud status {outcome['run_id']} --cloud {cloud}")
+    if outcome["status"] in ("failed", "error", "refused", "budget_exhausted", "deadline"):
+        sys.exit(1)
+    if outcome["status"] == "timeout":
+        sys.exit(2)
+
+
+def _cloud_task_spec(text, accounts, max_writes, citations, model, dry_run):
+    from .agent import TaskSpec
+
+    return TaskSpec(
+        goal=text,
+        accounts=[a.lower() for a in accounts] or None,
+        allow_writes=True,
+        max_writes=max_writes,
+        mode="plan",
+        plan_approval="out_of_band",
+        require_citations=citations,
+        model=model,
+        dry_run=dry_run,
+        max_turns=30,
+    )
+
+
+# The form used in requests and scripts: `skyctl run_cloud_task …`.
+_alias = click.Command(
+    name="run_cloud_task",
+    callback=run_cloud_task_cmd.callback,
+    params=run_cloud_task_cmd.params,
+    help=run_cloud_task_cmd.help,
+    hidden=True,
+)
+cli.add_command(_alias)
+
+
+# ------------------------------------------------------------------
+# Cloud profiles
+# ------------------------------------------------------------------
+
+
+@cli.group()
+def cloud():
+    """Connect this machine to skyctl deployments (profiles for `run-cloud-task`)."""
+
+
+@cloud.command("add")
+@click.argument("name")
+@click.option("--platform", default=None)
+@click.option("--state-url", default="")
+@click.option("--queue-url", default="")
+@click.option("--endpoint", default="")
+@click.option("--transport", type=click.Choice(["queue", "http"]), default=None)
+@click.option(
+    "--env", "env_pairs", multiple=True, metavar="KEY=VALUE", help="Adapter settings, e.g. AWS_REGION=us-east-1."
+)
+def cloud_add(name, platform, state_url, queue_url, endpoint, transport, env_pairs):
+    """Add or replace a profile by hand."""
+    from .remote import CloudProfile, RemoteError, load_profiles, save_profiles
+
+    env = {}
+    for pair in env_pairs:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            fail(f"--env expects KEY=VALUE, got {pair!r}")
+        env[key] = value
+    transport = transport or ("queue" if state_url and queue_url else "http")
+    try:
+        profile = CloudProfile(
+            name=name,
+            platform=platform or name,
+            transport=transport,
+            state_url=state_url,
+            queue_url=queue_url,
+            endpoint=endpoint,
+            env=env,
+        ).validate()
+    except RemoteError as e:
+        fail(str(e))
+    profiles = load_profiles()
+    profiles[name] = profile
+    console.print(f"[green]✓[/green] saved {name} to {save_profiles(profiles)}")
+
+
+@cloud.command("import")
+@click.argument("name")
+@click.option("--terraform-dir", default=None, type=click.Path(exists=True, file_okay=False))
+@click.option("--outputs-file", default=None, type=click.File("r"), help="The JSON of `terraform output -json`.")
+def cloud_import(name, terraform_dir, outputs_file):
+    """Create a profile from a generated deployment's Terraform outputs."""
+    from .remote import RemoteError, load_profiles, profile_from_terraform_outputs, save_profiles, terraform_outputs
+
+    if bool(terraform_dir) == bool(outputs_file):
+        fail("Give --terraform-dir or --outputs-file.")
+    try:
+        outputs = json.load(outputs_file) if outputs_file else terraform_outputs(terraform_dir)
+        profile = profile_from_terraform_outputs(name, outputs)
+    except (RemoteError, ValueError) as e:
+        fail(str(e))
+    profiles = load_profiles()
+    profiles[name] = profile
+    console.print(f"[green]✓[/green] {name}: {profile.state_url} · {profile.queue_url} → {save_profiles(profiles)}")
+
+
+@cloud.command("list")
+@json_option
+def cloud_list(as_json):
+    """Configured profiles."""
+    from .remote import load_profiles, profile_to_dict
+
+    profiles = {n: profile_to_dict(p) for n, p in load_profiles().items()}
+    if as_json:
+        emit_json(profiles)
+        return
+    table = Table(title="Cloud profiles")
+    for col in ("Name", "Transport", "State", "Queue / endpoint"):
+        table.add_column(col)
+    for n, p in profiles.items():
+        table.add_row(n, p.get("transport", ""), p.get("state_url", ""), p.get("queue_url") or p.get("endpoint", ""))
+    console.print(table)
+
+
+@cloud.command("remove")
+@click.argument("name")
+def cloud_remove(name):
+    """Remove a profile."""
+    from .remote import load_profiles, save_profiles
+
+    profiles = load_profiles()
+    if profiles.pop(name, None) is None:
+        fail(f"No profile {name!r}.")
+    save_profiles(profiles)
+    console.print(f"[green]✓[/green] removed {name}")
+
+
+@cloud.command("status")
+@click.argument("run_id")
+@click.option("--cloud", "cloud_name", required=True)
+@json_option
+def cloud_status(run_id, cloud_name, as_json):
+    """Show a run submitted with run-cloud-task."""
+    from .remote import RemoteError, connect, resolve_profile
+
+    try:
+        events = connect(resolve_profile(cloud_name)).run_events(run_id)
+    except RemoteError as e:
+        fail(str(e), as_json)
+    final = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if as_json:
+        emit_json(
+            {
+                "run_id": run_id,
+                "status": final["status"] if final else ("queued" if events else "unknown"),
+                "result": final,
+                "events": len(events),
+            }
+        )
+        return
+    console.print(f"{run_id}: {final['status'] if final else ('running or queued' if events else 'unknown')}")
+    if final:
+        console.print(escape(final.get("summary") or final.get("error") or ""))
+        if final.get("plan_id"):
+            console.print(f"  plan {final['plan_id']} ({final.get('plan_status')})")
+
+
+@cloud.command("approve")
+@click.argument("plan_id")
+@click.option("--cloud", "cloud_name", required=True)
+@click.option("--yes", "-y", is_flag=True)
+def cloud_approve(plan_id, cloud_name, yes):
+    """Review and approve a plan in a deployment, then have the deployment execute it."""
+    from .remote import RemoteError, connect, resolve_profile
+
+    try:
+        conn = connect(resolve_profile(cloud_name))
+        record = conn.get_plan(plan_id)
+        if record is None:
+            fail(f"No plan {plan_id} in {cloud_name}.")
+        _show_record(record)
+        if not yes and not click.confirm("Approve and execute this exact plan?", default=False):
+            console.print("Not approved.")
+            return
+        conn.approve_plan(plan_id, record["plan_hash"], by=f"cli:{os.getenv('USER', 'operator')}@{cloud_name}")
+        conn.execute_plan(plan_id, record["plan_hash"])
+    except RemoteError as e:
+        fail(str(e))
+    console.print(
+        f"[green]✓[/green] approved; execution requested in {cloud_name}. "
+        f"Check with: skyctl plan show … or skyctl cloud status"
+    )
+
 
 if __name__ == "__main__":
     cli()

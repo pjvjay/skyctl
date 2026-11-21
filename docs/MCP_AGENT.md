@@ -245,7 +245,8 @@ instead."*
 
 | Tag | Tools | MCP annotations |
 |---|---|---|
-| read | `list_accounts`, `get_profile`, `get_timeline`, `get_notifications`, `search_posts`, `list_posts`, `get_post`, `preview_post`, `fetch_link_metadata`, `list_jobs` | `readOnlyHint` |
+| read | `list_accounts`, `get_profile`, `get_timeline`, `get_notifications`, `search_posts`, `list_posts`, `get_post`, `get_post_thread`, `preview_post`, `fetch_link_metadata`, `list_jobs` | `readOnlyHint` |
+| research | `web_search` (news/web search, `SKYCTL_SEARCH_URL`), `fetch_page` (SSRF-safe readable text) | `readOnlyHint`, `openWorldHint` |
 | write | `post`, `reply`, `thread`, `repost`, `like`, `schedule_post`, `schedule_cron` | not read-only |
 | destructive | `delete_post`, `cancel_job` | `destructiveHint` |
 | plan | `plan_check`, `plan_create`, `plan_execute`, `plan_status`, `plan_list`, `plan_cancel` | `plan_execute` destructive |
@@ -336,6 +337,17 @@ Every `at://` URI returned by any tool is recorded in the session
   runner sessions.
 - The evaluation harness checks groundedness independently, as a second
   line of defence.
+
+**Citation grounding** applies the same idea to links. Every http(s) URL
+returned by a *research* tool (`web_search`, `fetch_page`) is recorded
+(`ToolContext.seen_urls`); links in the user's own request are trusted
+(`trusted_urls`). In runner sessions a post or reply that publishes any
+other link is refused (`link_grounding = "error"`; a warning elsewhere),
+and with `require_citations` every post and reply must cite at least one
+retrieved source. The plan preview marks each link *retrieved in this run*
+or *NOT retrieved by the agent*, and shows the author and text of the post
+a reply answers, so the reviewer judges the reply against what the agent
+actually read.
 
 ---
 
@@ -452,11 +464,37 @@ credentials in this environment. That is the first thing to do with it.
 | DNS-rebinding protection on by default | every remote `/mcp` call behind a load balancer got 421 → explicit host allow-list |
 | **The write ledger recorded failed writes** | after a transient failure, a retry skipped the write and reported success: a silently lost post (affected agent runs since the first version) → only effective writes are recorded |
 | `FileObjectStore.list()` with a relative root | listing under the default `./.skyctl` crashed → fixed |
+| SSRF check resolved IP-literal hosts instead of checking them | a resolver could vouch for `http://169.254.169.254/` → IP literals are checked as-is |
+| Page reader read the whole response before capping it | a huge page could exhaust worker memory → streamed, stops at the byte cap |
+| HTML `<title>`/`<head>` leaked into page text | noisy article text for the model → stripped |
 | Test PDS fake could not fetch a post it had just created | quoting a freshly created post looked broken in tests → fake fixed (and the executor's failure handling confirmed correct) |
 
 ---
 
-## 12. Open questions and next steps
+## 12. Research, citations and run-cloud-task (0.2.0)
+
+Requests such as *"find a post about X, look at the comments and respond to
+blatant misinformation with the facts from the most recent news"* need three
+things the first version lacked, now implemented:
+
+| Need | Implementation |
+|---|---|
+| Read "the comments" | `get_post_thread`: the post and its replies, flattened breadth-first with `reply_to` and `depth` |
+| Find recent news | `web_search` through a pluggable `WebSearch` (`skyctl/research.py`): GDELT (default, no key), Brave, Tavily, static (tests) |
+| Read the article, safely | `fetch_page` through `SafeFetcher`: http(s) only, every hop's address checked (private, loopback, link-local/metadata, reserved refused), byte-capped streaming, HTML → text |
+| Cite only what was read | citation grounding (§7), `require_citations` (auto-on for news/fact requests) |
+| Judge only blatant cases | planner guidance in plan mode and in `skyctl://guide`: only clear, checkable claims contradicted by recent reporting; skip opinions and jokes; one civil reply per author (the check warns on a second reply to the same post or author) |
+| Run it in the cloud from a laptop | `skyctl run-cloud-task --cloud aws\|azure\|gcp\|…` (`skyctl/remote.py`): submits `task.run` through the deployment's queue, follows the transcript in the state bucket, shows the plan, records the approval, submits `plan.execute`; the cloud worker executes with its own identity. See [OPERATIONS.md](OPERATIONS.md) |
+
+The whole loop is tested end to end with the real AWS adapters against
+moto (S3 + SQS), a worker thread running the real dispatcher, a simulated
+Bluesky network and a scripted fact-checking model
+(`tests/test_run_cloud_task.py`), and as the evaluation scenario
+`correct-misinformation-in-comments`.
+
+---
+
+## 13. Open questions and next steps
 
 1. **Run the evals against real models** (Anthropic, Bedrock, Vertex,
    Azure OpenAI) and set a pass^5 bar per scenario; grow the suite from

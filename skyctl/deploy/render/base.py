@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.deploy.render.base
 =========================
@@ -18,14 +33,14 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from ..spec import DeploySpec
 
 
 @dataclass
 class Finding:
-    level: str          # "error" | "warning" | "info"
+    level: str  # "error" | "warning" | "info"
     target: str
     message: str
     remedy: str = ""
@@ -37,18 +52,18 @@ class Finding:
 @dataclass
 class Workload:
     name: str
-    kind: str                   # service | worker | job
-    compute: str                # compute profile it runs under
+    kind: str  # service | worker | job
+    compute: str  # compute profile it runs under
     command: list[str]
 
 
 @dataclass
 class RenderedSchedule:
     name: str
-    expression: str             # in the target's own dialect
+    expression: str  # in the target's own dialect
     timezone: str
     invoke: dict
-    overlap_guard: str          # "platform" (overlap impossible) | "app" (claim protocol + lease)
+    overlap_guard: str  # "platform" (overlap impossible) | "app" (claim protocol + lease)
 
 
 @dataclass
@@ -59,7 +74,7 @@ class Artifact:
     workloads: list[Workload] = field(default_factory=list)
     schedules: list[RenderedSchedule] = field(default_factory=list)
     public_endpoints: list[str] = field(default_factory=list)
-    terraform: Optional[dict] = None
+    terraform: dict | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -68,10 +83,23 @@ class Artifact:
 # ----------------------------------------------------------------------
 
 COMMON_KEYS = (
-    "SKYCTL_PLATFORM", "SKYCTL_COMPUTE", "SKYCTL_SECRETS", "SKYCTL_STATE_URL", "SKYCTL_QUEUE_URL",
-    "SKYCTL_DELAYED_URL", "SKYCTL_AGENT_MODEL", "SKYCTL_AGENT_ALLOW_WRITES", "SKYCTL_AGENT_ALLOW_DELETE",
-    "SKYCTL_AGENT_MAX_WRITES", "SKYCTL_AGENT_MAX_TURNS", "SKYCTL_AGENT_MAX_SECONDS", "SKYCTL_AGENT_ACCOUNTS",
-    "SKYCTL_LOG_FORMAT", "SKYCTL_AUTH", "SKYCTL_HTTP_MCP",
+    "SKYCTL_PLATFORM",
+    "SKYCTL_COMPUTE",
+    "SKYCTL_SECRETS",
+    "SKYCTL_STATE_URL",
+    "SKYCTL_QUEUE_URL",
+    "SKYCTL_DELAYED_URL",
+    "SKYCTL_AGENT_MODEL",
+    "SKYCTL_AGENT_ALLOW_WRITES",
+    "SKYCTL_AGENT_ALLOW_DELETE",
+    "SKYCTL_AGENT_MAX_WRITES",
+    "SKYCTL_AGENT_MAX_TURNS",
+    "SKYCTL_AGENT_MAX_SECONDS",
+    "SKYCTL_AGENT_ACCOUNTS",
+    "SKYCTL_LOG_FORMAT",
+    "SKYCTL_AUTH",
+    "SKYCTL_HTTP_MCP",
+    "SKYCTL_SEARCH_URL",
 )
 POLICY_KEYS = tuple(k for k in COMMON_KEYS if k.startswith("SKYCTL_AGENT_") and k != "SKYCTL_AGENT_MODEL")
 
@@ -86,8 +114,8 @@ def common_env(
     state_url: str,
     queue_url: str = "none",
     delayed_url: str = "none",
-    auth: Optional[list[str]] = None,
-    extra: Optional[dict[str, str]] = None,
+    auth: list[str] | None = None,
+    extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     p = spec.policy
     env = {
@@ -107,6 +135,7 @@ def common_env(
         "SKYCTL_LOG_FORMAT": spec.runtime.log_format,
         "SKYCTL_AUTH": ",".join(auth if auth is not None else spec.service.auth),
         "SKYCTL_HTTP_MCP": str(spec.service.mcp).lower(),
+        "SKYCTL_SEARCH_URL": spec.runtime.search,
     }
     for key, value in (extra or {}).items():
         if key in env:
@@ -124,6 +153,7 @@ def invoke_args(invoke: dict) -> list[str]:
 # Terraform JSON
 # ----------------------------------------------------------------------
 
+
 def ref(address: str, attr: str) -> str:
     return "${" + address + "." + attr + "}"
 
@@ -138,8 +168,9 @@ class TfDoc:
     def _section(self, name: str) -> dict:
         return self.doc.setdefault(name, {})
 
-    def variable(self, name: str, type_: str = "string", *, sensitive: bool = False, default: Any = None,
-                 description: str = "") -> str:
+    def variable(
+        self, name: str, type_: str = "string", *, sensitive: bool = False, default: Any = None, description: str = ""
+    ) -> str:
         body: dict[str, Any] = {"type": type_}
         if description:
             body["description"] = description
@@ -157,7 +188,7 @@ class TfDoc:
         section[name] = body
         return f"{type_}.{name}"
 
-    def data(self, type_: str, name: str, body: Optional[dict] = None) -> str:
+    def data(self, type_: str, name: str, body: dict | None = None) -> str:
         self._section("data").setdefault(type_, {})[name] = body or {}
         return f"data.{type_}.{name}"
 
@@ -217,3 +248,13 @@ def check_references(doc: dict) -> list[str]:
 def iam_json(statements: list[dict]) -> str:
     """An AWS IAM policy document as a JSON string (Terraform interpolates the ${…} inside)."""
     return json.dumps({"Version": "2012-10-17", "Statement": statements}, separators=(",", ":"))
+
+
+def connection_output(platform: str, env: dict, extra_env: dict) -> dict:
+    """The `skyctl_connection` Terraform output that `skyctl cloud import` reads."""
+    return {
+        "platform": platform,
+        "state_url": env["SKYCTL_STATE_URL"],
+        "queue_url": env["SKYCTL_QUEUE_URL"],
+        "env": extra_env,
+    }

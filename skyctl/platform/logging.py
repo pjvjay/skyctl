@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.platform.logging
 =======================
@@ -20,12 +35,12 @@ import json
 import logging
 import sys
 import time
-from typing import Optional
 
 from .base import Platform, TraceContext
 
-_trace: contextvars.ContextVar[TraceContext] = contextvars.ContextVar("skyctl_trace", default=TraceContext())
-_platform: Optional[Platform] = None
+_EMPTY_TRACE = TraceContext()  # frozen dataclass: safe to share
+_trace: contextvars.ContextVar[TraceContext] = contextvars.ContextVar("skyctl_trace", default=_EMPTY_TRACE)
+_platform: Platform | None = None
 
 
 def set_platform(platform: Platform) -> None:
@@ -49,7 +64,12 @@ def _fields(level: str) -> dict:
 
 
 def format_event(event: str, level: str = "info", **data) -> str:
-    record = {**_fields(level), "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, "message": event}
+    record = {
+        **_fields(level),
+        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        "message": event,
+    }
     record.update(data)
     return json.dumps(record, default=str, ensure_ascii=False)
 
@@ -64,11 +84,13 @@ def emit_metric(name: str, value: float, unit: str = "Count", stream=None, **dim
         doc = {
             "_aws": {
                 "Timestamp": int(time.time() * 1000),
-                "CloudWatchMetrics": [{
-                    "Namespace": "skyctl",
-                    "Dimensions": [sorted(dimensions)] if dimensions else [[]],
-                    "Metrics": [{"Name": name, "Unit": unit}],
-                }],
+                "CloudWatchMetrics": [
+                    {
+                        "Namespace": "skyctl",
+                        "Dimensions": [sorted(dimensions)] if dimensions else [[]],
+                        "Metrics": [{"Name": name, "Unit": unit}],
+                    }
+                ],
             },
             name: value,
             **dimensions,

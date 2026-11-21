@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.config
 =============
@@ -20,7 +35,9 @@ every account, or BSKY_<ALIAS>_PDS_URL for one account:
 """
 
 import os
+
 from dotenv import load_dotenv
+
 from .models import AccountConfig
 
 
@@ -51,15 +68,10 @@ def load_accounts(env_file: str = ".env") -> dict[str, AccountConfig]:
         password = os.getenv(f"{prefix}PASSWORD", "").strip()
 
         if not handle or not password:
-            raise ValueError(
-                f"Account '{alias}' is incomplete. "
-                f"Expected env vars: {prefix}HANDLE and {prefix}PASSWORD"
-            )
+            raise ValueError(f"Account '{alias}' is incomplete. Expected env vars: {prefix}HANDLE and {prefix}PASSWORD")
 
         pds_url = os.getenv(f"{prefix}PDS_URL", "").strip() or default_pds
-        accounts[alias] = AccountConfig(
-            alias=alias, handle=handle, password=password, pds_url=pds_url
-        )
+        accounts[alias] = AccountConfig(alias=alias, handle=handle, password=password, pds_url=pds_url)
 
     return accounts
 
@@ -69,8 +81,5 @@ def load_single_account(alias: str, env_file: str = ".env") -> AccountConfig:
     accounts = load_accounts(env_file)
     alias = alias.lower()
     if alias not in accounts:
-        raise KeyError(
-            f"Account '{alias}' not found. "
-            f"Available accounts: {', '.join(accounts)}"
-        )
+        raise KeyError(f"Account '{alias}' not found. Available accounts: {', '.join(accounts)}")
     return accounts[alias]

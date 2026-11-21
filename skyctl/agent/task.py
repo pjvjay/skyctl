@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 skyctl.agent.task
 =================
@@ -20,7 +35,6 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional, Union
 
 from ..tools.policy import ToolPolicy
 
@@ -40,25 +54,26 @@ class TaskConfigError(ValueError):
 @dataclass
 class TaskSpec:
     goal: str
-    name: Optional[str] = None
-    accounts: Optional[list[str]] = None       # None → every configured account
+    name: str | None = None
+    accounts: list[str] | None = None  # None → every configured account
     allow_writes: bool = False
     allow_delete: bool = False
     allow_public_writes: bool = True
     max_writes: int = 5
     max_turns: int = 25
     max_tool_calls: int = 60
-    deadline_seconds: Optional[int] = 600
+    deadline_seconds: int | None = 600
     dry_run: bool = False
     approval: str = "none"
-    model: Optional[str] = None
-    effort: Optional[str] = None
-    tools: Optional[list[str]] = None          # allow-list of tool names
+    model: str | None = None
+    effort: str | None = None
+    tools: list[str] | None = None  # allow-list of tool names
     deny_tools: list[str] = field(default_factory=list)
-    context: dict = field(default_factory=dict)   # extra facts for the prompt
-    idempotency_key: Optional[str] = None      # dedupe writes across retried runs
-    mode: str = "direct"                       # direct: call write tools | plan: propose a plan (docs/MCP_AGENT.md)
-    plan_approval: Optional[str] = None        # plan mode: none | out_of_band (default: from `approval`)
+    context: dict = field(default_factory=dict)  # extra facts for the prompt
+    idempotency_key: str | None = None  # dedupe writes across retried runs
+    mode: str = "direct"  # direct: call write tools | plan: propose a plan (docs/MCP_AGENT.md)
+    require_citations: bool = False  # every post/reply must cite a source found with web_search
+    plan_approval: str | None = None  # plan mode: none | out_of_band (default: from `approval`)
 
     def __post_init__(self):
         if not self.goal or not self.goal.strip():
@@ -86,8 +101,8 @@ class TaskSpec:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TaskSpec":
-        known = {f for f in cls.__dataclass_fields__}
+    def from_dict(cls, data: dict) -> TaskSpec:
+        known = set(cls.__dataclass_fields__)
         unknown = set(data) - known
         if unknown:
             raise TaskConfigError(f"Unknown task fields: {', '.join(sorted(unknown))}")
@@ -97,7 +112,7 @@ class TaskSpec:
 @dataclass
 class RunResult:
     run_id: str
-    status: str                 # completed | needs_approval | budget_exhausted | deadline | refused | error
+    status: str  # completed | needs_approval | budget_exhausted | deadline | refused | error
     summary: str = ""
     turns: int = 0
     tool_calls: int = 0
@@ -106,11 +121,11 @@ class RunResult:
     usage: dict = field(default_factory=dict)
     started_at: str = ""
     finished_at: str = ""
-    error: Optional[str] = None
+    error: str | None = None
     model: str = ""
-    task: Optional[dict] = None
-    plan_id: Optional[str] = None              # plan mode: the plan the agent proposed
-    plan_status: Optional[str] = None
+    task: dict | None = None
+    plan_id: str | None = None  # plan mode: the plan the agent proposed
+    plan_status: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -148,7 +163,7 @@ def apply_deployment_ceilings(task: TaskSpec, ceilings) -> TaskSpec:
 TASKS_STATE_KEY = "config/tasks.toml"
 
 
-def load_tasks(path: Optional[Union[str, Path]] = None, state=None) -> dict[str, TaskSpec]:
+def load_tasks(path: str | Path | None = None, state=None) -> dict[str, TaskSpec]:
     """
     Read tasks and return {name: TaskSpec}. Looks at `path`, then
     $SKYCTL_TASKS_FILE, then ./tasks.toml, then `config/tasks.toml` in the

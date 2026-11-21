@@ -1,3 +1,18 @@
+# Copyright 2026 The skyctl Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tool registry, policy and the MCP server built from them."""
 
 import asyncio
@@ -5,14 +20,15 @@ import json
 
 import pytest
 
+from conftest import require
 from skyctl.adapters import MemoryObjectStore, ObjectJobStore
 from skyctl.scheduler import BskyScheduler
-from skyctl.tools import ToolContext, ToolDenied, ToolPolicy, ToolRegistry, registry
-
+from skyctl.tools import ToolContext, ToolPolicy, ToolRegistry, registry
 
 # ----------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------
+
 
 def test_catalogue_marks_mutating_and_destructive_tools():
     names = set(registry.names())
@@ -60,6 +76,7 @@ def test_custom_registry_derives_schema_from_signature():
 # Tools against the fake PDS
 # ----------------------------------------------------------------------
 
+
 def test_read_tools_wrap_network_content_as_untrusted(manager):
     ctx = ToolContext(manager)
     accounts = registry.call("list_accounts", {}, ctx).result["accounts"]
@@ -71,9 +88,14 @@ def test_read_tools_wrap_network_content_as_untrusted(manager):
     assert timeline["data"][0]["author"] == "friend.test"
     notes = registry.call("get_notifications", {"account": "personal"}, ctx).result
     assert notes["data"][0] == {
-        "reason": "mention", "author": "fan.test", "text": "hey @me.test, is there a student discount?",
-        "uri": "at://did:plc:fan/app.bsky.feed.post/n1", "cid": "cid-n1", "reason_subject": None,
-        "indexed_at": "2026-01-01T00:00:00Z", "is_read": False,
+        "reason": "mention",
+        "author": "fan.test",
+        "text": "hey @me.test, is there a student discount?",
+        "uri": "at://did:plc:fan/app.bsky.feed.post/n1",
+        "cid": "cid-n1",
+        "reason_subject": None,
+        "indexed_at": "2026-01-01T00:00:00Z",
+        "is_read": False,
     }
     preview = registry.call("preview_post", {"text": "hi @bsky.app #tag"}, ctx).result
     assert preview["fits"] and [f["type"] for f in preview["facets"]] == ["mention", "tag"]
@@ -112,6 +134,7 @@ def test_scheduling_tools_use_the_context_scheduler(manager):
 # Policy
 # ----------------------------------------------------------------------
 
+
 def test_policy_hides_and_denies(manager):
     policy = ToolPolicy(accounts=["work"], allow_writes=False, deny_tools=["search_posts"])
     visible = {s.name for s in registry.select(policy=policy)}
@@ -119,9 +142,9 @@ def test_policy_hides_and_denies(manager):
     assert "post" in visible
 
     ctx = ToolContext(manager, policy=policy)
-    assert registry.call("list_accounts", {}, ctx).result == {"accounts": [
-        {"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}
-    ]}
+    assert registry.call("list_accounts", {}, ctx).result == {
+        "accounts": [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]
+    }
     denied = registry.call("get_timeline", {"account": "personal"}, ctx)
     assert denied.denied and "outside this run's scope" in denied.error
     hidden = registry.call("delete_post", {"account": "work", "uri": "at://x"}, ctx)
@@ -141,7 +164,7 @@ def test_policy_write_budget(manager, fake_atproto):
     assert ctx.writes_done == 2
     third = registry.call("post", {"account": "work", "text": "3"}, ctx)
     assert third.denied and "budget exhausted" in third.error
-    assert registry.call("get_timeline", {"account": "work"}, ctx).ok   # reads unaffected
+    assert registry.call("get_timeline", {"account": "work"}, ctx).ok  # reads unaffected
 
 
 def test_policy_public_network_guard(manager):
@@ -170,14 +193,16 @@ def test_policy_describe_mentions_mode():
 # MCP server
 # ----------------------------------------------------------------------
 
+
 def test_mcp_server_exposes_policy_filtered_tools(manager, fake_atproto):
-    pytest.importorskip("mcp")
+    require("mcp")
     from mcp.server.fastmcp.exceptions import ToolError
 
     from skyctl.mcp_server import McpConfig, build_mcp_server
 
-    server = build_mcp_server(manager, ToolPolicy(accounts=["work"], allow_writes=True, max_writes=1),
-                              config=McpConfig(profile="direct"))
+    server = build_mcp_server(
+        manager, ToolPolicy(accounts=["work"], allow_writes=True, max_writes=1), config=McpConfig(profile="direct")
+    )
 
     async def scenario():
         tools = {t.name: t for t in await server.list_tools()}
@@ -191,7 +216,8 @@ def test_mcp_server_exposes_policy_filtered_tools(manager, fake_atproto):
             return json.loads(content[0].text)
 
         assert payload(await server.call_tool("list_accounts", {})) == {
-            "accounts": [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]}
+            "accounts": [{"account": "work", "handle": "work.test", "pds_url": "https://bsky.social"}]
+        }
         assert payload(await server.call_tool("post", {"account": "work", "text": "hello"}))["success"] is True
         # Failures are real MCP errors (isError), not data the model might misread.
         with pytest.raises(ToolError, match="outside this run's scope"):

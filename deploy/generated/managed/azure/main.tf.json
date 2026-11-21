@@ -327,6 +327,10 @@
                   "value": "true"
                 },
                 {
+                  "name": "SKYCTL_SEARCH_URL",
+                  "value": "gdelt://"
+                },
+                {
                   "name": "AZURE_CLIENT_ID",
                   "value": "${azurerm_user_assigned_identity.app.client_id}"
                 },
@@ -466,6 +470,10 @@
                   "value": "true"
                 },
                 {
+                  "name": "SKYCTL_SEARCH_URL",
+                  "value": "gdelt://"
+                },
+                {
                   "name": "AZURE_CLIENT_ID",
                   "value": "${azurerm_user_assigned_identity.app.client_id}"
                 },
@@ -585,6 +593,10 @@
                 {
                   "name": "SKYCTL_HTTP_MCP",
                   "value": "true"
+                },
+                {
+                  "name": "SKYCTL_SEARCH_URL",
+                  "value": "gdelt://"
                 },
                 {
                   "name": "AZURE_CLIENT_ID",
@@ -708,6 +720,10 @@
                   "value": "true"
                 },
                 {
+                  "name": "SKYCTL_SEARCH_URL",
+                  "value": "gdelt://"
+                },
+                {
                   "name": "AZURE_CLIENT_ID",
                   "value": "${azurerm_user_assigned_identity.app.client_id}"
                 },
@@ -758,6 +774,7 @@
         "SKYCTL_LOG_FORMAT": "json",
         "SKYCTL_AUTH": "bearer",
         "SKYCTL_HTTP_MCP": "true",
+        "SKYCTL_SEARCH_URL": "gdelt://",
         "AZURE_CLIENT_ID": "${azurerm_user_assigned_identity.app.client_id}",
         "AZURE_STORAGE_ACCOUNT_NAME": "${azurerm_storage_account.state.name}",
         "AZURE_TENANT_ID": "${data.azurerm_client_config.current.tenant_id}",
@@ -769,6 +786,16 @@
     },
     "storage_account": {
       "value": "${azurerm_storage_account.state.name}"
+    },
+    "skyctl_connection": {
+      "value": {
+        "platform": "azure",
+        "state_url": "az://skyctl/skyctl",
+        "queue_url": "azqueue://${azurerm_storage_account.state.name}/skyctl-work",
+        "env": {
+          "AZURE_STORAGE_ACCOUNT_NAME": "${azurerm_storage_account.state.name}"
+        }
+      }
     }
   }
 }
