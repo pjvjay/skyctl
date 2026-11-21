@@ -42,3 +42,6 @@ include = ["skyctl*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: contract tests against emulators or real cloud accounts (skipped unless configured)"]
+# The whole suite runs in seconds; a test stuck for this long dumps every thread's stack.
+faulthandler_timeout = 60

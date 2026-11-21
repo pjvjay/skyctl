@@ -299,3 +299,9 @@ pytest
 ```
 
 The suite uses a fake Bluesky client, so it needs no network and no credentials.
+Cloud adapters are tested against moto (AWS) and in-process fakes of the Azure
+and Google SDKs.
+
+`pytest -m integration` runs the same contract checks against LocalStack,
+Azurite and fake-gcs-server when the `SKYCTL_IT_*` variables are set (see
+`tests/test_integration.py`). CI does this on every pull request.

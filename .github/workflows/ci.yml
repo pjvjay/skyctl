@@ -1,0 +1,71 @@
+# test (Python 3.10-3.13 on Linux, 3.12 on macOS) and integration (object
+# stores and the Storage Queue adapter against real emulators).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - { os: macos-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}", cache: pip }
+      - run: pip install -e ".[test]"
+      - run: pytest -q
+
+  # Contract tests against emulators, for what in-process fakes cannot prove
+  # (moto does not evaluate S3 preconditions atomically).
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      localstack: { image: "localstack/localstack:3", ports: ["4566:4566"] }
+      azurite: { image: "mcr.microsoft.com/azure-storage/azurite", ports: ["10000:10000", "10001:10001"] }
+    steps:
+      - uses: actions/checkout@v4
+      # fake-gcs-server needs "-scheme http". A service container cannot be given
+      # arguments, so it is started as a step instead.
+      - name: Start fake-gcs-server
+        run: docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server -scheme http
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[test]"
+      - name: Wait for fake-gcs-server
+        run: |
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:4443/storage/v1/b > /dev/null && exit 0
+            sleep 1
+          done
+          docker logs gcs
+          exit 1
+      - run: pytest -q -m integration -rs
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+          SKYCTL_IT_S3_ENDPOINT: http://localhost:4566
+          SKYCTL_IT_S3_BUCKET: skyctl-it
+          # Azurite's published development account, not a real key.
+          SKYCTL_IT_AZURE_CONN: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;QueueEndpoint=http://localhost:10001/devstoreaccount1;"
+          SKYCTL_IT_GCS_ENDPOINT: http://localhost:4443
